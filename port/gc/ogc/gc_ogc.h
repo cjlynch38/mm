@@ -55,8 +55,16 @@ const char* gc_ogc_storage_mount(void);
 
 /* bridge_video.c */
 void gc_ogc_video_init(void);
-/** Show the console framebuffer, unblanked (gc_halt uses it so the halt message is visible). */
+/** Show the console framebuffer, unblanked (gc_halt uses it so the halt message is visible). After this,
+ *  gc_ogc_video_show_frame() no longer changes the display. */
 void gc_ogc_video_show_console(void);
+/** The video mode picked by gc_ogc_video_init() (a GXRModeObj; NULL before). The renderer sizes its EFB
+ *  copies and XFBs from it. */
+struct _gx_rmodeobj* gc_ogc_video_mode(void);
+/** Renderer (VI service thread): show XFB `xfb` from the next retrace on. The first call hands the
+ *  display from the console to the renderer, which also makes osViBlack effective. Returns 0 without
+ *  changing anything once gc_halt has brought the console back. */
+int gc_ogc_video_show_frame(void* xfb);
 
 /* bridge_log.c */
 /** Set up logging; also detects a USB Gecko in slot B, which then gets a copy of every line. */

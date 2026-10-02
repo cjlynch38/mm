@@ -58,6 +58,9 @@ MACHDEP    := -DGEKKO -mogc -mcpu=750 -meabi -mhard-float
 OGC_CFLAGS := $(MACHDEP) -O2 -std=gnu17 -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing \
               -I$(DEVKITPRO)/libogc/include -Iport/gc/include
 
+# The renderer (port/gc/gfx): libogc headers too; gfx_gx.c also uses the ogc-internal gc_ogc.h (video mode)
+GFX_CFLAGS := $(OGC_CFLAGS) -Iport/gc/gfx -Iport/gc/ogc
+
 #### Object list ####
 
 # Every object the N64 spec links, minus what the GameCube replaces:
@@ -99,16 +102,22 @@ DEP_FILES := $(GAME_O_FILES:.o=.d) $(PORT_O_FILES:.o=.d)
 #### Build options ####
 
 # make -f Makefile.gc GC_AUTOSTART=1: press Start automatically on the title screen (unattended test runs).
+# make -f Makefile.gc GC_RENDERER=0: no GX renderer, the M2 text console stays the display (graphics tasks skipped).
 # Options are written to gc_options.h, which only changes (and triggers rebuilds) when an option does.
 GC_AUTOSTART ?= 0
+GC_RENDERER  ?= 1
 GC_OPTIONS_H := $(BUILD_DIR)/generated/gc_options.h
 
 $(GC_OPTIONS_H): FORCE
 	@mkdir -p $(@D)
-	@printf '#define GC_AUTOSTART %d\n' $(GC_AUTOSTART) > $@.tmp; cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+	@printf '#define GC_AUTOSTART %d\n#define GC_RENDERER %d\n' $(GC_AUTOSTART) $(GC_RENDERER) > $@.tmp; \
+	    cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
 
-$(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o: $(GC_OPTIONS_H)
-$(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o: GAME_CPPFLAGS += -I$(BUILD_DIR)/generated
+GC_OPTIONS_GAME_O := $(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o
+GC_OPTIONS_OGC_O  := $(BUILD_DIR)/port/gc/gfx/gfx_task.o
+$(GC_OPTIONS_GAME_O) $(GC_OPTIONS_OGC_O): $(GC_OPTIONS_H)
+$(GC_OPTIONS_GAME_O): GAME_CPPFLAGS += -I$(BUILD_DIR)/generated
+$(GC_OPTIONS_OGC_O): GFX_CFLAGS += -I$(BUILD_DIR)/generated
 
 #### Per-file settings (mirror the N64 Makefile) ####
 
@@ -164,7 +173,7 @@ $(BUILD_DIR)/port/gc/ogc/%.o: port/gc/ogc/%.c
 # Renderer (libogc headers, own GBI constants in gfx_gbi.h)
 $(BUILD_DIR)/port/gc/gfx/%.o: port/gc/gfx/%.c
 	@mkdir -p $(@D)
-	$(CC) -c $(OGC_CFLAGS) -Iport/gc/gfx -MMD -MP -o $@ $<
+	$(CC) -c $(GFX_CFLAGS) -MMD -MP -o $@ $<
 
 $(BUILD_DIR)/port/gc/%.o: port/gc/%.c
 	@mkdir -p $(@D)

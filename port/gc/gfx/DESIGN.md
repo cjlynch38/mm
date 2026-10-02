@@ -78,6 +78,30 @@ times GFX_SCALE.
 
 Decal z mode has no polygon offset on GX, so bias depth toward the viewer by a small constant.
 
+As implemented (verified by port/gc/tests/gfx_gx_test, which reads the EFB back):
+- GX clips z/w outside [-1, 0] and the viewport maps it to window depth (z/w) * (far - near) + far.
+  Depth grows with distance, as on the N64: LEQUAL against a buffer cleared to GX_MAX_Z24.
+- Perspective: submit `(x, y, -w)`; GX matrix p00 = p11 = 1, p22 = k (1 - a), p23 = k b, so GX's
+  z_clip = k (z - w), with k = 1/8 (GX_ZK). The GX viewport's far comes from the N64 viewport z,
+  far = (vtrans.z + vscale.z) / G_MAXZ (1022/1023 for the standard viewport), and
+  far - near = vscale.z / (k G_MAXZ). GX window depth then equals the N64's
+  (ndc * vscale.z + vtrans.z) / G_MAXZ exactly (the test measures 0 difference at 24 bits).
+- Near plane: F3DZEX2 "NoN" does not clip at the near plane; it clips at w = 0 and clamps each vertex's
+  screen z to 0. GX always clips at z_clip = -w, which with k = 1/8 is N64 ndc -7 (a quarter of the
+  near distance) instead of -1, so geometry between n/4 and n is drawn; its window depth is below 0 and
+  is clamped to 0 (Dolphin; to be checked on hardware: without that clamp those pixels would get a
+  wrong depth). Geometry closer than n/4 still disappears. Both clip at the far plane (F3DZEX2 clips
+  against it too).
+- A triangle whose vertices leave the fitted plane z = a*w + b (non-affine modelview, forced matrix)
+  is divided on the CPU (counted as "via CPU" in the stats), as are G_ZS_PRIM triangles (z = the
+  primitive depth, clamped to the viewport's depth range) and orthographic projections. The CPU path
+  clamps ndc z at -1 like NoN, and drops triangles with a vertex behind the eye (no CPU clipping).
+- Primitive depth (G_SETPRIMDEPTH) is the RDP's 15-bit z, which is the RSP's screen z shifted left by 5:
+  window depth = z / (32 G_MAXZ), clamped to 1 (0x7FFF is just past G_MAXZ).
+- Rectangles are drawn in N64 screen pixels through an orthographic matrix and the full EFB
+  viewport; their window depth is the primitive depth with G_ZS_PRIM, else 0.
+- Decal bias: GX viewport near/far moved by 2^-16 (256 steps of the 24-bit buffer).
+
 ## Combiner and blender (gfx_tev.c)
 
 The N64 color combiner computes (A - B) * C + D per channel, in one or two cycles, separately for
@@ -139,11 +163,49 @@ Use the obvious shortcuts to save stages: B = 0, C = 0, C = 1, A = B, and so on.
   a depth clear.
 - After gc_halt the console XFB must show again (`gc_ogc_video_show_console`).
 
+As implemented:
+- Render targets: the first color image of a task that is not the z image is the frame; a color
+  image equal to the z image takes depth fills; any other is off-screen and its draws are skipped
+  (first 8 logged). The frame address is normalized to KSEG0 for the XFB slot key.
+- EFB clear policy: every EFB copy also clears the EFB, to the color of the last full-screen FILL
+  of the frame and to far depth. gfx_gx.c tracks that the EFB is "clean", so the game's full-screen
+  fills that follow (same color; z-buffer fill) are skipped. Any other FILL rectangle, or a fill
+  after something was drawn, is a quad: color without depth, or depth only (far) with color writes
+  off. Frames that do not clear show the clear color, not stale contents.
+- XFB slots (3, 2 minimum): `gfx_gx_task_end` picks a slot that is neither on screen
+  (VIDEO_GetCurrentFramebuffer: latched at the last retrace) nor about to be (VIDEO_GetNextFramebuffer,
+  or the slot last handed to the VI), preferring the one that already holds this N64 framebuffer,
+  else the least recently used. With only 2 slots it may have to wait for a retrace. GX_CopyDisp,
+  then GX_DrawDone, then the slot is published under the frame's address. The slot table is shared
+  with the VI thread under disabled interrupts.
+- `gc_gfx_present` (VI thread, from vi.c at the retrace where a swapped buffer becomes current)
+  calls `gc_ogc_video_show_frame`. The console stays the display until that first call; from then
+  on osViBlack is honoured. After gc_halt, `gc_ogc_video_show_console` wins for good.
+- The thread that runs the tasks becomes the current GX thread at each task start, because libogc
+  suspends that thread (not the writer) when the FIFO fills up.
+
 ## Memory
 
 The GameCube needs 4-5 MiB for the renderer: the GX FIFO (256 KiB), 2-3 XFBs (614,400 bytes each
 at 640x480) and the texture cache (about 2 MiB). To make room, the ROM range that the audio driver
 reads every frame (0x20700-0x5E06E0, 5.75 MiB) moves from MEM1 to ARAM (bridge_rom.c).
+
+Budget (all from gc_mem_alloc, logged as "mem:" lines, plus a "gfx: GX ready" summary):
+
+| Item | Size |
+|---|---|
+| GX FIFO | 256 KiB |
+| 3 XFBs, 640x480 YUY2 (NTSC; PAL 574 lines is 735 KiB each) | 1,800 KiB |
+| Texture cache (gfx_tex.c, halves down to 256 KiB if short) | 2,048 KiB |
+| Renderer statics in the image (batch buffer, TEV program cache, texture tables) | ~0.2 MiB |
+| **Total** | **~4.1 MiB** |
+
+M2 measurement (Dolphin, US ROM): 3,864 KiB of MEM1 free after boot, 2,655 KiB once the game's
+threads exist (their stacks and buffers take ~1.2 MiB after gc_gfx_init). gc_gfx_init therefore
+requires 4,104 KiB plus a 1,536 KiB reserve for the game; with less it logs the shortfall and leaves
+the renderer off (console display, tasks skipped) instead of starving the game. The renderer is
+initialised at the end of gc_ogc_boot, after the ROM preload, so the 5.75 MiB moved to ARAM is what
+makes it fit.
 
 ## Debugging
 

@@ -8,8 +8,9 @@
  *
  * The contexts follow libultra exactly: setters write the next context, the retrace makes it
  * current and the new next context starts as a copy of it. sched.c relies on this to pace frames
- * (osViGetCurrentFramebuffer() only returns a swapped buffer after the following retrace). Nothing
- * from the N64 framebuffers is shown on screen in M2; modes, scales and features are only recorded.
+ * (osViGetCurrentFramebuffer() only returns a swapped buffer after the following retrace). At the
+ * retrace where a swapped buffer becomes current, the renderer shows the frame it rendered into that
+ * N64 framebuffer (gc_gfx_present). Modes, scales and features are only recorded.
  * All state is protected by the global OS lock.
  */
 #include "gc_ultra_internal.h"
@@ -27,6 +28,8 @@ static s32 sViMgrActive;           // osCreateViManager() has run
 static u16 sViRetraceCountdown;    // retraces until the osViSetEvent message is posted
 static s32 sViBlackApplied = -1;   // last value passed to gc_video_set_black(), -1 = never
 static u32 sViRetraceTotal;        // retraces seen by the service thread (__osViIntrCount)
+static s32 sViSwapPending;         // osViSwapBuffer() since the last retrace
+static void* sViPresented;         // last buffer passed to gc_gfx_present()
 static gc_thread_t sViThread;
 
 /** __osViSwapContext() without the register writes. Caller holds the OS lock. */
@@ -88,6 +91,7 @@ void __gcViInit(void) {
 
 void __gcViRetrace(void) {
     s32 black = -1;
+    void* present = NULL;
 
     // On N64 the VI interrupt raises OS_EVENT_VI, which wakes the VI manager. Nothing in the game
     // registers this event, but post it for anything that does.
@@ -99,6 +103,13 @@ void __gcViRetrace(void) {
     // Like viMgrMain: no swaps and no retrace messages before osCreateViManager()
     if (sViMgrActive) {
         ViSwapContext();
+
+        // The swapped buffer is current from this retrace on: show the frame rendered into it
+        if (sViSwapPending || sViCurr->buffer != sViPresented) {
+            sViSwapPending = false;
+            sViPresented = sViCurr->buffer;
+            present = sViCurr->buffer;
+        }
 
         sViRetraceCountdown--;
         if (sViRetraceCountdown == 0) {
@@ -123,6 +134,9 @@ void __gcViRetrace(void) {
 
     if (black >= 0) {
         gc_video_set_black(black);
+    }
+    if (present != NULL) {
+        gc_gfx_present(present);
     }
 }
 
@@ -151,6 +165,7 @@ void osViSwapBuffer(void* frameBufPtr) {
     gc_os_lock();
     sViNext->buffer = frameBufPtr;
     sViNext->state |= VI_STATE_BUFFER_UPDATED;
+    sViSwapPending = true;
     gc_os_unlock();
 }
 

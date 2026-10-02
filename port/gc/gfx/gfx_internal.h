@@ -189,6 +189,21 @@ static inline void gfx_tex_uv(const GfxTexBinding* b, float s, float t, float* u
 /** Drop cached textures whose source memory the game rewrote (called at task start). */
 void gfx_tex_frame(void);
 
+/** Texture cache counters since boot (gfx_rsp_stats_frame logs them). */
+typedef struct {
+    uint32_t binds;      /* gfx_tex_bind calls */
+    uint32_t hits;       /* binds served by an already converted texture */
+    uint32_t misses;     /* binds that converted a new texture */
+    uint32_t reconverts; /* cached textures converted again because the game rewrote their source */
+    uint32_t evictions;  /* textures dropped to make room */
+    uint32_t syncs;      /* GX_DrawDone waits: evicting a texture already drawn in the same task */
+    uint32_t failures;   /* binds that returned false (nothing loaded, too large, no memory) */
+    uint32_t slow;       /* binds that replayed TMEM because the tile is not rows of one load in RAM */
+    uint32_t entries;    /* textures in the cache */
+    uint32_t bytesUsed, bytesTotal; /* texture memory */
+} GfxTexStats;
+void gfx_tex_get_stats(GfxTexStats* out);
+
 /* ================================================================================================ */
 /* Combiner / blender (gfx_tev.c)                                                                   */
 /* ================================================================================================ */
@@ -212,6 +227,10 @@ void gfx_tev_init(void);
  *  Uses GX_COLOR0A0 as the rasterized shade and GX_TEXMAP0/GX_TEXCOORD0 (TEXEL0), GX_TEXMAP1/GX_TEXCOORD1
  *  (TEXEL1). Does not touch vertex formats, texgens, channels or texture objects (gfx_gx.c owns those). */
 void gfx_tev_apply(GfxPrimKind kind, GfxTevInfo* out);
+/** gfx_tev_apply() skips uploading TEV stages and pixel engine state that GX already holds. Call this after
+ *  changing TEV stages, TEV colors, blend mode, alpha compare, z mode or color/alpha update outside gfx_tev.c
+ *  (FILL mode rectangles, EFB copies), so that the next gfx_tev_apply() uploads everything again. */
+void gfx_tev_invalidate(void);
 
 /* ================================================================================================ */
 /* GX backend (gfx_gx.c)                                                                            */
@@ -244,5 +263,8 @@ void gfx_gx_fillrect(float ulx, float uly, float lrx, float lry);
 
 /** Flush pending draws (state is about to change). */
 void gfx_gx_flush(void);
+/** True once gfx_gx_init() has set up GX, the FIFO and the XFBs (false: not enough memory or no video mode;
+ *  gfx_task.c then leaves the renderer disabled). */
+bool gfx_gx_ready(void);
 
 #endif

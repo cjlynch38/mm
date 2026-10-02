@@ -1,8 +1,8 @@
 /**
  * Platform bring-up before the game starts: video and console, the bridge's locks and service
  * threads, storage (SD card, or the Dolphin dev disc), the log file, the ROM (opened, validated,
- * audio range preloaded) and a memory map. main() runs it all through gc_ogc_boot(); the bridge
- * test calls the steps itself.
+ * audio range preloaded), the GX renderer and a memory map. main() runs it all through
+ * gc_ogc_boot(); the bridge test calls the steps itself.
  */
 #include <gccore.h>
 #include <ogc/libversion.h>
@@ -78,5 +78,8 @@ void gc_ogc_boot(void) {
     if (gc_ogc_rom_preload(GC_ROM_RESIDENT_START, GC_ROM_RESIDENT_END) != 0) {
         gc_halt("Could not load the audio data from the ROM into RAM (see above).");
     }
+    // After the ROM preload, so the renderer only takes memory that is really left; the console stays
+    // the display until the renderer shows its first frame.
+    gc_gfx_init();
     gc_ogc_print_memory_map();
 }

@@ -1,0 +1,1068 @@
+/**
+ * GX backend of the N64 display list renderer: GX and EFB/XFB setup, render targets, viewport and
+ * scissor, the projection trick that feeds N64 clip coordinates through GX's own perspective divide,
+ * triangle batching, texture and fill rectangles, EFB -> XFB copies and presenting frames on the VI
+ * thread. See DESIGN.md ("Projection on GX", "Frames and video").
+ *
+ * Depth: GX clip space keeps z in [-w, 0] (GX clips outside it) and the viewport maps z/w to window
+ * depth (z/w) * (far - near) + far, so window depth grows with distance as on the N64, and the depth
+ * test is LEQUAL against a buffer cleared to GX_MAX_Z24. The N64 window depth
+ * (ndc * vscale[2] + vtrans[2]) / G_MAXZ is reproduced exactly by submitting
+ * z_gx = GX_ZK * (ndc - 1) * w and deriving the GX viewport near/far from the N64 viewport's z scale and
+ * translation (gx_viewport_n64). GX_ZK < 1/2 puts GX's near clip plane closer to the eye than the N64's
+ * (see GX_NDC_NEAR); the far clip plane is the N64's, which F3DZEX2 also clips against.
+ */
+#include <gccore.h>
+#include <math.h>
+#include <ogc/lwp_watchdog.h>
+#include <ogc/machine/processor.h>
+#include <string.h>
+#include "gc_ogc.h"
+#include "gfx_internal.h"
+
+#define GX_FIFO_SIZE (256 * 1024)
+#ifndef XFB_SLOTS
+#define XFB_SLOTS 3 /* -DXFB_SLOTS=2 tests the low-memory path */
+#endif
+#define XFB_SLOTS_MIN 2
+#define BATCH_TRIS 128
+#define BATCH_VERTS (BATCH_TRIS * 3)
+
+/* Decal surfaces are drawn this much (window depth, 0..1) toward the viewer: GX has no polygon offset.
+ * 2^-16 is 256 steps of the 24-bit depth buffer, about 1.5 units at 1000 units from a 10-unit near plane. */
+#define DECAL_BIAS (1.0f / 65536.0f)
+
+/* Persp vertices whose z leaves the fitted plane z = a*w + b by more than this (relative to w) cannot
+ * be drawn through the GX perspective matrix; they are divided on the CPU instead. */
+#define PERSP_FIT_TOLERANCE 1.0e-3f
+
+/* N64 NDC z at which GX clips near. F3DZEX2 NoN does not clip at the near plane (ndc -1): it clips at
+ * w = 0 and clamps the vertex screen z to 0. GX always clips at z_gx = -w, so z_gx is scaled down to put
+ * that plane closer to the eye: ndc = 1 - 2n/w for a projection with near n (and a far plane far away), so
+ * ndc -7 is n/4. Window depth for ndc in [-1, 1] is unchanged; between the two near planes it is below
+ * 0 and ends up clamped to 0, close to the N64's clamp (Dolphin, checked by gfx_gx_test; to be checked
+ * on hardware). */
+#define GX_NDC_NEAR (-7.0f)
+#define GX_ZK (1.0f / (1.0f - GX_NDC_NEAR)) /* z_gx / w = GX_ZK * (ndc - 1), so ndc 1 (far) is z_gx = 0 */
+
+#define STATS_INTERVAL_MS 5000
+#define LOG_LIMIT 8
+
+typedef struct {
+    float x, y, z;
+    u32 color;
+    float u0, v0, u1, v1;
+} BatchVtx;
+
+/* How the current projection reaches GX */
+typedef enum {
+    PROJ_PERSP, /* submit (x, y, -w) through a GX perspective matrix */
+    PROJ_ORTHO, /* no w column: submit NDC (x/w, y/w, z/w) through a GX orthographic matrix */
+    PROJ_CPU    /* anything else: divide on the CPU, draw orthographically */
+} ProjKind;
+
+/* What a draw needs from the GX transform: projection matrix and viewport */
+typedef enum {
+    VMODE_NONE,
+    VMODE_PERSP,  /* N64 perspective through the GX perspective matrix, N64 viewport */
+    VMODE_NDC,    /* NDC coordinates divided on the CPU (ortho, CPU path, primitive depth), N64 viewport */
+    VMODE_SCREEN  /* N64 screen pixels (rectangles), full EFB viewport */
+} VMode;
+
+typedef enum { TARGET_FRAME, TARGET_DEPTH, TARGET_OFFSCREEN } Target;
+
+typedef struct {
+    void* xfb;
+    u32 key;    /* N64 framebuffer (KSEG0 form) whose frame this slot holds, 0 = none */
+    u32 stamp;  /* order of the last render or presentation, for LRU */
+    bool busy;  /* being copied into */
+} XfbSlot;
+
+typedef struct {
+    u32 type; /* (no padding: the cache compares with memcmp) */
+    float p[6];
+} GxProj;
+
+typedef struct {
+    float x, y, w, h, n, f;
+} GxViewport;
+
+static bool sReady;
+static GXRModeObj* sMode;
+static void* sFifo;
+
+/* Frames and presentation. The slot table is shared with the VI thread (gfx_gx_present); every access
+ * runs with interrupts disabled, which on one CPU also excludes the other thread. */
+static XfbSlot sSlots[XFB_SLOTS];
+static int sSlotCount;
+static int sPresented = -1; /* slot most recently handed to the VI */
+static u32 sStamp;
+
+/* Render target of the current task */
+static u32 sFrameKey;    /* the frame's color image (KSEG0 form), 0 until the first draw */
+static u32 sTargetCimg;  /* gGfxRdp addresses sTarget was computed for */
+static u32 sTargetZimg;
+static Target sTarget;
+static bool sTargetValid;
+
+/* EFB contents: after a copy the EFB holds the copy clear color and far depth everywhere */
+static GXColor sClearColor = { 0, 0, 0, 255 };
+static bool sColorClean;
+static GXColor sCleanColor;
+static bool sDepthClean;
+
+/* Projection set by gfx_rsp */
+static ProjKind sProjKind = PROJ_ORTHO;
+static float sProjA, sProjB;
+
+/* Draw state as last applied to GX */
+static bool sStateValid; /* false: re-apply everything before the next draw */
+static int sKind = -1;   /* GfxPrimKind the TEV was set up for */
+static GfxTevInfo sInfo;
+static int sTexTile = -1; /* tile bound to GX_TEXMAP0 (TEXEL1 is the next tile) */
+static bool sTexBound[2];
+/* Neutral until bound: TEXCOORD0 is still computed when only TEXEL1 is used (no division by 0) */
+static GfxTexBinding sTex[2] = {
+    { .width = 1, .height = 1, .sShiftScale = 1.0f, .tShiftScale = 1.0f },
+    { .width = 1, .height = 1, .sShiftScale = 1.0f, .tShiftScale = 1.0f },
+};
+static int sNumTex = -1;          /* texture coordinates in the vertex format */
+static VMode sVMode = VMODE_NONE; /* loaded into GX */
+static VMode sTriVMode;           /* for triangles under the current state (one may still take the CPU path) */
+static bool sZPrim;               /* triangles use the primitive depth (G_ZS_PRIM) */
+static float sPrimNdcZ;           /* N64 NDC z of the primitive depth */
+static bool sScissorEmpty;
+static GxProj sGxProj;
+static bool sGxProjValid;
+static GxViewport sGxVp;
+static bool sGxVpValid;
+
+static GXTexObj sDummyTex;
+static u8 sDummyTexData[32] ATTRIBUTE_ALIGN(32);
+
+/* Batch of triangles waiting for one GX_Begin */
+static BatchVtx sBatch[BATCH_VERTS];
+static int sBatchCount;
+
+static struct {
+    u32 tasks, frames;
+    u32 tris, cpuTris, droppedTris, rects, fillQuads, depthQuads, fillsSkipped, offscreen, batches;
+    u64 taskTicks, maxTaskTicks;
+} sStats;
+static u64 sStatsStart;
+static u64 sTaskStart;
+static int sLogCount, sLogBindCount;
+static bool sLoggedNoFrame, sLoggedCpuProj, sLoggedFillZ;
+
+static inline u32 gx_key(u32 addr) {
+    return (addr == 0) ? 0 : ((addr & 0x1FFFFFFF) | 0x80000000);
+}
+
+static inline u32 gx_rgba(const GXColor* c) {
+    return ((u32)c->r << 24) | ((u32)c->g << 16) | ((u32)c->b << 8) | c->a;
+}
+
+/* G_SETPRIMDEPTH z as window depth (0..1, the scale of gx_viewport_n64). The RDP's z is the RSP's screen
+ * z (ndc * vscale[2] + vtrans[2], at most G_MAXZ) shifted left by 5, so 0x7FFF is just past G_MAXZ. */
+static inline float gx_prim_depth(void) {
+    float d = (gGfxRdp.primDepthZ & 0x7FFF) * (1.0f / (32.0f * G_MAXZ));
+
+    return (d < 1.0f) ? d : 1.0f;
+}
+
+/* ============================================================================================== */
+/* Init                                                                                           */
+/* ============================================================================================== */
+
+static void gx_clear_xfb(void* xfb, u32 size) {
+    u32* p = xfb;
+    u32 i;
+
+    // YUY2 black: Y=16, U=V=128
+    for (i = 0; i < size / 4; i++) {
+        p[i] = 0x10801080;
+    }
+    DCFlushRange(xfb, size);
+}
+
+void gfx_gx_init(void) {
+    u32 xfbSize;
+    f32 yScale;
+    Mtx identity;
+    int i;
+
+    sMode = (GXRModeObj*)gc_ogc_video_mode();
+    if (sMode == NULL) {
+        gc_log("gfx: no video mode, renderer disabled");
+        return;
+    }
+
+    sFifo = gc_mem_alloc(GX_FIFO_SIZE, 32);
+    if (sFifo == NULL) {
+        gc_log("gfx: no memory for the GX FIFO, renderer disabled");
+        return;
+    }
+    memset(sFifo, 0, GX_FIFO_SIZE);
+    DCFlushRange(sFifo, GX_FIFO_SIZE);
+
+    xfbSize = VIDEO_GetFrameBufferSize(sMode);
+    for (i = 0; i < XFB_SLOTS; i++) {
+        sSlots[i].xfb = gc_mem_alloc(xfbSize, 32);
+        if (sSlots[i].xfb == NULL) {
+            break;
+        }
+        gx_clear_xfb(sSlots[i].xfb, xfbSize);
+    }
+    sSlotCount = i;
+    if (sSlotCount < XFB_SLOTS_MIN) {
+        gc_log("gfx: no memory for the XFBs, renderer disabled");
+        return;
+    }
+
+    GX_Init(sFifo, GX_FIFO_SIZE);
+
+    // EFB at 2x the N64 resolution, copied to an XFB of the TV mode (scaled vertically for 50 Hz modes)
+    GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+    GX_SetCopyClear(sClearColor, GX_MAX_Z24);
+    GX_SetViewport(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT, 0, 1);
+    GX_SetScissor(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT);
+    GX_SetDispCopySrc(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT);
+    yScale = GX_GetYScaleFactor(GFX_EFB_HEIGHT, sMode->xfbHeight);
+    GX_SetDispCopyYScale(yScale);
+    GX_SetDispCopyDst(sMode->fbWidth, sMode->xfbHeight);
+    // The mode's sample pattern and vertical filter: the deflicker filter for interlaced modes on a CRT
+    GX_SetCopyFilter(sMode->aa, sMode->sample_pattern, GX_TRUE, sMode->vfilter);
+    GX_SetFieldMode(sMode->field_rendering, (sMode->viHeight == 2 * sMode->xfbHeight) ? GX_ENABLE : GX_DISABLE);
+    GX_SetDispCopyGamma(GX_GM_1_0);
+
+    // gfx_rsp culls; GX clips (near/far and the frustum sides) in clip space
+    GX_SetCullMode(GX_CULL_NONE);
+    GX_SetClipMode(GX_CLIP_ENABLE);
+    GX_SetDither(GX_FALSE);
+    // Depth test after texturing, so texels rejected by the alpha compare never write depth
+    GX_SetZCompLoc(GX_FALSE);
+
+    // Vertex format: positions are already in clip (or NDC/screen) space, the position matrix is identity
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    sNumTex = 0;
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+    GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX1, GX_TEX_ST, GX_F32, 0);
+    guMtxIdentity(identity);
+    GX_LoadPosMtxImm(identity, GX_PNMTX0);
+    GX_SetCurrentMtx(GX_PNMTX0);
+
+    // Shade: the vertex color, no lighting (gfx_rsp lights on the CPU)
+    GX_SetNumChans(1);
+    GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+    GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+    GX_SetNumTexGens(0);
+
+    // Bound when a tile cannot be resolved, so the TEV never samples a stale texture: opaque white
+    memset(sDummyTexData, 0xFF, sizeof(sDummyTexData));
+    DCFlushRange(sDummyTexData, sizeof(sDummyTexData));
+    GX_InitTexObj(&sDummyTex, sDummyTexData, 8, 4, GX_TF_I8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&sDummyTex, GX_NEAR, GX_NEAR);
+
+    GX_Flush();
+    sReady = true;
+    sStatsStart = gettime();
+    gc_log("gfx: GX ready, FIFO %u KB, %d XFBs of %u KB (%ux%u, %s)", GX_FIFO_SIZE / 1024, sSlotCount, xfbSize / 1024,
+           sMode->fbWidth, sMode->xfbHeight, (sMode->viTVMode & VI_NON_INTERLACE) ? "progressive" : "interlaced");
+}
+
+bool gfx_gx_ready(void) {
+    return sReady;
+}
+
+/* ============================================================================================== */
+/* GX transform state                                                                             */
+/* ============================================================================================== */
+
+static void gx_load_proj(u32 type, float p0, float p1, float p2, float p3, float p4, float p5) {
+    GxProj proj = { type, { p0, p1, p2, p3, p4, p5 } };
+    Mtx44 m;
+
+    if (sGxProjValid && memcmp(&proj, &sGxProj, sizeof(proj)) == 0) {
+        return;
+    }
+    sGxProj = proj;
+    sGxProjValid = true;
+
+    memset(m, 0, sizeof(m));
+    m[0][0] = p0;
+    m[1][1] = p2;
+    m[2][2] = p4;
+    m[2][3] = p5;
+    if (type == GX_PERSPECTIVE) {
+        m[0][2] = p1;
+        m[1][2] = p3;
+        m[3][2] = -1.0f;
+    } else {
+        m[0][3] = p1;
+        m[1][3] = p3;
+        m[3][3] = 1.0f;
+    }
+    GX_LoadProjectionMtx(m, type);
+}
+
+static void gx_load_viewport(float x, float y, float w, float h, float n, float f) {
+    GxViewport vp = { x, y, w, h, n, f };
+
+    if (sGxVpValid && memcmp(&vp, &sGxVp, sizeof(vp)) == 0) {
+        return;
+    }
+    sGxVp = vp;
+    sGxVpValid = true;
+    GX_SetViewport(x, y, w, h, n, f);
+}
+
+/* The N64 viewport (G_MV_VIEWPORT) scaled to the EFB. Window depth: GX gives (z_gx/w) * (f - n) + f with
+ * z_gx/w = GX_ZK * (ndc - 1), the N64 gives (ndc * sz + tz) / G_MAXZ, so f = (sz + tz) / G_MAXZ and
+ * f - n = sz / (GX_ZK * G_MAXZ). The standard viewport (sz = tz = G_MAXZ / 2) gives f = 1022/1023, and
+ * window depth 0 at ndc -1 as on the N64. */
+static void gx_n64_viewport_z(float* sz, float* tz) {
+    *sz = gGfxRsp.viewportScale[2];
+    *tz = gGfxRsp.viewportTrans[2];
+    if (*sz == 0.0f && *tz == 0.0f) {
+        // No viewport loaded: the standard one
+        *sz = *tz = G_MAXZ / 2;
+    }
+}
+
+static void gx_viewport_n64(float bias) {
+    float sx = gGfxRsp.viewportScale[0] * 0.25f;
+    float sy = gGfxRsp.viewportScale[1] * 0.25f;
+    float tx = gGfxRsp.viewportTrans[0] * 0.25f;
+    float ty = gGfxRsp.viewportTrans[1] * 0.25f;
+    float sz, tz;
+    float n, f;
+
+    if (sx == 0.0f || sy == 0.0f) {
+        sx = tx = GFX_N64_WIDTH / 2;
+        sy = ty = GFX_N64_HEIGHT / 2;
+    }
+    gx_n64_viewport_z(&sz, &tz);
+    f = (tz + sz) / (float)G_MAXZ;
+    n = f - sz / (GX_ZK * (float)G_MAXZ);
+    gx_load_viewport((tx - sx) * GFX_SCALE, (ty - sy) * GFX_SCALE, 2.0f * sx * GFX_SCALE, 2.0f * sy * GFX_SCALE,
+                     n - bias, f - bias);
+}
+
+static void gx_set_vmode(VMode mode) {
+    float bias = sInfo.decal ? DECAL_BIAS : 0.0f;
+
+    // Batched vertices were computed for the current projection
+    gfx_gx_flush();
+    switch (mode) {
+        case VMODE_PERSP:
+            // clip = (x, y, z_gx, w) from the submitted (x, y, -w): z_gx = p4 * (-w) + p5 = GX_ZK * ((a - 1) w + b),
+            // which is GX_ZK * (z - w) for z = a * w + b
+            gx_load_proj(GX_PERSPECTIVE, 1.0f, 0.0f, 1.0f, 0.0f, (1.0f - sProjA) * GX_ZK, sProjB * GX_ZK);
+            gx_viewport_n64(bias);
+            break;
+        case VMODE_NDC:
+            // N64 NDC in (w = 1); z_gx = GX_ZK * (ndc - 1), as above
+            gx_load_proj(GX_ORTHOGRAPHIC, 1.0f, 0.0f, 1.0f, 0.0f, GX_ZK, -GX_ZK);
+            gx_viewport_n64(bias);
+            break;
+        case VMODE_SCREEN:
+            // N64 screen pixels in, y down; z is the window depth 0..1
+            gx_load_proj(GX_ORTHOGRAPHIC, 2.0f / GFX_N64_WIDTH, -1.0f, -2.0f / GFX_N64_HEIGHT, 1.0f, 1.0f, -1.0f);
+            gx_load_viewport(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT, 0.0f - bias, 1.0f - bias);
+            break;
+        default:
+            break;
+    }
+    sVMode = mode;
+}
+
+static void gx_apply_scissor(void) {
+    int x0 = (gGfxRdp.scissorUlx * GFX_SCALE) >> 2;
+    int y0 = (gGfxRdp.scissorUly * GFX_SCALE) >> 2;
+    int x1 = (gGfxRdp.scissorLrx * GFX_SCALE) >> 2;
+    int y1 = (gGfxRdp.scissorLry * GFX_SCALE) >> 2;
+
+    x0 = (x0 < 0) ? 0 : x0;
+    y0 = (y0 < 0) ? 0 : y0;
+    x1 = (x1 > GFX_EFB_WIDTH) ? GFX_EFB_WIDTH : x1;
+    y1 = (y1 > GFX_EFB_HEIGHT) ? GFX_EFB_HEIGHT : y1;
+    sScissorEmpty = (x1 <= x0) || (y1 <= y0);
+    if (!sScissorEmpty) {
+        GX_SetScissor(x0, y0, x1 - x0, y1 - y0);
+    }
+}
+
+void gfx_gx_set_projection(const float m[4][4]) {
+    float best = 0.0f;
+    int row = -1;
+    int i;
+
+    gfx_gx_flush();
+    for (i = 0; i < 3; i++) {
+        if (fabsf(m[i][3]) > best) {
+            best = fabsf(m[i][3]);
+            row = i;
+        }
+    }
+
+    if (row < 0) {
+        sProjKind = PROJ_ORTHO;
+    } else {
+        // Perspective: column 2 must be a * column 3 + b * (0, 0, 0, 1), so that z = a * w + b
+        float a = m[row][2] / m[row][3];
+        float scale = fabsf(m[0][2]) + fabsf(m[1][2]) + fabsf(m[2][2]) + 1.0e-6f;
+        bool fits = true;
+
+        for (i = 0; i < 3; i++) {
+            if (fabsf(m[i][2] - a * m[i][3]) > 1.0e-3f * scale) {
+                fits = false;
+            }
+        }
+        sProjA = a;
+        sProjB = m[3][2] - a * m[3][3];
+        sProjKind = fits ? PROJ_PERSP : PROJ_CPU;
+        if (!fits && !sLoggedCpuProj) {
+            sLoggedCpuProj = true;
+            gc_log("gfx: projection without z = a*w + b, drawn with CPU division (logged once)");
+        }
+    }
+    sStateValid = false;
+}
+
+/* ============================================================================================== */
+/* Render targets                                                                                 */
+/* ============================================================================================== */
+
+static Target gx_target(void) {
+    u32 cimg = gGfxRdp.colorImageAddr;
+    u32 zimg = gGfxRdp.zImageAddr;
+    u32 key;
+
+    if (sTargetValid && cimg == sTargetCimg && zimg == sTargetZimg) {
+        return sTarget;
+    }
+    sTargetCimg = cimg;
+    sTargetZimg = zimg;
+    sTargetValid = true;
+
+    key = gx_key((u32)gfx_addr(cimg));
+    if (zimg != 0 && key == gx_key((u32)gfx_addr(zimg))) {
+        sTarget = TARGET_DEPTH;
+    } else if (sFrameKey == 0 || key == sFrameKey) {
+        // The first color image of a task that is not the z-buffer is the frame
+        sFrameKey = key;
+        sTarget = TARGET_FRAME;
+    } else {
+        sTarget = TARGET_OFFSCREEN;
+        if (sLogCount < LOG_LIMIT) {
+            sLogCount++;
+            gc_log("gfx: draws into off-screen color image %08X skipped (frame %08X)", key, sFrameKey);
+        }
+    }
+    return sTarget;
+}
+
+/* ============================================================================================== */
+/* Draw state                                                                                     */
+/* ============================================================================================== */
+
+static void gx_set_num_tex(int numTex) {
+    if (numTex == sNumTex) {
+        return;
+    }
+    GX_ClearVtxDesc();
+    GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+    if (numTex >= 1) {
+        GX_SetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+    }
+    if (numTex >= 2) {
+        GX_SetVtxDesc(GX_VA_TEX1, GX_DIRECT);
+    }
+    GX_SetNumTexGens(numTex);
+    sNumTex = numTex;
+}
+
+static void gx_bind(int index, int tile) {
+    GfxTexBinding* b = &sTex[index];
+    int texMap = (index == 0) ? GX_TEXMAP0 : GX_TEXMAP1;
+
+    if (gfx_tex_bind(tile & 7, texMap, b) && b->valid) {
+        return;
+    }
+    // Unresolvable tile (nothing loaded): sample opaque white
+    if (sLogBindCount < LOG_LIMIT) {
+        const GfxTile* t = &gGfxRdp.tiles[tile & 7];
+
+        sLogBindCount++;
+        gc_log("gfx: TEXEL%d tile %d (fmt %u siz %u tmem %03X) not resolved, white instead (combine %06X %08X, "
+               "mode H %08X)", index, tile & 7, t->fmt, t->siz, t->tmem, (unsigned int)gGfxRdp.combineHi,
+               (unsigned int)gGfxRdp.combineLo, (unsigned int)gGfxRdp.otherModeH);
+    }
+    GX_LoadTexObj(&sDummyTex, texMap);
+    memset(b, 0, sizeof(*b));
+    b->width = 8;
+    b->height = 4;
+    b->sShiftScale = b->tShiftScale = 1.0f;
+}
+
+/* Bring GX up to date with the RSP/RDP state for a draw of `kind` reading tile `tile` (and tile + 1). */
+static void gx_prepare_slow(GfxPrimKind kind, int tile) {
+    u32 dirty = gGfxRdp.dirty;
+    bool full = !sStateValid || (int)kind != sKind;
+    VMode vmode;
+    bool oldDecal = sInfo.decal;
+
+    gfx_gx_flush();
+
+    if (full || (dirty & ~(GFX_DIRTY_SCISSOR | GFX_DIRTY_VIEWPORT))) {
+        bool used0 = sInfo.usesTexel0, used1 = sInfo.usesTexel1;
+
+        gfx_tev_apply(kind, &sInfo);
+        if (full || (dirty & (GFX_DIRTY_TEXTURES | GFX_DIRTY_OTHERMODE)) || tile != sTexTile ||
+            (sInfo.usesTexel0 && !used0) || (sInfo.usesTexel1 && !used1)) {
+            sTexBound[0] = sTexBound[1] = false;
+        }
+        sKind = kind;
+        sZPrim = (kind == GFX_PRIM_TRIANGLE) && (gGfxRdp.otherModeL & G_ZS_PRIM);
+    } else if (tile != sTexTile) {
+        sTexBound[0] = sTexBound[1] = false;
+    }
+
+    // Textures the combiner reads; TEXEL1 is the next tile
+    sTexTile = tile;
+    if (sInfo.usesTexel0 && !sTexBound[0]) {
+        gx_bind(0, tile);
+        sTexBound[0] = true;
+    }
+    if (sInfo.usesTexel1 && !sTexBound[1]) {
+        gx_bind(1, tile + 1);
+        sTexBound[1] = true;
+    }
+    gx_set_num_tex(sInfo.usesTexel1 ? 2 : (sInfo.usesTexel0 ? 1 : 0));
+
+    if (full || (dirty & GFX_DIRTY_SCISSOR)) {
+        gx_apply_scissor();
+    }
+
+    if (kind != GFX_PRIM_TRIANGLE) {
+        vmode = VMODE_SCREEN;
+    } else if (sProjKind == PROJ_PERSP && !sZPrim) {
+        vmode = VMODE_PERSP;
+    } else {
+        vmode = VMODE_NDC;
+    }
+    sTriVMode = vmode;
+    if (sZPrim) {
+        // N64 NDC z that lands on the primitive depth through the N64 viewport's z mapping. Clamped to the
+        // viewport's range: GX would otherwise clip the triangle on the primitive depth (G_SETPRIMDEPTH -1 is
+        // just past the far plane), where the RSP clips on the vertices' own z.
+        float sz, tz, ndc;
+
+        gx_n64_viewport_z(&sz, &tz);
+        ndc = (sz != 0.0f) ? (gx_prim_depth() * G_MAXZ - tz) / sz : 0.0f;
+        sPrimNdcZ = (ndc < -1.0f) ? -1.0f : (ndc > 1.0f) ? 1.0f : ndc;
+    }
+    // Projection and viewport go through caches, so recomputing them is cheap
+    if (full || vmode != sVMode || oldDecal != sInfo.decal || (dirty & GFX_DIRTY_VIEWPORT)) {
+        gx_set_vmode(vmode);
+    }
+
+    gGfxRdp.dirty = 0;
+    sStateValid = true;
+}
+
+static inline void gx_prepare(GfxPrimKind kind, int tile) {
+    if (gGfxRdp.dirty != 0 || !sStateValid || (int)kind != sKind || (kind != GFX_PRIM_TRIANGLE && tile != sTexTile)) {
+        gx_prepare_slow(kind, tile);
+    }
+}
+
+/* My own GX state for FILL-mode rectangles and depth clears; the next normal draw re-applies everything. */
+static void gx_set_fill_state(GXColor color, bool colorWrite, bool depthWrite) {
+    gfx_gx_flush();
+    GX_SetNumTevStages(1);
+    GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+    GX_SetTevColor(GX_TEVREG0, color);
+    GX_SetTevColorIn(GX_TEVSTAGE0, GX_CC_ZERO, GX_CC_ZERO, GX_CC_ZERO, GX_CC_C0);
+    GX_SetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_A0);
+    GX_SetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetNumIndStages(0);
+    GX_SetTevDirect(GX_TEVSTAGE0);
+    GX_SetFog(GX_FOG_NONE, 0, 1, 0.1f, 1, color);
+    GX_SetBlendMode(GX_BM_NONE, GX_BL_ONE, GX_BL_ZERO, GX_LO_COPY);
+    GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    GX_SetZMode(depthWrite ? GX_TRUE : GX_FALSE, GX_ALWAYS, depthWrite ? GX_TRUE : GX_FALSE);
+    GX_SetColorUpdate(colorWrite ? GX_TRUE : GX_FALSE);
+    GX_SetAlphaUpdate(colorWrite ? GX_TRUE : GX_FALSE);
+    gx_set_num_tex(0);
+    memset(&sInfo, 0, sizeof(sInfo));
+    gx_set_vmode(VMODE_SCREEN);
+    sStateValid = false;
+    gfx_tev_invalidate();
+}
+
+/* ============================================================================================== */
+/* Drawing                                                                                        */
+/* ============================================================================================== */
+
+void gfx_gx_flush(void) {
+    BatchVtx* v = sBatch;
+    int i;
+
+    if (sBatchCount == 0) {
+        return;
+    }
+    GX_Begin(GX_TRIANGLES, GX_VTXFMT0, sBatchCount);
+    switch (sNumTex) {
+        case 0:
+            for (i = 0; i < sBatchCount; i++, v++) {
+                GX_Position3f32(v->x, v->y, v->z);
+                GX_Color1u32(v->color);
+            }
+            break;
+        case 1:
+            for (i = 0; i < sBatchCount; i++, v++) {
+                GX_Position3f32(v->x, v->y, v->z);
+                GX_Color1u32(v->color);
+                GX_TexCoord2f32(v->u0, v->v0);
+            }
+            break;
+        default:
+            for (i = 0; i < sBatchCount; i++, v++) {
+                GX_Position3f32(v->x, v->y, v->z);
+                GX_Color1u32(v->color);
+                GX_TexCoord2f32(v->u0, v->v0);
+                GX_TexCoord2f32(v->u1, v->v1);
+            }
+            break;
+    }
+    GX_End();
+    sStats.batches++;
+    sBatchCount = 0;
+}
+
+static inline BatchVtx* gx_batch_alloc(int count) {
+    BatchVtx* v;
+
+    if (sBatchCount + count > BATCH_VERTS) {
+        gfx_gx_flush();
+    }
+    v = &sBatch[sBatchCount];
+    sBatchCount += count;
+    return v;
+}
+
+static inline void gx_texcoords(BatchVtx* out, float s, float t) {
+    if (sNumTex >= 1) {
+        gfx_tex_uv(&sTex[0], s, t, &out->u0, &out->v0);
+    }
+    if (sNumTex >= 2) {
+        gfx_tex_uv(&sTex[1], s, t, &out->u1, &out->v1);
+    }
+}
+
+static inline bool gx_fits_persp(const GfxVtx* v) {
+    return fabsf(v->z - (sProjA * v->w + sProjB)) <= PERSP_FIT_TOLERANCE * (fabsf(v->w) + 1.0f);
+}
+
+void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
+    const GfxVtx* vtx[3] = { v0, v1, v2 };
+    BatchVtx* out;
+    bool cpu;
+    int i;
+
+    if (gx_target() != TARGET_FRAME) {
+        sStats.offscreen++;
+        return;
+    }
+    gx_prepare(GFX_PRIM_TRIANGLE, gGfxRsp.textureTile);
+    if (sScissorEmpty) {
+        return;
+    }
+
+    cpu = (sTriVMode != VMODE_PERSP);
+    if (!cpu && !(gx_fits_persp(v0) && gx_fits_persp(v1) && gx_fits_persp(v2))) {
+        // z is off the fitted plane (non-affine modelview, forced matrix): divide this triangle on the CPU
+        cpu = true;
+        sStats.cpuTris++;
+    }
+    if (cpu && !(v0->w > 0.0f && v1->w > 0.0f && v2->w > 0.0f)) {
+        // Behind the eye (or NaN): the CPU path does not clip
+        sStats.droppedTris++;
+        return;
+    }
+    if (sVMode != (cpu ? VMODE_NDC : VMODE_PERSP)) {
+        gx_set_vmode(cpu ? VMODE_NDC : VMODE_PERSP);
+    }
+
+    // (flat shading is applied by gfx_rsp: it keeps per-vertex alpha, as the microcode does)
+    out = gx_batch_alloc(3);
+    for (i = 0; i < 3; i++, out++) {
+        const GfxVtx* v = vtx[i];
+
+        if (!cpu) {
+            out->x = v->x;
+            out->y = v->y;
+            out->z = -v->w;
+        } else {
+            float invW = 1.0f / v->w;
+            float z = v->z * invW;
+
+            out->x = v->x * invW;
+            out->y = v->y * invW;
+            // F3DZEX2 NoN clamps the screen z of vertices in front of the near plane to 0 (ndc -1); beyond
+            // the far plane it clips, as GX does
+            out->z = sZPrim ? sPrimNdcZ : (z > -1.0f) ? z : -1.0f;
+        }
+        out->color = ((u32)v->r << 24) | ((u32)v->g << 16) | ((u32)v->b << 8) | v->a;
+        gx_texcoords(out, v->s, v->t);
+    }
+    sStats.tris++;
+    sColorClean = sDepthClean = false;
+}
+
+/* Quad in N64 screen pixels as two triangles (VMODE_SCREEN). st[i] are the texel coordinates of the
+ * corners UL, UR, LL, LR. */
+static void gx_quad(float ulx, float uly, float lrx, float lry, float z, u32 color, const float st[4][2]) {
+    static const u8 order[6] = { 0, 1, 2, 2, 1, 3 };
+    float xs[4] = { ulx, lrx, ulx, lrx };
+    float ys[4] = { uly, uly, lry, lry };
+    BatchVtx* out = gx_batch_alloc(6);
+    int i;
+
+    for (i = 0; i < 6; i++, out++) {
+        int c = order[i];
+
+        out->x = xs[c];
+        out->y = ys[c];
+        out->z = z;
+        out->color = color;
+        if (st != NULL) {
+            gx_texcoords(out, st[c][0], st[c][1]);
+        } else {
+            out->u0 = out->v0 = out->u1 = out->v1 = 0.0f;
+        }
+    }
+}
+
+/* Window depth of a rectangle: the primitive depth with G_ZS_PRIM, else 0 (rectangles have no z slope) */
+static inline float gx_rect_depth(void) {
+    return (gGfxRdp.otherModeL & G_ZS_PRIM) ? gx_prim_depth() : 0.0f;
+}
+
+void gfx_gx_texrect(float ulx, float uly, float lrx, float lry, int tile, float s, float t, float dsdx,
+                    float dtdy, bool flip) {
+    float st[4][2];
+    float dx = lrx - ulx;
+    float dy = lry - uly;
+
+    if (gx_target() != TARGET_FRAME) {
+        sStats.offscreen++;
+        return;
+    }
+    if (lrx <= ulx || lry <= uly) {
+        return;
+    }
+    gx_prepare(GFX_PRIM_TEXRECT, tile);
+    if (sScissorEmpty) {
+        return;
+    }
+
+    if (!flip) {
+        st[0][0] = s;             st[0][1] = t;
+        st[1][0] = s + dx * dsdx; st[1][1] = t;
+        st[2][0] = s;             st[2][1] = t + dy * dtdy;
+        st[3][0] = s + dx * dsdx; st[3][1] = t + dy * dtdy;
+    } else {
+        // G_TEXRECTFLIP: s advances down the rectangle, t across it
+        st[0][0] = s;             st[0][1] = t;
+        st[1][0] = s;             st[1][1] = t + dx * dtdy;
+        st[2][0] = s + dy * dsdx; st[2][1] = t;
+        st[3][0] = s + dy * dsdx; st[3][1] = t + dx * dtdy;
+    }
+    gx_quad(ulx, uly, lrx, lry, gx_rect_depth(), 0xFFFFFFFF, st);
+    sStats.rects++;
+    sColorClean = sDepthClean = false;
+}
+
+/* FILL mode fill color as an RGBA8 color: the first of two RGBA5551 pixels, or RGBA8888 for 32-bit images */
+static GXColor gx_fill_color(void) {
+    u32 fill = gGfxRdp.fillColor;
+    GXColor c;
+
+    if (gGfxRdp.colorImageSiz == G_IM_SIZ_32b) {
+        c.r = fill >> 24;
+        c.g = fill >> 16;
+        c.b = fill >> 8;
+        c.a = fill;
+    } else {
+        u32 p = fill >> 16;
+        u32 r = (p >> 11) & 0x1F, g = (p >> 6) & 0x1F, b = (p >> 1) & 0x1F;
+
+        c.r = (r << 3) | (r >> 2);
+        c.g = (g << 3) | (g >> 2);
+        c.b = (b << 3) | (b >> 2);
+        c.a = (p & 1) ? 255 : 0;
+    }
+    return c;
+}
+
+/* Whether a rectangle, clipped by the scissor, covers the whole N64 screen. Rectangles are exclusive of
+ * their lower-right edge; one pixel of slack also accepts the inclusive FILL-mode form (0, 0, 319, 239). */
+static bool gx_covers_screen(float ulx, float uly, float lrx, float lry) {
+    float sx0 = gGfxRdp.scissorUlx * 0.25f, sy0 = gGfxRdp.scissorUly * 0.25f;
+    float sx1 = gGfxRdp.scissorLrx * 0.25f, sy1 = gGfxRdp.scissorLry * 0.25f;
+
+    return ulx <= 0.0f && uly <= 0.0f && lrx >= GFX_N64_WIDTH - 1 && lry >= GFX_N64_HEIGHT - 1 && sx0 <= 0.0f &&
+           sy0 <= 0.0f && sx1 >= GFX_N64_WIDTH - 1 && sy1 >= GFX_N64_HEIGHT - 1;
+}
+
+static void gx_fill_depth(float ulx, float uly, float lrx, float lry) {
+    static const GXColor black = { 0, 0, 0, 0 };
+    bool full = gx_covers_screen(ulx, uly, lrx, lry);
+
+    if (gGfxRdp.fillColor != 0xFFFCFFFC && !sLoggedFillZ) {
+        sLoggedFillZ = true;
+        gc_log("gfx: z-buffer filled with %08X, cleared to far instead (logged once)", gGfxRdp.fillColor);
+    }
+    if (full && sDepthClean) {
+        sStats.fillsSkipped++;
+        return;
+    }
+    gx_set_fill_state(black, false, true);
+    if (gGfxRdp.dirty & GFX_DIRTY_SCISSOR) {
+        gx_apply_scissor();
+        gGfxRdp.dirty &= ~GFX_DIRTY_SCISSOR;
+    }
+    if (!sScissorEmpty) {
+        gx_quad(ulx, uly, lrx, lry, 1.0f, 0, NULL);
+        gfx_gx_flush();
+    }
+    sStats.depthQuads++;
+    if (full) {
+        sDepthClean = true;
+    }
+}
+
+static void gx_fill_color_rect(float ulx, float uly, float lrx, float lry) {
+    GXColor color = gx_fill_color();
+    bool full = gx_covers_screen(ulx, uly, lrx, lry);
+
+    color.a = 255;
+    if (full) {
+        // The next copy clears the EFB to this color: frames usually start with the same fill
+        sClearColor = color;
+        if (sColorClean && gx_rgba(&sCleanColor) == gx_rgba(&color)) {
+            sStats.fillsSkipped++;
+            return;
+        }
+    }
+    gx_set_fill_state(color, true, false);
+    if (gGfxRdp.dirty & GFX_DIRTY_SCISSOR) {
+        gx_apply_scissor();
+        gGfxRdp.dirty &= ~GFX_DIRTY_SCISSOR;
+    }
+    if (!sScissorEmpty) {
+        gx_quad(ulx, uly, lrx, lry, 0.0f, 0, NULL);
+        gfx_gx_flush();
+    }
+    sStats.fillQuads++;
+    sColorClean = full;
+    sCleanColor = color;
+}
+
+void gfx_gx_fillrect(float ulx, float uly, float lrx, float lry) {
+    Target target = gx_target();
+
+    if (lrx <= ulx || lry <= uly) {
+        return;
+    }
+    if ((gGfxRdp.otherModeH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_FILL) {
+        if (target == TARGET_DEPTH) {
+            gx_fill_depth(ulx, uly, lrx, lry);
+        } else if (target == TARGET_FRAME) {
+            gx_fill_color_rect(ulx, uly, lrx, lry);
+        } else {
+            sStats.offscreen++;
+        }
+        return;
+    }
+
+    if (target != TARGET_FRAME) {
+        sStats.offscreen++;
+        return;
+    }
+    gx_prepare(GFX_PRIM_FILLRECT, sTexTile < 0 ? 0 : sTexTile);
+    if (sScissorEmpty) {
+        return;
+    }
+    gx_quad(ulx, uly, lrx, lry, gx_rect_depth(), 0xFFFFFFFF, NULL);
+    sStats.rects++;
+    sColorClean = sDepthClean = false;
+}
+
+/* ============================================================================================== */
+/* Tasks and frames                                                                               */
+/* ============================================================================================== */
+
+void gfx_gx_task_begin(void) {
+    // The thread that writes the FIFO is the one GX suspends when the FIFO fills up
+    if (GX_GetCurrentGXThread() != LWP_GetSelf()) {
+        GX_SetCurrentGXThread();
+    }
+    sTaskStart = gettime();
+    sFrameKey = 0;
+    sTargetValid = false;
+    sStateValid = false;
+    sKind = -1;
+    sTexTile = -1;
+    sTexBound[0] = sTexBound[1] = false;
+    sBatchCount = 0;
+}
+
+static void gx_log_stats(u64 now) {
+    u32 ms = ticks_to_millisecs(now - sStatsStart);
+    u32 tasks = (sStats.tasks != 0) ? sStats.tasks : 1;
+
+    gc_log("gx: %u tasks in %u ms, %u frames; per task: %u tris (%u via CPU, %u dropped), %u rects, %u batches; "
+           "fills: %u color, %u depth, %u skipped; %u off-screen draws; task %u us avg, %u us max",
+           sStats.tasks, ms, sStats.frames, sStats.tris / tasks, sStats.cpuTris / tasks, sStats.droppedTris / tasks,
+           sStats.rects / tasks, sStats.batches / tasks, sStats.fillQuads, sStats.depthQuads, sStats.fillsSkipped,
+           sStats.offscreen, (u32)ticks_to_microsecs(sStats.taskTicks / tasks),
+           (u32)ticks_to_microsecs(sStats.maxTaskTicks));
+    memset(&sStats, 0, sizeof(sStats));
+    sStatsStart = now;
+}
+
+/* A slot that is neither on screen nor about to be (libogc's current framebuffer is the one latched at
+ * the last retrace, the next one is latched at the coming retrace): the one already holding this
+ * framebuffer, else the least recently used. Marked busy, so the VI thread cannot present it. */
+static int gx_pick_slot(u32 key) {
+    void* current;
+    void* next;
+    u32 level;
+    int slot = -1;
+    int i;
+
+    // Read libogc's framebuffers with interrupts off too: a retrace (current = next) followed by a present
+    // between two unguarded reads would leave the slot on screen out of both
+    _CPU_ISR_Disable(level);
+    current = VIDEO_GetCurrentFramebuffer();
+    next = VIDEO_GetNextFramebuffer();
+    for (i = 0; i < sSlotCount; i++) {
+        if (sSlots[i].busy || i == sPresented || sSlots[i].xfb == current || sSlots[i].xfb == next) {
+            continue;
+        }
+        if (sSlots[i].key == key) {
+            slot = i;
+            break;
+        }
+        if (slot < 0 || sSlots[i].stamp < sSlots[slot].stamp) {
+            slot = i;
+        }
+    }
+    if (slot >= 0) {
+        sSlots[slot].key = 0;
+        sSlots[slot].busy = true;
+    }
+    _CPU_ISR_Restore(level);
+    return slot;
+}
+
+void gfx_gx_task_end(void) {
+    u32 level;
+    u32 key = sFrameKey;
+    u64 now;
+    u64 ticks;
+    int slot = -1;
+    int i;
+
+    gfx_gx_flush();
+
+    if (key != 0) {
+        // With 3 XFBs one is always free; with 2, the previous frame stays on screen until the next retrace
+        for (i = 0; (slot = gx_pick_slot(key)) < 0 && i < 4; i++) {
+            VIDEO_WaitVSync();
+        }
+    }
+
+    if (slot >= 0) {
+        // The copy also clears the EFB (color and depth), which needs color and z updates enabled
+        GX_SetColorUpdate(GX_TRUE);
+        GX_SetAlphaUpdate(GX_TRUE);
+        GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+        GX_SetCopyClear(sClearColor, GX_MAX_Z24);
+        GX_CopyDisp(sSlots[slot].xfb, GX_TRUE);
+        sStateValid = false;
+        gfx_tev_invalidate();
+    }
+    GX_DrawDone();
+
+    if (slot >= 0) {
+        sColorClean = sDepthClean = true;
+        sCleanColor = sClearColor;
+        _CPU_ISR_Disable(level);
+        for (i = 0; i < sSlotCount; i++) {
+            if (sSlots[i].key == key) {
+                sSlots[i].key = 0;
+            }
+        }
+        sSlots[slot].key = key;
+        sSlots[slot].stamp = ++sStamp;
+        sSlots[slot].busy = false;
+        _CPU_ISR_Restore(level);
+        sStats.frames++;
+    } else if (key != 0 && sLogCount < LOG_LIMIT) {
+        sLogCount++;
+        gc_log("gfx: no free XFB for the frame in %08X", key);
+    }
+
+    now = gettime();
+    ticks = now - sTaskStart;
+    sStats.tasks++;
+    sStats.taskTicks += ticks;
+    if (ticks > sStats.maxTaskTicks) {
+        sStats.maxTaskTicks = ticks;
+    }
+    if (ticks_to_millisecs(now - sStatsStart) >= STATS_INTERVAL_MS) {
+        gx_log_stats(now);
+    }
+}
+
+void gfx_gx_present(const void* n64Framebuffer) {
+    u32 key = gx_key((u32)n64Framebuffer);
+    u32 level;
+    void* xfb = NULL;
+    int i;
+
+    if (!sReady || key == 0) {
+        return;
+    }
+    _CPU_ISR_Disable(level);
+    for (i = 0; i < sSlotCount; i++) {
+        if (sSlots[i].key == key && !sSlots[i].busy) {
+            break;
+        }
+    }
+    if (i < sSlotCount && i != sPresented) {
+        sPresented = i;
+        sSlots[i].stamp = ++sStamp;
+        xfb = sSlots[i].xfb;
+    }
+    _CPU_ISR_Restore(level);
+
+    if (xfb != NULL) {
+        gc_ogc_video_show_frame(xfb);
+    } else if (i >= sSlotCount && sStamp != 0 && !sLoggedNoFrame) {
+        // (before the first rendered frame this is the boot framebuffer: not interesting)
+        sLoggedNoFrame = true;
+        gc_log("gfx: present %08X: no frame was rendered into it (logged once)", key);
+    }
+}

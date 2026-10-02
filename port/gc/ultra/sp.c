@@ -1,11 +1,12 @@
 /**
- * libultra RSP/RDP API with the RCP stubbed (Milestone 2): osSpTask*, SP/DP status, osAfterPreNMI.
+ * libultra RSP/RDP API: osSpTask*, SP/DP status, osAfterPreNMI.
  *
- * A task "runs" instantly inside osSpTaskStartGo(), which posts the completion events the hardware
- * would raise. sched.c registers OS_EVENT_SP (RSP_DONE_MSG) and OS_EVENT_DP (RDP_DONE_MSG) on its
- * own interrupt queue and completes a task only when every unit it was dispatched to has reported
- * done; a missing event hangs Graph_TaskSet00/GameState_Destroy, an extra one completes the wrong
- * task. What the game sends:
+ * A task runs synchronously inside osSpTaskStartGo(): graphics tasks go through the GX renderer
+ * (gc_gfx_run_task, port/gc/gfx) when it is enabled, other tasks are still stubbed. It then posts
+ * the completion events the hardware would raise. sched.c registers OS_EVENT_SP (RSP_DONE_MSG) and
+ * OS_EVENT_DP (RDP_DONE_MSG) on its own interrupt queue and completes a task only when every unit it
+ * was dispatched to has reported done; a missing event hangs Graph_TaskSet00/GameState_Destroy, an
+ * extra one completes the wrong task. What the game sends:
  *   - M_GFXTASK (graph.c) has OS_SC_NEEDS_RSP | OS_SC_NEEDS_RDP and ends in gDPFullSync, so the
  *     scheduler waits for one SP and one DP event.
  *   - M_AUDTASK (audio), M_NJPEGTASK (z_jpeg.c) and the JP-only CIC task are RSP-only: one SP event.
@@ -32,7 +33,11 @@ void osSpTaskStartGo(OSTask* tp) {
     }
     sSpTaskCount[(type <= M_NJPEGTASK) ? type : (M_NJPEGTASK + 1)]++;
 
-    // Future hook: run the display list (M3) or the audio command list (M4) here.
+    // The display list is interpreted before the done events, so the frame is complete (copied to its
+    // XFB) by the time the scheduler swaps to its framebuffer. Audio command lists come in M4.
+    if (type == M_GFXTASK && gc_gfx_enabled()) {
+        gc_gfx_run_task((u32)tp->t.data_ptr);
+    }
 
     __gcPostEvent(OS_EVENT_SP);
     if (type == M_GFXTASK) {
