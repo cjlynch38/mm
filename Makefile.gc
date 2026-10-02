@@ -91,7 +91,7 @@ SHIFTJIS_O_FILES := $(foreach f,$(SHIFTJIS_C_FILES:.c=.o),$(BUILD_DIR)/$f)
 
 # Platform layer (port/gc). ultra/ and game/ use the game's headers; ogc/ uses libogc's.
 PORT_GAME_C  := $(wildcard port/gc/ultra/*.c port/gc/game/*.c)
-PORT_OGC_C   := $(wildcard port/gc/ogc/*.c)
+PORT_OGC_C   := $(wildcard port/gc/ogc/*.c port/gc/gfx/*.c)
 PORT_O_FILES := $(foreach f,$(PORT_GAME_C:.c=.o) $(PORT_OGC_C:.c=.o),$(BUILD_DIR)/$f)
 
 DEP_FILES := $(GAME_O_FILES:.o=.d) $(PORT_O_FILES:.o=.d)
@@ -160,6 +160,11 @@ $(BUILD_DIR)/src/%.o: src/%.c
 $(BUILD_DIR)/port/gc/ogc/%.o: port/gc/ogc/%.c
 	@mkdir -p $(@D)
 	$(CC) -c $(OGC_CFLAGS) -MMD -MP -o $@ $<
+
+# Renderer (libogc headers, own GBI constants in gfx_gbi.h)
+$(BUILD_DIR)/port/gc/gfx/%.o: port/gc/gfx/%.c
+	@mkdir -p $(@D)
+	$(CC) -c $(OGC_CFLAGS) -Iport/gc/gfx -MMD -MP -o $@ $<
 
 $(BUILD_DIR)/port/gc/%.o: port/gc/%.c
 	@mkdir -p $(@D)

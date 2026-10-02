@@ -167,6 +167,21 @@ void* gc_mem_alloc(unsigned int size, unsigned int align);
 void gc_set_reset_callback(void (*callback)(void));
 
 /* ------------------------------------------------------------------------------------------ */
+/* Renderer (port/gc/gfx): runs the game's graphics tasks through GX                           */
+/* ------------------------------------------------------------------------------------------ */
+
+/** Called once by ogc/main.c after the console video init; the renderer takes over the display. */
+void gc_gfx_init(void);
+/** Nonzero if the renderer draws (zero in console-only builds: tasks are then skipped). */
+int gc_gfx_enabled(void);
+/** Run an F3DZEX2 graphics task synchronously (from osSpTaskStartGo, on the game's Sched thread).
+ *  dlist is the task's data_ptr: the display list address as the game wrote it (KSEG0 or physical). */
+void gc_gfx_run_task(unsigned int dlist);
+/** Show the frame rendered into N64 framebuffer `framebuffer` (called by the VI service thread at the
+ *  retrace where osViSwapBuffer's buffer becomes current). */
+void gc_gfx_present(const void* framebuffer);
+
+/* ------------------------------------------------------------------------------------------ */
 /* Implemented on the ultra side (port/gc/ultra), called by port/gc/ogc/main.c                  */
 /* ------------------------------------------------------------------------------------------ */
 
