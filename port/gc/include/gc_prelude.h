@@ -45,4 +45,35 @@
 #define guOrtho n64_guOrtho
 #define guPerspective n64_guPerspective
 
+/*
+ * ---- game-asm renames ----
+ * C replacements for the game's MIPS assembly live in port/gc/game. fp.c replaces
+ * src/boot/libc64/fp.s (declared in include/libc64/fixed_point.h) and keeps the N64 semantics:
+ * results pass through a 32-bit integer and nearbyint rounds ties to even. newlib's libm defines
+ * floor, floorf, ceil, ceilf, trunc, truncf, round, roundf, lround, lroundf, nearbyint and
+ * nearbyintf with C99 semantics, so all 20 functions get n64_ names. The rename also stops GCC
+ * from treating the calls as builtins. It renames every game identifier with these names, e.g.
+ * the member SSList floor in z64bgcheck.h becomes n64_floor (consistently, in all game TUs).
+ */
+#define floorf n64_floorf
+#define floor n64_floor
+#define lfloorf n64_lfloorf
+#define lfloor n64_lfloor
+#define ceilf n64_ceilf
+#define ceil n64_ceil
+#define lceilf n64_lceilf
+#define lceil n64_lceil
+#define truncf n64_truncf
+#define trunc n64_trunc
+#define ltruncf n64_ltruncf
+#define ltrunc n64_ltrunc
+#define nearbyintf n64_nearbyintf
+#define nearbyint n64_nearbyint
+#define lnearbyintf n64_lnearbyintf
+#define lnearbyint n64_lnearbyint
+#define roundf n64_roundf
+#define round n64_round
+#define lroundf n64_lroundf
+#define lround n64_lround
+
 #endif

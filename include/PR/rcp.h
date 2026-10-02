@@ -797,8 +797,16 @@
  */
 #if defined(_LANGUAGE_C) || defined(_LANGUAGE_C_PLUS_PLUS)
 
+#ifdef TARGET_GC
+// There is no RCP on GameCube: register accesses go to an emulated register block (port/gc/ultra/io.c)
+u32 __gcIoRead(u32 addr);
+void __gcIoWrite(u32 addr, u32 data);
+#define IO_READ(addr)       __gcIoRead((u32)(addr))
+#define IO_WRITE(addr,data) __gcIoWrite((u32)(addr), (u32)(data))
+#else
 #define IO_READ(addr)       (*(vu32*)PHYS_TO_K1(addr))
 #define IO_WRITE(addr,data) (*(vu32*)PHYS_TO_K1(addr)=(u32)(data))
+#endif
 
 #define RCP_STAT_PRINT                                              \
     rmonPrintf("current=%x start=%x end=%x dpstat=%x spstat=%x\n",  \

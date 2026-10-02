@@ -899,7 +899,11 @@ void Fault_DisplayFrameBuffer(void) {
     } else {
         fb = osViGetNextFramebuffer();
         if ((uintptr_t)fb == K0BASE) {
+#ifdef TARGET_GC
+            fb = FAULT_FB_ADDRESS;
+#else
             fb = (void*)(PHYS_TO_K0(osMemSize) - SCREEN_HEIGHT * SCREEN_WIDTH * sizeof(u16));
+#endif
         }
     }
 

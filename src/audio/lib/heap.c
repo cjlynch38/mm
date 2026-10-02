@@ -127,8 +127,13 @@ void* AudioHeap_WritebackDCache(void* addr, size_t size) {
     Audio_WritebackDCache(addr, size);
     if (addr) {}
 
+#ifdef TARGET_GC
+    // GameCube has no KSEG1 alias at 0xA0000000; the CPU mixer reads the buffers through the cache.
+    return addr;
+#else
     // KSEG0 to KSEG1 (ensures data is written straight to ram instead of the data cache)
     return OS_PHYSICAL_TO_K1(OS_K0_TO_PHYSICAL(addr));
+#endif
 }
 
 /**

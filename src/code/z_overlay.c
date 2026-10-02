@@ -36,11 +36,17 @@ TransitionOverlayStatus TransitionOverlay_Load(TransitionOverlay* overlayEntry) 
     }
 
     if (Lib_PhysicalToVirtual(overlayEntry->loadInfo.addr) == NULL) {
+#ifdef TARGET_GC
+        // Linked at its VRAM address, which is below 16 MB so it fits the 24-bit loadInfo.addr field.
+        // Overlay_Load resets its data and bss (port/gc/game/overlay_static.c).
+        loadedRamAddr = overlayEntry->vramStart;
+#else
         loadedRamAddr = ZeldaArena_Malloc((uintptr_t)overlayEntry->vramEnd - (uintptr_t)overlayEntry->vramStart);
 
         if (loadedRamAddr == NULL) {
             return TRANSITION_OVERLAY_STATUS_FAILED;
         }
+#endif
 
         Overlay_Load(overlayEntry->file.vromStart, overlayEntry->file.vromEnd, overlayEntry->vramStart,
                      overlayEntry->vramEnd, loadedRamAddr);
@@ -79,7 +85,9 @@ TransitionOverlayStatus TransitionOverlay_Free(TransitionOverlay* overlayEntry) 
             count--;
             overlayEntry->loadInfo.count = count;
             if (count == 0) {
+#ifndef TARGET_GC // Linked into the executable, nothing to free
                 ZeldaArena_Free(loadedRamAddr);
+#endif
                 overlayEntry->loadInfo.addr = Lib_VirtualToPhysical(NULL);
                 return TRANSITION_OVERLAY_STATUS_LOAD_FREE;
             }

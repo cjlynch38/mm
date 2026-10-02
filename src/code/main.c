@@ -42,6 +42,9 @@ struct PadMgr gPadMgr;
 #include "libu64/system_heap.h"
 #include "z64nmi_buff.h"
 #include "z64thread.h"
+#ifdef TARGET_GC
+#include "gc_game.h"
+#endif
 
 s32 gScreenWidth = SCREEN_WIDTH;
 s32 gScreenHeight = SCREEN_HEIGHT;
@@ -63,9 +66,17 @@ void Main(void* arg) {
     Check_RegionIsSupported();
     Check_ExpansionPak();
 
+#ifdef TARGET_GC
+    // The N64 heap fills the RAM between the buffers and the fixed-address framebuffers; the
+    // GameCube build uses a static buffer of the same size (see gc_game.h).
+    sysHeap = (uintptr_t)gGcSystemHeap;
+    fb = sysHeap + GC_SYSTEM_HEAP_SIZE;
+    gSystemHeapSize = GC_SYSTEM_HEAP_SIZE;
+#else
     sysHeap = (uintptr_t)SEGMENT_END(buffers);
     fb = FRAMEBUFFERS_START_ADDR;
     gSystemHeapSize = fb - sysHeap;
+#endif
     PRINTF(T("システムヒープ初期化 %08x-%08x %08x\n", "System heap initialization %08x-%08x %08x\n"), systemHeapStart,
            fb, sysHeap);
     SystemHeap_Init((void*)sysHeap, gSystemHeapSize);

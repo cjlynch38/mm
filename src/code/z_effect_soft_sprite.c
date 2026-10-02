@@ -48,9 +48,11 @@ void EffectSs_ClearAll(PlayState* play) {
     overlay = &gEffectSsOverlayTable[0];
     for (i = 0; i < EFFECT_SS_TYPE_MAX; i++) {
         addr = overlay->loadedRamAddr;
+#ifndef TARGET_GC // Overlays are linked into the executable, nothing to free
         if (addr != NULL) {
             ZeldaArena_Free(addr);
         }
+#endif
 
         overlay->loadedRamAddr = NULL;
         overlay++;
@@ -185,11 +187,16 @@ void EffectSs_Spawn(PlayState* play, s32 type, s32 priority, void* initData) {
         profile = overlayEntry->profile;
     } else {
         if (overlayEntry->loadedRamAddr == NULL) {
+#ifdef TARGET_GC
+            // Linked at its VRAM address; Overlay_Load resets its data and bss (overlay_static.c)
+            overlayEntry->loadedRamAddr = overlayEntry->vramStart;
+#else
             overlayEntry->loadedRamAddr = ZeldaArena_MallocR(overlaySize);
 
             if (overlayEntry->loadedRamAddr == NULL) {
                 return;
             }
+#endif
 
             Overlay_Load(overlayEntry->file.vromStart, overlayEntry->file.vromEnd, overlayEntry->vramStart,
                          overlayEntry->vramEnd, overlayEntry->loadedRamAddr);

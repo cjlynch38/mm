@@ -54,6 +54,16 @@ void Main_InitScreen(void) {
     osViBlack(false);
 }
 
+#ifdef TARGET_GC
+// The program's memory is zeroed by the C runtime and the rest of RAM does not belong to the game.
+// The code segment is linked into the executable, so Main_Init has nothing to load or clear.
+void Main_InitMemory(void) {
+}
+
+void Main_Init(void) {
+    Main_InitScreen();
+}
+#else
 void Main_InitMemory(void) {
     void* memStart = (void*)BOOT_ADDRESS_ULTRA;
     void* memEnd = OS_PHYSICAL_TO_K0(osMemSize);
@@ -88,6 +98,7 @@ void Main_Init(void) {
 
     Main_ClearMemory(SEGMENT_BSS_START(code), SEGMENT_BSS_END(code));
 }
+#endif
 
 void Main_ThreadEntry(void* arg) {
     StackCheck_Init(&sIrqMgrStackInfo, sIrqMgrStack, STACK_TOP(sIrqMgrStack), 0, 0x100, "irqmgr");
@@ -135,6 +146,19 @@ void Idle_ThreadEntry(void* arg) {
     osCreateThread(&sMainThread, Z_THREAD_ID_MAIN, Main_ThreadEntry, arg, STACK_TOP(sMainStack), Z_PRIORITY_MAIN);
     osStartThread(&sMainThread);
     osSetThreadPri(NULL, OS_PRIORITY_IDLE);
+
+#ifdef TARGET_GC
+    // Block instead of spinning: the GameCube has other idle-priority work (libogc's main thread).
+    {
+        OSMesgQueue idleQueue;
+        OSMesg idleMsg;
+
+        osCreateMesgQueue(&idleQueue, &idleMsg, 1);
+        for (;;) {
+            osRecvMesg(&idleQueue, NULL, OS_MESG_BLOCK);
+        }
+    }
+#endif
 
     for (;;) {}
 }

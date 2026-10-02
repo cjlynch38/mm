@@ -30,6 +30,9 @@ void __gcViRetrace(void);
 void __gcTimerInit(void);
 void __gcViInit(void);
 
+/** Write unsaved flash (save data) changes to the card now. Blocks on storage I/O (port/gc/ultra/flash.c). */
+void __gcFlashFlush(void);
+
 /** Stop with a message naming an unimplemented libultra function. */
 #define GC_TODO(name) gc_halt("GC_TODO: %s not implemented (%s:%d)", name, __FILE__, __LINE__)
 

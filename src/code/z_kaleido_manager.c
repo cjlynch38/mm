@@ -39,7 +39,13 @@ uintptr_t KaleidoManager_FaultAddrConv(uintptr_t address, void* param) {
 }
 
 void KaleidoManager_LoadOvl(KaleidoMgrOverlay* ovl) {
+#ifdef TARGET_GC
+    // Linked at its VRAM address; Overlay_Load resets its data and bss (port/gc/game/overlay_static.c).
+    // The pause menu and player overlays share sKaleidoAreaPtr on N64, so each load starts fresh there too.
+    ovl->loadedRamAddr = ovl->vramStart;
+#else
     ovl->loadedRamAddr = sKaleidoAreaPtr;
+#endif
     Overlay_Load(ovl->file.vromStart, ovl->file.vromEnd, ovl->vramStart, ovl->vramEnd, ovl->loadedRamAddr);
     ovl->offset = (uintptr_t)ovl->loadedRamAddr - (uintptr_t)ovl->vramStart;
     gKaleidoMgrCurOvl = ovl;
@@ -48,7 +54,9 @@ void KaleidoManager_LoadOvl(KaleidoMgrOverlay* ovl) {
 void KaleidoManager_ClearOvl(KaleidoMgrOverlay* ovl) {
     if (ovl->loadedRamAddr != NULL) {
         ovl->offset = 0;
+#ifndef TARGET_GC // On GameCube the area is the overlay's own code; the next load resets its data
         bzero(ovl->loadedRamAddr, (uintptr_t)ovl->vramEnd - (uintptr_t)ovl->vramStart);
+#endif
         ovl->loadedRamAddr = NULL;
         gKaleidoMgrCurOvl = NULL;
     }
@@ -66,7 +74,12 @@ void KaleidoManager_Init(PlayState* play) {
         }
     }
 
+#ifdef TARGET_GC
+    // No shared load area needed; keep the pointer non-NULL for code that checks it
+    sKaleidoAreaPtr = gKaleidoMgrOverlayTable[0].vramStart;
+#else
     sKaleidoAreaPtr = THA_AllocTailAlign16(&play->state.tha, largestSize);
+#endif
     gKaleidoMgrCurOvl = NULL;
     Fault_AddAddrConvClient(&sKaleidoMgrFaultAddrConvClient, KaleidoManager_FaultAddrConv, NULL);
 }
@@ -93,7 +106,13 @@ void* KaleidoManager_GetRamAddr(void* vram) {
                 return (void*)((uintptr_t)vram + ovl->offset);
             }
             ovl++;
+#ifdef AVOID_UB
+            //! @bug The original loop ends when ovl reaches &sKaleidoAreaPtr, relying on it directly following
+            //! gKaleidoMgrOverlayTable in memory.
+        } while (ovl < &gKaleidoMgrOverlayTable[ARRAY_COUNT(gKaleidoMgrOverlayTable)]);
+#else
         } while (ovl != (KaleidoMgrOverlay*)&sKaleidoAreaPtr);
+#endif
 
         return NULL;
     } else if (((uintptr_t)vram < (uintptr_t)gKaleidoMgrCurOvl->vramStart) ||

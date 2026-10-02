@@ -155,6 +155,11 @@ void AudioMgr_Init(AudioMgr* audioMgr, void* stack, OSPri pri, OSId id, Schedule
     R_AUDIOMGR_DEBUG_LEVEL = 1;
 #endif
 
+#ifdef TARGET_GC
+    // No audio microcode yet: run the audio driver every retrace but never submit an RSP task.
+    R_AUDIOMGR_DEBUG_LEVEL = 1;
+#endif
+
     osCreateMesgQueue(&audioMgr->cmdQueue, audioMgr->cmdMsgBuf, ARRAY_COUNT(audioMgr->cmdMsgBuf));
     osCreateMesgQueue(&audioMgr->interruptQueue, audioMgr->interruptMsgBuf, ARRAY_COUNT(audioMgr->interruptMsgBuf));
     osCreateMesgQueue(&audioMgr->lockQueue, audioMgr->lockMsgBuf, ARRAY_COUNT(audioMgr->lockMsgBuf));

@@ -396,12 +396,21 @@ void Graph_ThreadEntry(void* arg) {
         gameState = malloc(size);
 
         bzero(gameState, size);
+#ifdef TARGET_GC
+        Gc_TraceGameStateStart(ovl - gGameStateOverlayTable, size);
+#endif
         GameState_Init(gameState, ovl->init, &gfxCtx);
 
         while (GameState_IsRunning(gameState)) {
             Graph_Update(&gfxCtx, gameState);
+#ifdef TARGET_GC
+            Gc_TraceFrame();
+#endif
         }
 
+#ifdef TARGET_GC
+        Gc_TraceGameStateEnd();
+#endif
         nextOvl = Graph_GetNextGameState(gameState);
 
         if (size) {}

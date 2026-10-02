@@ -306,5 +306,9 @@ void FaultDrawer_SetInputCallback(FaultDrawerCallback callback) {
 void FaultDrawer_Init() {
     sFaultDrawerInstance = &sFaultDrawer;
     bcopy(&sFaultDrawerDefault, sFaultDrawerInstance, sizeof(FaultDrawer));
+#ifdef TARGET_GC
+    sFaultDrawerInstance->frameBuffer = (u16*)FAULT_FB_ADDRESS;
+#else
     sFaultDrawerInstance->frameBuffer = (u16*)(PHYS_TO_K0(osMemSize) - SCREEN_HEIGHT * SCREEN_WIDTH * sizeof(u16));
+#endif
 }

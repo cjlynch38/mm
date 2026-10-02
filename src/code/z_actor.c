@@ -3439,7 +3439,9 @@ void Actor_FreeOverlay(ActorOverlay* entry) {
                 entry->loadedRamAddr = NULL;
             } else {
                 PRINTF(T("オーバーレイ解放します\n", "Overlay deallocated\n"));
+#ifndef TARGET_GC
                 ZeldaArena_Free(entry->loadedRamAddr);
+#endif
                 entry->loadedRamAddr = NULL;
             }
         }
@@ -3465,6 +3467,11 @@ ActorProfile* Actor_LoadOverlay(ActorContext* actorCtx, s16 index) {
         profile = overlayEntry->profile;
     } else {
         if (overlayEntry->loadedRamAddr == NULL) {
+#ifdef TARGET_GC
+            // Overlays are linked into the executable at their VRAM address. Overlay_Load resets the
+            // overlay's data and bss as a fresh load from ROM would (port/gc/game/overlay_static.c).
+            gActorOverlayTable[index].loadedRamAddr = overlayEntry->vramStart;
+#else
             if (overlayEntry->allocType & ALLOCTYPE_ABSOLUTE) {
                 if (actorCtx->absoluteSpace == NULL) {
                     actorCtx->absoluteSpace = ZeldaArena_MallocR(AM_FIELD_SIZE);
@@ -3479,6 +3486,7 @@ ActorProfile* Actor_LoadOverlay(ActorContext* actorCtx, s16 index) {
             if (overlayEntry->loadedRamAddr == NULL) {
                 return NULL;
             }
+#endif
 
             Overlay_Load(overlayEntry->file.vromStart, overlayEntry->file.vromEnd, overlayEntry->vramStart,
                          overlayEntry->vramEnd, overlayEntry->loadedRamAddr);

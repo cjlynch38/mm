@@ -109,7 +109,7 @@ $(BUILD_DIR)/src/libultra/gu/cosf.o: POSTPROCESS_OBJ = $(OBJCOPY) --strip-symbol
 #### Targets ####
 
 .PHONY: all objs port sizes clean
-all: objs port
+all: objs port dol
 
 port: $(PORT_O_FILES)
 	@echo "Compiled $(words $(PORT_O_FILES)) platform objects"
@@ -156,3 +156,105 @@ $(BUILD_DIR)/assets/audio/sequence_font_table.o: $(N64_BUILD_DIR)/assets/audio/s
 	$(AS) -o $@ $(@:.o=.ppc.s)
 
 -include $(DEP_FILES)
+
+#### Link: ELF and DOL ####
+
+# port/gc/tools/gen_gc_link.py generates the link inputs from spec/spec, the matching N64 ELF and GAME_O_FILES:
+#   mm_gc.ld                devkitPPC's ogc.ld layout, plus every overlay as one contiguous block (_<seg>Segment*)
+#   abs_syms.ld             PROVIDE() of the N64 asset/ROM symbols (segmented addresses, VROM offsets)
+#   generated/ovl_ranges.c  overlay link ranges for the static overlay runtime
+# check_dmadata.py then checks the VROM symbols against the dmadata table of the user's ROM.
+NM          := $(PREFIX)nm
+MIPS_NM     := mips-linux-gnu-nm
+ELF2DOL     := $(DEVKITPRO)/tools/bin/elf2dol
+BASEROM_DIR := baseroms/$(VERSION)
+
+GC_OBJ_LIST    := $(BUILD_DIR)/game_o_files.txt
+GC_LD_SCRIPT   := $(BUILD_DIR)/mm_gc.ld
+GC_ABS_SYMS_LD := $(BUILD_DIR)/abs_syms.ld
+GC_EXTRA_LD    := $(BUILD_DIR)/linker_scripts/undefined_syms.ld
+OVL_RANGES_C   := $(BUILD_DIR)/generated/ovl_ranges.c
+OVL_RANGES_O   := $(BUILD_DIR)/generated/ovl_ranges.o
+DMADATA_OK     := $(BUILD_DIR)/dmadata_check.ok
+LINK_GEN       := $(GC_LD_SCRIPT) $(GC_ABS_SYMS_LD) $(GC_EXTRA_LD) $(OVL_RANGES_C) $(DMADATA_OK)
+
+GC_ELF       := $(BUILD_DIR)/mm-gc.elf
+GC_MAP       := $(BUILD_DIR)/mm-gc.map
+GC_DOL       := $(BUILD_DIR)/mm-gc.dol
+GC_PROBE_ELF := $(BUILD_DIR)/probe/mm-gc-probe.elf
+
+LINK_O_FILES := $(GAME_O_FILES) $(PORT_O_FILES) $(OVL_RANGES_O)
+GC_LIB_DIR   := $(DEVKITPRO)/libogc/lib/cube
+
+# -mogc adds devkitPPC's crt objects and system libraries. Given -T, it drops its default ogc.ld (mm_gc.ld replaces
+# it; several -T scripts accumulate). Its link spec also passes --gc-sections, which --no-gc-sections overrides.
+GC_LDFLAGS := -mogc -mcpu=750 -meabi -mhard-float \
+              -T $(GC_LD_SCRIPT) -T $(GC_ABS_SYMS_LD) -T $(GC_EXTRA_LD) \
+              -Wl,--no-gc-sections -L$(GC_LIB_DIR)
+# libiso9660: the Dolphin dev disc (Dolphin has no GameCube SD card), see port/gc/ogc/storage.c
+GC_LIBS    := -liso9660 -lfat -logc -lm
+
+# Libraries whose symbol names abs_syms.ld must not PROVIDE
+GC_TOOLCHAIN_LIBS := $(GC_LIB_DIR)/libiso9660.a $(GC_LIB_DIR)/libfat.a $(GC_LIB_DIR)/libogc.a \
+                     $(addprefix $(DEVKITPPC)/powerpc-eabi/lib/,libm.a libc.a libsysbase.a) \
+                     $(wildcard $(DEVKITPPC)/lib/gcc/powerpc-eabi/*/libgcc.a)
+
+GEN_GC_LINK      := $(PYTHON) port/gc/tools/gen_gc_link.py
+GEN_GC_LINK_ARGS := --objs $(GC_OBJ_LIST) --gc-build-dir $(BUILD_DIR) --nm $(NM)
+
+.PHONY: link-gen elf dol link-probe link-undefined FORCE
+FORCE:
+
+link-gen: $(LINK_GEN)
+elf: $(GC_ELF)
+dol: $(GC_DOL)
+
+# make -f Makefile.gc -s print-GAME_O_FILES
+print-%: ; @echo $($*)
+
+# The object list as a file that only changes when the list does, so the generators rerun only when needed
+$(GC_OBJ_LIST): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' $(GAME_O_FILES) > $@.tmp; cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+# D_0x000000 segment base symbols (absolute). As in the N64 Makefile, run through cpp: the file has C comments.
+$(GC_EXTRA_LD): linker_scripts/final/undefined_syms.ld
+	@mkdir -p $(@D)
+	gcc -E -P -xc -fno-dollars-in-identifiers -DMM_VERSION=N64_US $< > $@
+
+$(GC_LD_SCRIPT) $(GC_ABS_SYMS_LD) $(OVL_RANGES_C) &: spec/spec include/versions.h $(N64_ELF) $(GC_OBJ_LIST) \
+                                                      $(GC_EXTRA_LD) port/gc/tools/gen_gc_link.py
+	$(GEN_GC_LINK) generate $(GEN_GC_LINK_ARGS) --out-dir $(BUILD_DIR) --n64-elf $(N64_ELF) --mips-nm $(MIPS_NM) \
+	    --extra-ld $(GC_EXTRA_LD) $(addprefix --lib ,$(GC_TOOLCHAIN_LIBS))
+
+$(DMADATA_OK): $(GC_ABS_SYMS_LD) $(BASEROM_DIR)/baserom.z64 $(BASEROM_DIR)/segments.csv port/gc/tools/check_dmadata.py
+	$(PYTHON) port/gc/tools/check_dmadata.py --rom $(BASEROM_DIR)/baserom.z64 --segments $(BASEROM_DIR)/segments.csv \
+	    --abs-syms $(GC_ABS_SYMS_LD)
+	@touch $@
+
+$(OVL_RANGES_O): $(OVL_RANGES_C)
+	$(CC) -c $(GAME_CPPFLAGS) $(GAME_CFLAGS) $(GAME_WARNINGS) $(PORT_WARNINGS) -MMD -MP -o $@ $<
+
+-include $(OVL_RANGES_O:.o=.d)
+
+$(GC_ELF): $(LINK_O_FILES) $(LINK_GEN)
+	$(CC) $(GC_LDFLAGS) -Wl,-Map,$(GC_MAP) -o $@ $(LINK_O_FILES) $(GC_LIBS)
+	$(GEN_GC_LINK) verify $(GEN_GC_LINK_ARGS) --elf $@ --map $(GC_MAP) || { rm -f $@; exit 1; }
+
+# elf2dol leaves the last section unpadded, which Dolphin rejects; dolpad.py pads it
+$(GC_DOL): $(GC_ELF)
+	$(ELF2DOL) $< $@
+	$(PYTHON) port/gc/tools/dolpad.py $@
+
+# Link with unresolved symbols allowed, to inspect the layout before the platform layer is complete
+link-probe: $(LINK_O_FILES) $(LINK_GEN)
+	@mkdir -p $(dir $(GC_PROBE_ELF))
+	$(CC) $(GC_LDFLAGS) -Wl,--unresolved-symbols=ignore-all -Wl,-Map,$(GC_PROBE_ELF:.elf=.map) \
+	    -o $(GC_PROBE_ELF) $(LINK_O_FILES) $(GC_LIBS)
+	$(GEN_GC_LINK) verify $(GEN_GC_LINK_ARGS) --elf $(GC_PROBE_ELF) --map $(GC_PROBE_ELF:.elf=.map)
+
+# Symbols the link still lacks (what the platform layer has yet to provide), one per line
+link-undefined: $(LINK_O_FILES) $(LINK_GEN)
+	@mkdir -p $(dir $(GC_PROBE_ELF))
+	@{ $(CC) $(GC_LDFLAGS) -o $(GC_PROBE_ELF:.elf=-undef.elf) $(LINK_O_FILES) $(GC_LIBS) 2>&1 || true; } \
+	    | sed -n -E "s/.*undefined reference to [\`']([^']+)'.*/\1/p" | sort -u

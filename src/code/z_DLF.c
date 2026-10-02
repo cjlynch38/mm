@@ -185,7 +185,9 @@ void Overlay_FreeGameState(GameStateOverlay* overlayEntry) {
             }
 #endif
 
+#ifndef TARGET_GC // Linked into the executable (Overlay_AllocateAndLoad returned vramStart)
             free(overlayEntry->loadedRamAddr);
+#endif
             overlayEntry->loadedRamAddr = NULL;
         }
     }
