@@ -1,6 +1,16 @@
 #include "global.h"
 #include "audiomgr.h"
 
+#ifdef TARGET_GC
+#include "gc_options.h"
+#include "z64thread.h"
+
+// port/gc/ultra/ai.c: run an audio command list on the CPU (timed), and the CPU time of one AudioThread_Update,
+// for the audio statistics
+void Gc_AudioMgrRunTask(OSTask* task);
+void Gc_AudioMgrUpdateTime(OSTime time);
+#endif
+
 void AudioMgr_NotifyTaskDone(AudioMgr* audioMgr) {
     AudioTask* task = audioMgr->rspTask;
 
@@ -26,6 +36,12 @@ void AudioMgr_HandleRetrace(AudioMgr* audioMgr) {
 #endif
 
     if (audioMgr->rspTask != NULL) {
+#ifdef TARGET_GC
+        // No RSP: the CPU runs the command list right here. Through the scheduler it would wait behind the
+        // graphics tasks, which the Sched thread renders on the CPU for 10 ms and more, and this thread
+        // would wait for it, missing retraces (and, after 32 ms, taking the AUDIO SP TIMEOUT path below).
+        Gc_AudioMgrRunTask(&audioMgr->rspTask->task);
+#else
         audioMgr->audioTask.next = NULL;
         audioMgr->audioTask.flags = OS_SC_NEEDS_RSP;
         audioMgr->audioTask.framebuffer = NULL;
@@ -36,16 +52,27 @@ void AudioMgr_HandleRetrace(AudioMgr* audioMgr) {
         audioMgr->audioTask.msg = NULL;
         osSendMesg(&audioMgr->sched->cmdQueue, &audioMgr->audioTask, OS_MESG_BLOCK);
         Sched_SendNotifyMsg(audioMgr->sched);
+#endif
     }
 
     if (R_AUDIOMGR_DEBUG_LEVEL >= 2) {
         rspTask = NULL;
     } else {
+#ifdef TARGET_GC
+        OSTime updateStart = osGetTime();
+
         rspTask = AudioThread_Update();
+        Gc_AudioMgrUpdateTime(osGetTime() - updateStart);
+#else
+        rspTask = AudioThread_Update();
+#endif
     }
 
     if (audioMgr->rspTask != NULL) {
-#if MM_VERSION >= N64_US
+#ifdef TARGET_GC
+        // The task already ran above
+        AudioMgr_NotifyTaskDone(audioMgr);
+#elif MM_VERSION >= N64_US
         static s32 sRetryCount = 10;
         while (true) {
             osSetTimer(&timer, OS_USEC_TO_CYCLES(32000), 0, &audioMgr->cmdQueue, (OSMesg)timerMsgVal);
@@ -156,8 +183,16 @@ void AudioMgr_Init(AudioMgr* audioMgr, void* stack, OSPri pri, OSId id, Schedule
 #endif
 
 #ifdef TARGET_GC
-    // No audio microcode yet: run the audio driver every retrace but never submit an RSP task.
-    R_AUDIOMGR_DEBUG_LEVEL = 1;
+    // Audio command lists run on the CPU, on this thread (Gc_AudioMgrRunTask), and the output goes to the AI
+    // (port/gc/ultra/ai.c). GC_AUDIO=0 builds keep the M2 setup instead: the audio driver runs every retrace,
+    // but no audio task is ever run.
+    R_AUDIOMGR_DEBUG_LEVEL = GC_AUDIO ? 0 : 1;
+#if GC_AUDIO
+    // On N64 the scheduler (priority 16) only dispatches RSP tasks. Here it renders graphics tasks on the CPU,
+    // 10 ms and more right after a retrace, so below it every audio update would wait for that and the AI
+    // queue would run dry. Run above it (and above the DMA manager, whose ROM reads can be long too).
+    pri = Z_PRIORITY_IRQMGR;
+#endif
 #endif
 
     osCreateMesgQueue(&audioMgr->cmdQueue, audioMgr->cmdMsgBuf, ARRAY_COUNT(audioMgr->cmdMsgBuf));

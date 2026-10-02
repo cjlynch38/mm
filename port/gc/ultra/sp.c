@@ -1,15 +1,20 @@
 /**
  * libultra RSP/RDP API: osSpTask*, SP/DP status, osAfterPreNMI.
  *
- * A task runs synchronously inside osSpTaskStartGo(): graphics tasks go through the GX renderer
- * (gc_gfx_run_task, port/gc/gfx) when it is enabled, other tasks are still stubbed. It then posts
- * the completion events the hardware would raise. sched.c registers OS_EVENT_SP (RSP_DONE_MSG) and
- * OS_EVENT_DP (RDP_DONE_MSG) on its own interrupt queue and completes a task only when every unit it
- * was dispatched to has reported done; a missing event hangs Graph_TaskSet00/GameState_Destroy, an
- * extra one completes the wrong task. What the game sends:
+ * A task runs synchronously inside osSpTaskStartGo(), on the CPU: graphics tasks go through the GX
+ * renderer (gc_gfx_run_task, port/gc/gfx) when it is enabled, audio command lists through
+ * Gc_AudRunTask (port/gc/audio) and NJPEG decodes through Gc_NJpegRunTask (port/gc/game/njpeg_cpu.c).
+ * Other task types are skipped. It then posts the completion events the hardware would raise.
+ * sched.c registers OS_EVENT_SP (RSP_DONE_MSG) and OS_EVENT_DP (RDP_DONE_MSG) on its own interrupt
+ * queue and completes a task only when every unit it was dispatched to has reported done; a missing
+ * event hangs Graph_TaskSet00/GameState_Destroy, an extra one completes the wrong task. What the game
+ * sends:
  *   - M_GFXTASK (graph.c) has OS_SC_NEEDS_RSP | OS_SC_NEEDS_RDP and ends in gDPFullSync, so the
  *     scheduler waits for one SP and one DP event.
- *   - M_AUDTASK (audio), M_NJPEGTASK (z_jpeg.c) and the JP-only CIC task are RSP-only: one SP event.
+ *   - M_NJPEGTASK (z_jpeg.c) and the JP-only CIC task are RSP-only: one SP event.
+ *   - M_AUDTASK would be RSP-only too, but the GameCube audio manager runs its command lists itself
+ *     (Gc_AudioMgrRunTask, TARGET_GC code in audio_thread_manager.c) instead of queueing them behind
+ *     the graphics tasks the Sched thread renders. The case below covers any other sender.
  * The events are queued on the Sched thread's own queue, so they are handled after Sched_RunTask
  * has recorded curRSPTask/curRDPTask.
  *
@@ -33,10 +38,20 @@ void osSpTaskStartGo(OSTask* tp) {
     }
     sSpTaskCount[(type <= M_NJPEGTASK) ? type : (M_NJPEGTASK + 1)]++;
 
-    // The display list is interpreted before the done events, so the frame is complete (copied to its
-    // XFB) by the time the scheduler swaps to its framebuffer. Audio command lists come in M4.
-    if (type == M_GFXTASK && gc_gfx_enabled()) {
-        gc_gfx_run_task((u32)tp->t.data_ptr);
+    // The task's output is complete before the done events: the frame is copied to its XFB by the time
+    // the scheduler swaps to its framebuffer, the audio buffer is mixed by the time the audio manager
+    // sees the task done.
+    if (type == M_GFXTASK) {
+        if (gc_gfx_enabled()) {
+            gc_gfx_run_task((u32)tp->t.data_ptr);
+        }
+    } else if (type == M_AUDTASK) {
+        u64 start = gc_time_ticks();
+
+        Gc_AudRunTask(tp);
+        __gcAiNoteTaskTime(gc_time_ticks() - start);
+    } else if (type == M_NJPEGTASK) {
+        Gc_NJpegRunTask(tp);
     }
 
     __gcPostEvent(OS_EVENT_SP);

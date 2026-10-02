@@ -92,8 +92,8 @@ GAME_O_FILES := $(addprefix $(BUILD_DIR)/,$(GAME_O_REL)) \
 SHIFTJIS_C_FILES := src/audio/voice_external.c src/code/z_message.c src/code/z_message_nes.c
 SHIFTJIS_O_FILES := $(foreach f,$(SHIFTJIS_C_FILES:.c=.o),$(BUILD_DIR)/$f)
 
-# Platform layer (port/gc). ultra/ and game/ use the game's headers; ogc/ uses libogc's.
-PORT_GAME_C  := $(wildcard port/gc/ultra/*.c port/gc/game/*.c)
+# Platform layer (port/gc). ultra/, game/ and audio/ use the game's headers; ogc/ uses libogc's.
+PORT_GAME_C  := $(wildcard port/gc/ultra/*.c port/gc/game/*.c port/gc/audio/*.c)
 PORT_OGC_C   := $(wildcard port/gc/ogc/*.c port/gc/gfx/*.c)
 PORT_O_FILES := $(foreach f,$(PORT_GAME_C:.c=.o) $(PORT_OGC_C:.c=.o),$(BUILD_DIR)/$f)
 
@@ -103,17 +103,21 @@ DEP_FILES := $(GAME_O_FILES:.o=.d) $(PORT_O_FILES:.o=.d)
 
 # make -f Makefile.gc GC_AUTOSTART=1: press Start automatically on the title screen (unattended test runs).
 # make -f Makefile.gc GC_RENDERER=0: no GX renderer, the M2 text console stays the display (graphics tasks skipped).
+# make -f Makefile.gc GC_AUDIO=0: no sound; the audio driver runs without submitting audio tasks, as in M2.
 # Options are written to gc_options.h, which only changes (and triggers rebuilds) when an option does.
 GC_AUTOSTART ?= 0
 GC_RENDERER  ?= 1
+GC_AUDIO     ?= 1
 GC_OPTIONS_H := $(BUILD_DIR)/generated/gc_options.h
 
 $(GC_OPTIONS_H): FORCE
 	@mkdir -p $(@D)
-	@printf '#define GC_AUTOSTART %d\n#define GC_RENDERER %d\n' $(GC_AUTOSTART) $(GC_RENDERER) > $@.tmp; \
+	@printf '#define GC_AUTOSTART %d\n#define GC_RENDERER %d\n#define GC_AUDIO %d\n' \
+	    $(GC_AUTOSTART) $(GC_RENDERER) $(GC_AUDIO) > $@.tmp; \
 	    cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
 
-GC_OPTIONS_GAME_O := $(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o
+GC_OPTIONS_GAME_O := $(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o \
+                     $(BUILD_DIR)/port/gc/ultra/ai.o $(BUILD_DIR)/src/code/audio_thread_manager.o
 GC_OPTIONS_OGC_O  := $(BUILD_DIR)/port/gc/gfx/gfx_task.o
 $(GC_OPTIONS_GAME_O) $(GC_OPTIONS_OGC_O): $(GC_OPTIONS_H)
 $(GC_OPTIONS_GAME_O): GAME_CPPFLAGS += -I$(BUILD_DIR)/generated
@@ -169,6 +173,11 @@ $(BUILD_DIR)/src/%.o: src/%.c
 $(BUILD_DIR)/port/gc/ogc/%.o: port/gc/ogc/%.c
 	@mkdir -p $(@D)
 	$(CC) -c $(OGC_CFLAGS) -MMD -MP -o $@ $<
+
+# Audio command list interpreter (port/gc/audio): the game's headers and flags, like port/gc/game
+$(BUILD_DIR)/port/gc/audio/%.o: port/gc/audio/%.c
+	@mkdir -p $(@D)
+	$(CC) -c $(GAME_CPPFLAGS) $(GAME_CFLAGS) $(GAME_WARNINGS) $(PORT_WARNINGS) -MMD -MP -o $@ $<
 
 # Renderer (libogc headers, own GBI constants in gfx_gbi.h)
 $(BUILD_DIR)/port/gc/gfx/%.o: port/gc/gfx/%.c

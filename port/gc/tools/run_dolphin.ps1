@@ -20,11 +20,22 @@ Options: -Seconds 0 waits until Dolphin is closed by hand. -NoSd boots without
 the dev disc. -NoGecko leaves slot B empty (no log capture). -NoPadCheck skips
 the DOL padding check (to reproduce "Failed to init core").
 
+-ExtraConfig adds Dolphin settings for this run only, as <System>.<Section>.<Key>=<Value>
+(passed as -C; several can be given separated by ';'), for example
+'Dolphin.DSP.Volume=0'. -DumpAudio <file.wav> records the AI DMA output: it turns
+on Dolphin's audio dump for the run (Dump\Audio\<id>_<date>_dspdump*.wav in the
+user folder; Dolphin starts a new file whenever the AI sample rate changes) and
+copies the file written last to <file.wav>, any earlier ones of the run next to it
+as <file>-<n>.wav.
+
 Exit codes: 0 ok, 1 setup error, 2 Dolphin showed a dialog (error/warning),
 3 Dolphin exited before the time was up, 4 Dolphin had to be killed.
 
 .EXAMPLE
 powershell -ExecutionPolicy Bypass -File run_dolphin.ps1 -Dol C:\path\sd_probe.dol -Seconds 15
+
+.EXAMPLE
+run_dolphin.sh build/gc-n64-us/mm-gc.dol -Seconds 40 -DumpAudio 'C:\_mmgcport\dolphin\mm.wav' -ExtraConfig 'Dolphin.DSP.Volume=0'
 #>
 [CmdletBinding()]
 param(
@@ -40,7 +51,9 @@ param(
     [string]$DolphinUserDir = "$env:APPDATA\Dolphin Emulator",
     [string]$Distro = 'Ubuntu-24.04',
     [int]$LogTail = 60,
-    [switch]$NoPadCheck
+    [switch]$NoPadCheck,
+    [string[]]$ExtraConfig = @(),
+    [string]$DumpAudio = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -244,8 +257,25 @@ $dolphinArgs = @(
     '-C', "Dolphin.Core.SlotB=$slotB",
     '-C', 'Dolphin.Core.FastDiscSpeed=True',
     '-C', "Dolphin.Core.DefaultISO=$discIso",      # inserted when booting a DOL
-    '-e', $RunDol
+    # EFB copies reach RAM as on hardware (the renderer's framebuffer effects read them back);
+    # Dolphin's default keeps them on the GPU only, which makes port/gc/gfx turn the effects off.
+    '-C', 'Graphics.Hacks.EFBToTextureEnable=False'
 )
+$audioDumpDir = Join-Path $DolphinUserDir 'Dump\Audio'
+$runStartUtc = [DateTime]::UtcNow
+if ($DumpAudio) {
+    # DumpAudioSilent: replace an old dump without asking (the question would be a dialog)
+    $dolphinArgs += @('-C', 'Dolphin.DSP.DumpAudio=True', '-C', 'Dolphin.DSP.DumpAudioSilent=True')
+}
+foreach ($item in $ExtraConfig) {
+    foreach ($setting in ($item -split ';')) {
+        $setting = $setting.Trim()
+        if (-not $setting) { continue }
+        if ($setting -notmatch '^[^.=\s]+\.[^.=\s]+\.[^=\s]+=') { Fail "-ExtraConfig '$setting' is not <System>.<Section>.<Key>=<Value>" }
+        $dolphinArgs += @('-C', $setting)
+    }
+}
+$dolphinArgs += @('-e', $RunDol)
 $argLine = ($dolphinArgs | ForEach-Object { if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ } }) -join ' '
 
 $dolphinLog = Join-Path $DolphinUserDir 'Logs\dolphin.log'
@@ -376,6 +406,36 @@ try {
     try { $geckoPs.Stop(); $geckoPs.Dispose() } catch { }
 }
 
+# Audio dump: Dolphin has closed the files (and written their headers) by now. The run's files
+# are moved out of Dolphin's dump folder: the DSP (AI DMA) dump to -DumpAudio, the disc
+# streaming (DTK) dump, which this port never uses, next to it as <file>-dtk.wav.
+if ($DumpAudio) {
+    $dumps = @()
+    $dtk = @()
+    if (Test-Path -LiteralPath $audioDumpDir) {
+        $new = @(Get-ChildItem -LiteralPath $audioDumpDir -Filter '*.wav' |
+            Where-Object { $_.LastWriteTimeUtc -ge $runStartUtc } | Sort-Object LastWriteTimeUtc)
+        $dumps = @($new | Where-Object { $_.Name -like '*dspdump*' })
+        $dtk = @($new | Where-Object { $_.Name -like '*dtkdump*' })
+    }
+    if ($dumps.Count -eq 0) {
+        Say "run_dolphin: no audio dump was written to $audioDumpDir"
+    } else {
+        $d = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($DumpAudio))
+        if ($d) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        $base = Join-Path $d ([System.IO.Path]::GetFileNameWithoutExtension($DumpAudio))
+        for ($i = 0; $i -lt $dumps.Count; $i++) {
+            $dest = if ($i -eq $dumps.Count - 1) { $DumpAudio } else { "$base-$i.wav" }
+            Move-Item -LiteralPath $dumps[$i].FullName -Destination $dest -Force
+            Say "run_dolphin: audio dump $($dumps[$i].Name) ($($dumps[$i].Length) bytes) -> $dest"
+        }
+        for ($i = 0; $i -lt $dtk.Count; $i++) {
+            $dest = if ($i -eq 0) { "$base-dtk.wav" } else { "$base-dtk-$i.wav" }
+            Move-Item -LiteralPath $dtk[$i].FullName -Destination $dest -Force
+        }
+    }
+}
+
 # --- report --------------------------------------------------------------------------------
 
 Say ''
@@ -388,7 +448,19 @@ if ($gecko.Port -ne 0) {
 
 Say ''
 if (Test-Path -LiteralPath $dolphinLog) {
-    $raw = [System.IO.File]::ReadAllBytes($dolphinLog)
+    # Share read/write: another Dolphin instance (a concurrent run) may still have the log open
+    $stream = [System.IO.File]::Open($dolphinLog, 'Open', 'Read', 'ReadWrite')
+    try {
+        $raw = New-Object byte[] $stream.Length
+        $got = 0
+        while ($got -lt $raw.Length) {
+            $n = $stream.Read($raw, $got, $raw.Length - $got)
+            if ($n -le 0) { break }
+            $got += $n
+        }
+    } finally {
+        $stream.Dispose()
+    }
     if ($raw.Length -lt $logStart) { $logStart = 0 }   # Dolphin truncated the log at startup
     $text = [System.Text.Encoding]::UTF8.GetString($raw, [int]$logStart, $raw.Length - [int]$logStart)
     $lines = $text -split "`r?`n" | Where-Object { $_ -and $_ -notmatch 'warning X\d{4}:|Shader@0x|compilation succeeded with warnings' }
