@@ -4,6 +4,7 @@
 #
 #   port/gc/tools/run_dolphin.sh port/gc/tests/sd_probe/sd_probe.dol -Seconds 15
 #   port/gc/tools/run_dolphin.sh -Dol build/gc-n64-us/mm.dol -Screenshot /tmp/mm.png -NoSd
+#   port/gc/tools/run_dolphin.sh build/gc-n64-us/mm-gc.iso -Seconds 60   (boots the disc image)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,13 +20,13 @@ args=()
 have_dol=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        -Dol | -Screenshot | -SdFolder | -Disc | -GeckoLog | -DolphinExe | -DolphinUserDir)
+        -Dol | -Iso | -Screenshot | -SdFolder | -Disc | -GeckoLog | -DolphinExe | -DolphinUserDir | -MemCard)
             [ $# -ge 2 ] || { echo "run_dolphin.sh: $1 needs a value" >&2; exit 1; }
-            [ "$1" = -Dol ] && have_dol=1
+            case "$1" in -Dol | -Iso) have_dol=1 ;; esac
             args+=("$1" "$(winpath "$2")")
             shift 2
             ;;
-        -Seconds | -LogTail | -Distro)
+        -Seconds | -LogTail | -Distro | -ScreenshotEvery)
             [ $# -ge 2 ] || { echo "run_dolphin.sh: $1 needs a value" >&2; exit 1; }
             args+=("$1" "$2")
             shift 2

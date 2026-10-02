@@ -123,6 +123,20 @@ $(GC_OPTIONS_GAME_O) $(GC_OPTIONS_OGC_O): $(GC_OPTIONS_H)
 $(GC_OPTIONS_GAME_O): GAME_CPPFLAGS += -I$(BUILD_DIR)/generated
 $(GC_OPTIONS_OGC_O): GFX_CFLAGS += -I$(BUILD_DIR)/generated
 
+# make -f Makefile.gc GC_ROM_FLAGS='-DGC_ROM_TRACE=1 ...': options of the ROM reader (the GC_ROM_* macros at
+# the top of port/gc/ogc/bridge_rom.c and platform.c). Its objects rebuild when the flags change.
+GC_ROM_FLAGS ?=
+GC_ROM_FLAGS_STAMP := $(BUILD_DIR)/generated/gc_rom_flags.txt
+GC_ROM_O := $(BUILD_DIR)/port/gc/ogc/bridge_rom.o $(BUILD_DIR)/port/gc/ogc/platform.o
+
+$(GC_ROM_FLAGS_STAMP): FORCE
+	@mkdir -p $(@D)
+	@printf '%s\n' '$(GC_ROM_FLAGS)' > $@.tmp; \
+	    cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+$(GC_ROM_O): $(GC_ROM_FLAGS_STAMP)
+$(GC_ROM_O): OGC_CFLAGS += $(GC_ROM_FLAGS)
+
 #### Per-file settings (mirror the N64 Makefile) ####
 
 $(BUILD_DIR)/src/boot/build.o: GAME_CPPFLAGS += -DBUILD_CREATOR="\"zelda@srd44\"" -DBUILD_DATE="\"00-07-31\"" -DBUILD_TIME="\"17:04:16\""
@@ -137,7 +151,7 @@ $(BUILD_DIR)/src/libultra/gu/cosf.o: POSTPROCESS_OBJ = $(OBJCOPY) --strip-symbol
 #### Targets ####
 
 .PHONY: all objs port sizes clean
-all: objs port dol
+all: objs port dol apploader
 
 port: $(PORT_O_FILES)
 	@echo "Compiled $(words $(PORT_O_FILES)) platform objects"
@@ -283,6 +297,36 @@ $(GC_ELF): $(LINK_O_FILES) $(LINK_GEN)
 $(GC_DOL): $(GC_ELF)
 	$(ELF2DOL) $< $@
 	$(PYTHON) port/gc/tools/dolpad.py $@
+
+#### Bootable disc image ####
+
+# make -f Makefile.gc iso: build/gc-n64-us/mm-gc.iso, a GameCube disc image (game ID GMME00) with the
+# port's own apploader (port/gc/apploader, CC0), the DOL and YOUR ROM as /mmgcport/baserom.z64. It is
+# built locally from baseroms/n64-us/baserom.z64 and must never be committed or shared (build/ is
+# gitignored). See port/gc/README.md for booting it in Dolphin and with Swiss.
+GC_APPLOADER_DIR := $(BUILD_DIR)/apploader
+GC_APPLOADER_ELF := $(GC_APPLOADER_DIR)/apploader.elf
+GC_ISO           := $(BUILD_DIR)/mm-gc.iso
+APPLOADER_CFLAGS := -mcpu=750 -meabi -mhard-float -G0 -msdata=none -O2 -std=gnu17 -ffreestanding -fno-builtin \
+                    -fno-tree-loop-distribute-patterns -fno-asynchronous-unwind-tables -Wall -Wextra
+
+.PHONY: apploader iso
+apploader: $(GC_APPLOADER_ELF)
+iso: $(GC_ISO)
+
+$(GC_APPLOADER_DIR)/apploader.o: port/gc/apploader/apploader.c
+	@mkdir -p $(@D)
+	$(CC) -c $(APPLOADER_CFLAGS) -MMD -MP -o $@ $<
+
+-include $(GC_APPLOADER_DIR)/apploader.d
+
+$(GC_APPLOADER_ELF): $(GC_APPLOADER_DIR)/apploader.o port/gc/apploader/apploader.ld
+	$(CC) -mcpu=750 -meabi -mhard-float -nostdlib -nostartfiles -T port/gc/apploader/apploader.ld \
+	    -Wl,-Map,$(@:.elf=.map) -o $@ $<
+
+$(GC_ISO): $(GC_DOL) $(GC_APPLOADER_ELF) $(BASEROM_DIR)/baserom.z64 port/gc/tools/mkiso.py port/gc/tools/mkdevdisc.py
+	$(PYTHON) port/gc/tools/mkiso.py --dol $(GC_DOL) --apploader $(GC_APPLOADER_ELF) \
+	    --rom $(BASEROM_DIR)/baserom.z64 -o $@
 
 # Link with unresolved symbols allowed, to inspect the layout before the platform layer is complete
 link-probe: $(LINK_O_FILES) $(LINK_GEN)

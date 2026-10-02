@@ -17,6 +17,10 @@ ISO9660 readers ignore the system area (sectors 0-15), so the GameCube header
 fits there. The image ends with 16 spare sectors because libiso9660 always
 reads 32 KiB at a time.
 
+build_image() is shared with mkiso.py, which builds the bootable disc image the
+same way (a GameCube disc that is also an ISO9660 volume) with an apploader and
+the main DOL added.
+
 usage: mkdevdisc.py [SRC_DIR] [OUT_IMAGE] [--if-stale]
 """
 import argparse
@@ -26,6 +30,7 @@ import sys
 import time
 
 SECTOR = 2048
+SYSTEM_AREA = 16 * SECTOR  # ISO9660 leaves sectors 0-15 to the system: the GameCube boot data lives there
 GAME_ID = b"MMGE00"
 GC_MAGIC = 0xC2339F3D
 GC_DISC_MAX = 1459978240
@@ -35,6 +40,8 @@ DEFAULT_OUT = "/mnt/c/_mmgcport/dolphin/mmgcport-dev.iso"
 
 
 class Node:
+    """A directory or file of the image. `path` is the source file (files only)."""
+
     def __init__(self, name, path, is_dir, parent):
         self.name = name
         self.path = path
@@ -76,6 +83,33 @@ def scan(path, name, parent):
         elif entry.is_file():
             node.children.append(Node(entry.name, entry.path, False, node))
     return node
+
+
+def tree_from_files(files):
+    """A tree for (disc_path, source_file) pairs, e.g. ("mmgcport/baserom.z64", "baserom.z64")."""
+    root = Node("", None, True, None)
+    for disc_path, src in files:
+        parts = [p for p in disc_path.split("/") if p]
+        if not parts:
+            raise SystemExit(f"mkdevdisc: empty disc path for {src}")
+        node = root
+        for part in parts[:-1]:
+            check_name(part)
+            child = next((c for c in node.children if c.name == part), None)
+            if child is None:
+                child = Node(part, None, True, node)
+                node.children.append(child)
+            elif not child.is_dir:
+                raise SystemExit(f"mkdevdisc: {disc_path}: {part} is a file")
+            node = child
+        check_name(parts[-1])
+        if any(c.name.upper() == parts[-1].upper() for c in node.children):
+            raise SystemExit(f"mkdevdisc: {disc_path} given twice")
+        node.children.append(Node(parts[-1], src, False, node))
+    for node in walk(root):
+        if node.is_dir:
+            node.children.sort(key=lambda c: c.name.upper())
+    return root
 
 
 def walk(node):
@@ -190,13 +224,13 @@ def gc_header(fst_offset, fst_size, stamp_text):
     return bytes(hdr)
 
 
-def pvd(total_sectors, pt_size, l_table, m_table, root, stamp, stamp17):
+def pvd(total_sectors, pt_size, l_table, m_table, root, stamp, stamp17, volume_id):
     d = bytearray(SECTOR)
     d[0] = 1
     d[1:6] = b"CD001"
     d[6] = 1
     d[8:40] = b"GAMECUBE".ljust(32)
-    d[40:72] = VOLUME_ID.ljust(32)
+    d[40:72] = volume_id.ljust(32)
     d[80:88] = both32(total_sectors)
     d[120:124] = both16(1)
     d[124:128] = both16(1)
@@ -218,14 +252,22 @@ def pvd(total_sectors, pt_size, l_table, m_table, root, stamp, stamp17):
     return bytes(d)
 
 
-def build(src, out):
-    root = scan(src, "", None)
+def build_image(root, out, system_area, volume_id, mtime, blobs=(), file_align=SECTOR):
+    """Write a GameCube disc image that is also an ISO9660 volume holding the files under `root`.
+
+    system_area(fst_offset, fst_size, blob_offsets) returns the bytes of 0x0000-0x7FFF (boot.bin,
+    bi2.bin, the apploader). `blobs` are byte strings placed after the FST, each at a `file_align`
+    boundary (the main DOL); `file_align` (a multiple of SECTOR) also aligns every file.
+    Returns (files, image size, fst offset, fst size, blob offsets)."""
+    if file_align % SECTOR:
+        raise SystemExit(f"mkdevdisc: file alignment {file_align} is not a multiple of {SECTOR}")
+    align = file_align // SECTOR
     dirs = path_table_order(root)
-    t = time.gmtime(newest_mtime(src))
+    t = time.gmtime(mtime)
     stamp = bytes([t.tm_year - 1900, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec, 0])
     stamp17 = time.strftime("%Y%m%d%H%M%S00", t).encode() + b"\x00"
 
-    # Layout: PVD 16, terminator 17, L table, M table, directories, FST, files.
+    # Layout: PVD 16, terminator 17, L table, M table, directories, FST, blobs, files.
     pt_size = len(path_table(dirs, False))
     l_table = 18
     m_table = l_table + sectors(pt_size)
@@ -236,13 +278,23 @@ def build(src, out):
     fst_size = len(gc_fst(root))
     fst_sector = cur
     cur += sectors(fst_size)
+    blob_sectors = []
+    for blob in blobs:
+        cur = (cur + align - 1) // align * align
+        blob_sectors.append(cur)
+        cur += sectors(len(blob))
     files = [n for n in walk(root) if not n.is_dir]
     for node in files:
+        cur = (cur + align - 1) // align * align
         node.extent = cur if node.size else 0
         cur += sectors(node.size)
     total = (cur + 16 + 15) // 16 * 16
     if total * SECTOR > GC_DISC_MAX:
         raise SystemExit(f"mkdevdisc: {total * SECTOR} bytes does not fit on a GameCube disc")
+    blob_offsets = [s * SECTOR for s in blob_sectors]
+    head = system_area(fst_sector * SECTOR, fst_size, blob_offsets)
+    if len(head) > SYSTEM_AREA:
+        raise SystemExit(f"mkdevdisc: the boot data ({len(head)} bytes) does not fit below 0x{SYSTEM_AREA:X}")
 
     tmp = out + ".tmp"
     with open(tmp, "wb") as f:
@@ -251,8 +303,8 @@ def build(src, out):
             f.seek(sector * SECTOR)
             f.write(data)
 
-        put(0, gc_header(fst_sector * SECTOR, fst_size, time.strftime("%Y/%m/%d", t).encode()))
-        put(16, pvd(total, pt_size, l_table, m_table, root, stamp, stamp17))
+        put(0, head)
+        put(16, pvd(total, pt_size, l_table, m_table, root, stamp, stamp17, volume_id))
         put(17, b"\xffCD001\x01".ljust(SECTOR, b"\x00"))
         put(l_table, path_table(dirs, False))
         put(m_table, path_table(dirs, True))
@@ -266,6 +318,8 @@ def build(src, out):
                 data += rec
             put(node.extent, bytes(data))
         put(fst_sector, gc_fst(root))
+        for sector, blob in zip(blob_sectors, blobs):
+            put(sector, blob)
         for node in files:
             f.seek(node.extent * SECTOR)
             with open(node.path, "rb") as src_file:
@@ -276,7 +330,19 @@ def build(src, out):
                     f.write(chunk)
         f.truncate(total * SECTOR)
     os.replace(tmp, out)
-    return files, total * SECTOR
+    return files, total * SECTOR, fst_sector * SECTOR, fst_size, blob_offsets
+
+
+def build(src, out):
+    root = scan(src, "", None)
+    mtime = newest_mtime(src)
+    date = time.strftime("%Y/%m/%d", time.gmtime(mtime)).encode()
+
+    def system_area(fst_offset, fst_size, blob_offsets):
+        return gc_header(fst_offset, fst_size, date)
+
+    files, size, _, _, _ = build_image(root, out, system_area, VOLUME_ID, mtime)
+    return files, size
 
 
 def main():

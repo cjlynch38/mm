@@ -18,6 +18,17 @@ extern unsigned char __Arena1Lo[] __attribute__((weak));
 /* Game-visible memory must stay below this address (see gc_mem_alloc) */
 #define GAME_MEMORY_LIMIT 0x81000000u
 
+/* 1: preload the hot ROM range (GC_ROM_HOT_START-END) into ARAM at boot, next to the audio data.
+ * Off by default with -DGC_ROM_RESIDENT_ARAM=0 (GC_ROM_FLAGS reach this file too): resident ranges
+ * then live in MEM1, which has no room for another 4 MiB next to the audio data. */
+#ifndef GC_ROM_HOT_RESIDENT
+#if defined(GC_ROM_RESIDENT_ARAM) && GC_ROM_RESIDENT_ARAM == 0
+#define GC_ROM_HOT_RESIDENT 0
+#else
+#define GC_ROM_HOT_RESIDENT 1
+#endif
+#endif
+
 void gc_ogc_init(void) {
     gc_ogc_log_init();
     gc_ogc_sync_init();
@@ -49,8 +60,6 @@ void gc_ogc_print_memory_map(void) {
 }
 
 void gc_ogc_boot(void) {
-    char romPath[64];
-    const char* root;
     const char* error;
 
     gc_ogc_video_init();
@@ -59,25 +68,31 @@ void gc_ogc_boot(void) {
            _V_MINOR_, _V_PATCH_);
     gc_log("Video: %d Hz; USB Gecko in slot B: %s", gc_video_refresh_hz(), gc_ogc_log_gecko() ? "yes" : "no");
 
-    root = gc_ogc_storage_mount();
-    if (root == NULL) {
-        gc_halt("No SD card found (tried SD2SP2, then SD Gecko in slots A and B). Put your ROM at "
-                "SD:" GC_ROM_FILE ".");
-    }
-    if (gc_ogc_sd_mounted()) {
+    // The SD card first: the log file and saves go there, and it may hold the ROM or the disc image.
+    if (gc_ogc_sd_mount() != NULL) {
         gc_ogc_log_open_file(GC_LOG_PATH);
-    } else {
-        gc_log("No SD card: no log file, and saves are not kept");
     }
-
-    snprintf(romPath, sizeof(romPath), "%s%s", root, GC_ROM_FILE);
-    error = gc_ogc_rom_open(romPath);
+    error = gc_ogc_storage_open_rom();
     if (error != NULL) {
         gc_halt("%s", error);
+    }
+    if (!gc_ogc_sd_mounted()) {
+        if (gc_ogc_card_mount() == 0) {
+            gc_log("No SD card: no log file; saves go to the memory card");
+        } else {
+            gc_log("No SD card and no memory card: no log file, and saves are not kept");
+        }
     }
     if (gc_ogc_rom_preload(GC_ROM_RESIDENT_START, GC_ROM_RESIDENT_END) != 0) {
         gc_halt("Could not load the audio data from the ROM into RAM (see above).");
     }
+#if GC_ROM_HOT_RESIDENT
+    // Optional: without it those files are read from the disc like the rest
+    if (gc_ogc_rom_preload(GC_ROM_HOT_START, GC_ROM_HOT_END) != 0) {
+        gc_log("ROM: the hot range stays on the disc");
+    }
+#endif
+    gc_ogc_rom_cache_init();
     // After the ROM preload, so the renderer only takes memory that is really left; the console stays
     // the display until the renderer shows its first frame.
     gc_gfx_init();

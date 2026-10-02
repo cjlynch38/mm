@@ -10,6 +10,9 @@
  * Whatever step a crash or power loss interrupts, a complete save remains: mm.fla, else
  * mm.fla.bak (the previous save), else a mm.fla.tmp of the full size (written in step 1).
  * gc_save_load tries them in that order.
+ *
+ * Without an SD card (booted from the disc), saves go to the memory card if one was mounted at boot
+ * (storage.c, gc_ogc_card_save_load/store).
  */
 #include <gccore.h>
 #include <ogc/lwp_watchdog.h>
@@ -53,6 +56,12 @@ int gc_save_load(void* dst, unsigned int size) {
     int ret = 0;
 
     if (!gc_ogc_sd_mounted()) {
+        if (gc_ogc_card_mounted()) {
+            LWP_MutexLock(sSaveMutex);
+            ret = gc_ogc_card_save_load(dst, size);
+            LWP_MutexUnlock(sSaveMutex);
+            return ret;
+        }
         gc_log("save: no SD card, starting without a save");
         return -1;
     }
@@ -110,6 +119,12 @@ int gc_save_store(const void* src, unsigned int size) {
     int ok;
 
     if (!gc_ogc_sd_mounted()) {
+        if (gc_ogc_card_mounted()) {
+            LWP_MutexLock(sSaveMutex);
+            ok = gc_ogc_card_save_store(src, size);
+            LWP_MutexUnlock(sSaveMutex);
+            return ok;
+        }
         gc_log("save: no SD card, the save is not kept");
         return -1;
     }

@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Runs a GameCube DOL in Dolphin 2609 for the mmgcport dev loop and collects its output.
+Runs a GameCube DOL or disc image in Dolphin 2609 for the mmgcport dev loop and collects its output.
 
 .DESCRIPTION
 Dolphin 2609 has no SD card on the GameCube side (no SD adapter EXI device; the
@@ -28,6 +28,20 @@ user folder; Dolphin starts a new file whenever the AI sample rate changes) and
 copies the file written last to <file.wav>, any earlier ones of the run next to it
 as <file>-<n>.wav.
 
+A disc image (.iso or .gcm, e.g. build/gc-n64-us/mm-gc.iso from 'make -f Makefile.gc iso')
+can be given instead of a DOL (-Dol or its alias -Iso): Dolphin then boots the disc
+itself (its emulated IPL runs the disc's apploader), as a console would, and no dev
+disc is inserted. -MemCard <file.raw> puts a raw memory card image in slot A for the
+run (Dolphin.Core.SlotA=1 and MemcardAPath; a missing file is created as a 59-block
+card; Dolphin names it <file>.<region>.<blocks>.raw, e.g. memcard-a.USA.59.raw).
+Without -MemCard slot A is empty, so every run starts without a save (the port saves
+to the memory card when there is no SD card, which Dolphin never has).
+
+-ScreenshotEvery <n> also screenshots the render window every n seconds of the run, to
+<screenshot>-<t>s.png (t = seconds since the start), to follow a run as a sequence.
+With -ExtraConfig 'Dolphin.Core.EmulationSpeed=0' (no speed limit) the game runs several
+times faster than real time; the Gecko log's timestamps stay in game time.
+
 Exit codes: 0 ok, 1 setup error, 2 Dolphin showed a dialog (error/warning),
 3 Dolphin exited before the time was up, 4 Dolphin had to be killed.
 
@@ -36,10 +50,13 @@ powershell -ExecutionPolicy Bypass -File run_dolphin.ps1 -Dol C:\path\sd_probe.d
 
 .EXAMPLE
 run_dolphin.sh build/gc-n64-us/mm-gc.dol -Seconds 40 -DumpAudio 'C:\_mmgcport\dolphin\mm.wav' -ExtraConfig 'Dolphin.DSP.Volume=0'
+
+.EXAMPLE
+run_dolphin.sh build/gc-n64-us/mm-gc.iso -Seconds 60 -MemCard 'C:\_mmgcport\dolphin\memcard-a.raw'
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)][string]$Dol,
+    [Parameter(Mandatory = $true, Position = 0)][Alias('Iso')][string]$Dol,
     [int]$Seconds = 20,
     [string]$Screenshot = 'C:\_mmgcport\dolphin\screenshot.png',
     [switch]$NoSd,
@@ -53,7 +70,9 @@ param(
     [int]$LogTail = 60,
     [switch]$NoPadCheck,
     [string[]]$ExtraConfig = @(),
-    [string]$DumpAudio = ''
+    [string]$DumpAudio = '',
+    [int]$ScreenshotEvery = 0,
+    [string]$MemCard = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -212,7 +231,17 @@ function Get-ShotPath([string]$Suffix) {
 if (-not (Test-Path -LiteralPath $DolphinExe)) { Fail "Dolphin not found at $DolphinExe" }
 if (-not (Test-Path -LiteralPath $Dol)) { Fail "DOL not found: $Dol" }
 $Dol = (Resolve-Path -LiteralPath $Dol).ProviderPath
-if (-not $NoPadCheck -and -not (Test-DolPadded $Dol)) {
+# A disc image boots like a disc: Dolphin runs its apploader; no dev disc goes in the drive.
+$isDisc = $Dol -match '\.(iso|gcm)$'
+if ($isDisc) {
+    $head = New-Object byte[] 0x20
+    $stream = [System.IO.File]::OpenRead($Dol)
+    try { [void]$stream.Read($head, 0, $head.Length) } finally { $stream.Dispose() }
+    if ($head[0x1C] -ne 0xC2 -or $head[0x1D] -ne 0x33 -or $head[0x1E] -ne 0x9F -or $head[0x1F] -ne 0x3D) {
+        Fail "$Dol is not a GameCube disc image (no disc magic at 0x1C)"
+    }
+    $NoSd = $true
+} elseif (-not $NoPadCheck -and -not (Test-DolPadded $Dol)) {
     Fail "$Dol is not padded; Dolphin would fail with 'Failed to init core'. Run port/gc/tools/dolpad.py on it."
 }
 New-Item -ItemType Directory -Force -Path $WorkDir, (Join-Path $WorkDir 'run') | Out-Null
@@ -261,6 +290,18 @@ $dolphinArgs = @(
     # Dolphin's default keeps them on the GPU only, which makes port/gc/gfx turn the effects off.
     '-C', 'Graphics.Hacks.EFBToTextureEnable=False'
 )
+if ($MemCard) {
+    # EXIDeviceType::MemoryCard (a raw card image); MemoryCardSize 0 = 4 Mbit (59 blocks) for a new file
+    $card = [System.IO.Path]::GetFullPath($MemCard)
+    $d = [System.IO.Path]::GetDirectoryName($card)
+    if ($d) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+    $dolphinArgs += @('-C', 'Dolphin.Core.SlotA=1', '-C', "Dolphin.Core.MemcardAPath=$card",
+        '-C', 'Dolphin.Core.MemoryCardSize=0')
+} else {
+    # No memory card: without an SD card the port saves to the memory card, and a save kept in the
+    # user's Dolphin card (GCI folder) would carry over from one test run to the next.
+    $dolphinArgs += @('-C', 'Dolphin.Core.SlotA=255')
+}
 $audioDumpDir = Join-Path $DolphinUserDir 'Dump\Audio'
 $runStartUtc = [DateTime]::UtcNow
 if ($DumpAudio) {
@@ -286,7 +327,11 @@ if (Test-Path -LiteralPath $dolphinLog) { $logStart = (Get-Item -LiteralPath $do
 
 $duration = "$Seconds s"
 if ($Seconds -le 0) { $duration = 'until closed' }
-Say "run_dolphin: $RunDol, $duration (disc: $(if ($discIso) { $discIso } else { 'none' }))"
+if ($isDisc) {
+    Say "run_dolphin: booting the disc image $RunDol, $duration"
+} else {
+    Say "run_dolphin: $RunDol, $duration (disc: $(if ($discIso) { $discIso } else { 'none' }))"
+}
 $proc = Start-Process -FilePath $DolphinExe -ArgumentList $argLine -PassThru
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -337,6 +382,7 @@ $geckoHandle = $geckoPs.BeginInvoke()
 $status = 0
 $dialogsSeen = @{}
 $renderSeen = $false
+$nextShot = $ScreenshotEvery
 try {
     while ($Seconds -le 0 -or $clock.Elapsed.TotalSeconds -lt $Seconds) {
         Start-Sleep -Milliseconds 500
@@ -347,6 +393,12 @@ try {
         }
         $wins = Get-DolphinWindows $proc.Id
         if ($wins.Render -ne [IntPtr]::Zero) { $renderSeen = $true }
+        if ($ScreenshotEvery -gt 0 -and $wins.Render -ne [IntPtr]::Zero -and $clock.Elapsed.TotalSeconds -ge $nextShot) {
+            $shot = Get-ShotPath "-$($nextShot)s"
+            $err = [MmgcWin]::Capture($wins.Render, $shot)
+            if ($err) { Say "run_dolphin: screenshot $shot failed: $err" }
+            $nextShot += $ScreenshotEvery
+        }
         foreach ($h in $wins.Dialogs) {
             $key = $h.ToInt64()
             if ($dialogsSeen.ContainsKey($key)) { continue }

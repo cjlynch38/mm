@@ -9,13 +9,23 @@
 
 #include "gc_bridge.h"
 
-/* Files. The ROM is read from the storage root that gc_ogc_storage_mount() found ("sd:" on
- * hardware, "dvd:" for the Dolphin dev disc); the log file and saves need a writable SD card. */
+/* Files. The ROM is <root>/mmgcport/baserom.z64 on the SD card (sd:), on the disc in the drive
+ * (dvd:: the disc image built by mkiso.py, or the Dolphin dev disc) or inside a disc image file
+ * on the SD card (img:), see gc_ogc_storage_open_rom(). The log file and saves need the SD card;
+ * without one, saves go to the memory card. */
 #define GC_DIR "/mmgcport"
 #define GC_ROM_FILE GC_DIR "/baserom.z64"
 #define GC_SD_DIR "sd:" GC_DIR
 #define GC_LOG_PATH GC_SD_DIR "/log.txt"
 #define GC_SAVE_PATH GC_SD_DIR "/mm.fla"
+/* Where a disc image on the SD card is looked for when the loader did not name one */
+#define GC_SD_IMAGE_PATH GC_SD_DIR "/mm-gc.iso"
+
+/* The disc image's game ID (port/gc/tools/mkiso.py); its first four letters and maker code also
+ * own the memory card save file */
+#define GC_CARD_GAME_CODE "GMME"
+#define GC_CARD_COMPANY "00"
+#define GC_CARD_FILE_NAME "mmgcport_flash"
 
 /* The user's ROM: the compressed US 1.0 cartridge image in .z64 (big-endian) byte order */
 #define GC_ROM_SIZE 0x2000000u
@@ -24,9 +34,16 @@
 #define GC_ROM_CRC2 0x03A2DEF0u
 
 /* ROM range the audio code streams from every frame (Audiobank, Audioseq, Audiotable).
- * Preloaded into RAM so those reads never touch the SD card. */
+ * Preloaded into ARAM so those reads never touch the SD card. */
 #define GC_ROM_RESIDENT_START 0x20700
 #define GC_ROM_RESIDENT_END 0x5E06E0
+
+/* The hot range, also preloaded into ARAM: link_animetion (read every gameplay frame), the item, map
+ * and schedule statics, the yar archives (CmpDma), do_action/message/font statics and the message
+ * data, ending with staff_message_data_static. The kanji font between the two ranges is not read by
+ * the US game. */
+#define GC_ROM_HOT_START 0x65C9E0
+#define GC_ROM_HOT_END 0xA684D0
 
 /* Priority of the bridge's reset callback thread; its press thread runs one above (LWP, 127 = highest) */
 #define GC_PRIO_SERVICE_RESET 120
@@ -47,11 +64,28 @@ void gc_ogc_print_memory_map(void);
 const char* gc_ogc_sd_mount(void);
 /** Nonzero once an SD card is mounted as sd: (the log file and saves need it). */
 int gc_ogc_sd_mounted(void);
-/** Mount the Dolphin dev disc (an ISO9660 image of the SD folder in the DVD drive) as "dvd:".
+/** argv[0] as the loader passed it ("dvd:/" from the port's apploader; Swiss passes the path of
+ *  the DOL or disc image it started), or NULL. */
+const char* gc_ogc_boot_path(void);
+/** Mount the disc in the DVD drive (the disc image or the Dolphin dev disc, both ISO9660) as "dvd:".
  *  Returns 0 on success. */
-int gc_ogc_devdisc_mount(void);
-/** SD card if there is one, else the Dolphin dev disc. Returns "sd:", "dvd:" or NULL. */
+int gc_ogc_disc_mount(void);
+/** Mount a disc image file (built by mkiso.py; e.g. "sd:/mmgcport/mm-gc.iso") read-only as "img:".
+ *  Returns 0 on success. */
+int gc_ogc_image_mount(const char* path);
+/** Find and open the ROM: the source the program was booted from first (the disc, a disc image
+ *  on SD, else the SD card), then the others. Call after gc_ogc_sd_mount(). Returns NULL on
+ *  success, else a message for the user listing what was tried. */
+const char* gc_ogc_storage_open_rom(void);
+/** SD card if there is one, else the disc in the drive. Returns "sd:", "dvd:" or NULL (bridge test). */
 const char* gc_ogc_storage_mount(void);
+/** Mount the memory card in slot A, else slot B (not with a USB Gecko there), for saves without an
+ *  SD card. 0 on success. */
+int gc_ogc_card_mount(void);
+int gc_ogc_card_mounted(void);
+/** gc_save_load/gc_save_store on the memory card (same return values). */
+int gc_ogc_card_save_load(void* dst, unsigned int size);
+int gc_ogc_card_save_store(const void* src, unsigned int size);
 
 /* bridge_video.c */
 void gc_ogc_video_init(void);
@@ -92,8 +126,13 @@ unsigned int gc_ogc_mem_top(void);
 void gc_ogc_rom_init(void);
 /** Open and validate the ROM. Returns NULL on success, or a message for the user. */
 const char* gc_ogc_rom_open(const char* path);
-/** Read [start, end) of the ROM into RAM; gc_rom_read() then serves it by memcpy. 0 on success. */
+/** Copy [start, end) of the ROM into ARAM (a resident range, up to 4); gc_rom_read() then never reads
+ *  it from the disc again. The first preload takes all free ARAM for the ROM, and its range gets a
+ *  lock of its own (preload the audio data first: the audio thread then never waits for another
+ *  thread's read); the later ranges share one. 0 on success. */
 int gc_ogc_rom_preload(unsigned int start, unsigned int end);
+/** Turn the ARAM left after the preloads into the file cache (whole dmadata files, LRU). 0 on success. */
+int gc_ogc_rom_cache_init(void);
 void gc_ogc_rom_print_stats(void);
 
 /* bridge_save.c */

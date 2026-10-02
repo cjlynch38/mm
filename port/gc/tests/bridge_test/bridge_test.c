@@ -488,6 +488,83 @@ static void reader_entry(void* arg) {
     gc_sem_post(sReaderDone);
 }
 
+static unsigned int be32_at(const unsigned char* p) {
+    return ((unsigned int)p[0] << 24) | ((unsigned int)p[1] << 16) | ((unsigned int)p[2] << 8) | p[3];
+}
+
+/* Every file of the ROM's dmadata table read through gc_rom_read in 1 KB pieces (as Yaz0 does), twice
+ * in different orders, and compared with fread from a second handle on the ROM file. That is more
+ * data than the file cache holds, so files are fetched, evicted, refilled from ARAM and fetched
+ * again. Files are read up to 1 MB. */
+static void check_files(const char* path) {
+    FILE* file = fopen(path, "rb");
+    unsigned char* table = malloc(0x6200);
+    unsigned char* expect = malloc(0x100000);
+    unsigned char* got = sRomBuf + 3;
+    unsigned int entries = 0;
+    unsigned int files = 0;
+    unsigned int bad = 0;
+    unsigned long long bytes = 0;
+    u64 t0 = gettime();
+    int pass;
+
+    if (file == NULL || table == NULL || expect == NULL || fseek(file, 0x1A500, SEEK_SET) != 0 ||
+        fread(table, 1, 0x6200, file) != 0x6200) {
+        check(0, "file cache: cannot read the dmadata table through a second handle on %s", path);
+        goto done;
+    }
+    while (entries < 0x6200 / 16 && be32_at(table + entries * 16 + 4) != 0) {
+        entries++;
+    }
+    for (pass = 0; pass < 2; pass++) {
+        unsigned int k;
+
+        for (k = 0; k < entries; k++) {
+            // Pass 0 in ROM order, pass 1 in a scattered order (997 is prime, so this is a permutation)
+            unsigned int i = (pass == 0) ? k : (k * 997u + 11u) % entries;
+            const unsigned char* e = table + i * 16;
+            unsigned int vromStart = be32_at(e);
+            unsigned int vromEnd = be32_at(e + 4);
+            unsigned int romStart = be32_at(e + 8);
+            unsigned int romEnd = be32_at(e + 12);
+            unsigned int size = (romEnd != 0) ? romEnd - romStart : vromEnd - vromStart;
+            unsigned int done = 0;
+
+            if (romStart == 0xFFFFFFFF || size == 0) {
+                continue;
+            }
+            if (size > 0x100000) {
+                size = 0x100000;
+            }
+            while (done < size) {
+                unsigned int n = (size - done < 0x400) ? size - done : 0x400;
+
+                if (gc_rom_read(romStart + done, got + done, n) != 0) {
+                    break;
+                }
+                done += n;
+            }
+            if (done != size || fseek(file, romStart, SEEK_SET) != 0 || fread(expect, 1, size, file) != size ||
+                memcmp(got, expect, size) != 0) {
+                if (bad++ < 5) {
+                    gc_log("  file cache: entry %u (%08X+%X) differs, pass %d", i, romStart, size, pass);
+                }
+            }
+            files++;
+            bytes += size;
+        }
+    }
+    check(bad == 0, "file cache: %u files (%llu KB) read twice through gc_rom_read match fread (%u differ, %u ms)",
+          files, bytes / 1024, bad, ms_since(t0));
+    gc_ogc_rom_print_stats();
+done:
+    if (file != NULL) {
+        fclose(file);
+    }
+    free(table);
+    free(expect);
+}
+
 static void test_rom(void) {
     char path[64];
     const char* root;
@@ -522,6 +599,14 @@ static void test_rom(void) {
     check_rom_ranges("file");
     check(gc_ogc_rom_preload(GC_ROM_RESIDENT_START, GC_ROM_RESIDENT_END) == 0, "preload the resident range");
     check_rom_ranges("resident");
+    check(gc_ogc_rom_preload(GC_ROM_HOT_START, GC_ROM_HOT_END) == 0, "preload the hot range");
+    check(gc_ogc_rom_preload(GC_ROM_HOT_START + 0x100, GC_ROM_HOT_START + 0x200) != 0,
+          "an overlapping preload is refused");
+    check_rom_ranges("hot range");
+    check(gc_ogc_rom_cache_init() == 0, "create the ARAM file cache");
+    check_rom_ranges("file cache");
+    check_rom_ranges("file cache, again");
+    check_files(path);
 
     snprintf(path, sizeof(path), "%s%s", root, GC_DIR "/no_such_rom.z64");
     error = gc_ogc_rom_open(path);

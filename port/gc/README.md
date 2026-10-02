@@ -41,7 +41,8 @@ symbols), so the N64 build must exist first.
 | `port/gc/ultra/` | libultra API reimplemented on libogc |
 | `port/gc/ogc/` | Platform code that uses libogc headers |
 | `port/gc/game/` | C replacements for MIPS assembly and other game-side helpers |
-| `port/gc/tools/` | Host tools (run inside Linux/WSL) |
+| `port/gc/apploader/` | The disc image's apploader (CC0), built by `make -f Makefile.gc apploader` |
+| `port/gc/tools/` | Host tools (run inside Linux/WSL), e.g. `mkiso.py` (disc image) and `mkdevdisc.py` (Dolphin dev disc) |
 | `port/gc/tests/` | Stand-alone test programs for the shim |
 
 ## Testing in Dolphin
@@ -82,7 +83,8 @@ The script passes these settings with `-C`; they are not saved to `Dolphin.ini`:
 | Setting | Value | Why |
 |---|---|---|
 | `Dolphin.Core.SlotB` | `7` (USB Gecko) | Log channel; Dolphin serves it on TCP port 55020 |
-| `Dolphin.Core.DefaultISO` | the dev disc | Inserted when Dolphin boots a DOL |
+| `Dolphin.Core.SlotA` | `255` (empty), or `1` (raw memory card) with `-MemCard` | Saves never carry over between runs unless asked for |
+| `Dolphin.Core.DefaultISO` | the dev disc | Inserted when Dolphin boots a DOL (not with a disc image, which Dolphin boots itself) |
 | `Dolphin.Core.FastDiscSpeed` | `True` | About 19 MB/s sequential reads |
 | `Dolphin.Interface.ConfirmStop` | `False` | `WM_CLOSE` stops without a Yes/No box |
 
@@ -97,8 +99,10 @@ On the console side (see `tests/sd_probe/source/main.c` for working code):
 - **Logging.** `if (usb_isgeckoalive(1)) usb_sendbuffer_safe(1, buf, len);`.
   Dolphin buffers the output until the script connects. Skip the slot B SD
   probe while a USB Gecko answers there: SD commands would corrupt the log.
-- Anything that must write (`log.txt`, saves) has nowhere to go in Dolphin;
-  test writes on hardware.
+- `log.txt` has nowhere to go in Dolphin. Saves go to the memory card in slot
+  A when the run has one: `run_dolphin.sh ... -MemCard C:\path\card.raw`
+  (Dolphin names the file `card.USA.59.raw`, a 59-block card). Without
+  `-MemCard` the script leaves slot A empty, so every run starts without a save.
 
 ### Real hardware
 
@@ -108,3 +112,176 @@ On the console side (see `tests/sd_probe/source/main.c` for working code):
 3. In Swiss, browse to `sd:/mmgcport/` and start the DOL.
 4. The platform layer logs to `SD:/mmgcport/log.txt` (`sd_probe` writes
    `probe_log.txt`). Power off and read the file on the PC.
+
+Or use the disc image (next section): it needs no separate ROM file.
+
+## Bootable disc image
+
+```bash
+make -f Makefile.gc iso     # build/gc-n64-us/mm-gc.iso, about 39 MiB
+port/gc/tools/run_dolphin.sh build/gc-n64-us/mm-gc.iso -Seconds 60 -MemCard 'C:\_mmgcport\dolphin\memcard-a.raw'
+```
+
+**The image contains your ROM.** `port/gc/tools/mkiso.py` copies
+`baseroms/n64-us/baserom.z64` into it (after checking its size, header and
+MD5). Build it yourself and keep it to yourself: never commit, upload or share
+it. `build/` is gitignored. The repository holds no ROM data and no Nintendo
+code. The apploader is the port's own (`port/gc/apploader/`, CC0).
+
+The image is a GameCube disc that is also an ISO9660 volume, like the dev disc
+(`mkiso.py` reuses `mkdevdisc.build_image`):
+
+| Offset | Contents |
+|---|---|
+| `0x000000` | `boot.bin`: game ID `GMME00`, title, main DOL and FST offsets |
+| `0x000440` | `bi2.bin`: country code 1 (NTSC-U), 24 MiB simulated memory |
+| `0x002440` | Apploader header (date `2026/10/02`, entry `0x81200000`), then the apploader (about 4.8 KB) |
+| `0x008000` | ISO9660 volume descriptors, path tables, directories |
+| `0x00B000` | GameCube FST: `/mmgcport/baserom.z64` |
+| `0x010000` | Main DOL (`mm-gc.dol`) |
+| `0x678000` | `mmgcport/baserom.z64` (32 MiB), at a 32 KiB boundary |
+
+- **Game ID `GMME00`.** `G` is the GameCube prefix, `MM` stands for Majora's
+  Mask, `E` means NTSC-U and maker `00` is unassigned. No GameCube title uses
+  the `GMM` prefix: GameTDB's list in Dolphin 2609 and Dolphin's GameSettings
+  have no `GMM` entries. Dolphin and Swiss therefore apply no game-specific
+  settings or patches. Change it with `mkiso.py --id`; the fourth letter sets
+  the region.
+- **Apploader** (`port/gc/apploader/apploader.c`, `apploader.ld`). It
+  implements the interface YAGCD documents. The boot program loads it to
+  `0x81200000` and calls its entry with pointers for `init`, `main` and
+  `close`.
+  - `main` asks for one DVD read per call: the disc header, the DOL header,
+    then each DOL section straight to its load address. Every request is
+    32-byte aligned with a length that is a multiple of 32; pieces that are
+    not aligned go through a bounce buffer.
+  - It then loads `bi2.bin` and the FST to the top of MEM1 and records them in
+    low memory (`0x80000034`, `0x38`, `0x3C`, `0xF4`), as retail apploaders do.
+  - `close` writes the data cache back, invalidates the instruction cache over
+    the code and passes `argv[0] = "dvd:/"` in libogc's argv block. It returns
+    the DOL's entry point.
+  - In Dolphin, its messages show in `dolphin.log` as `OSREPORT_HLE` lines,
+    next to Dolphin's `DVDRead` lines for each request.
+
+### Where the ROM comes from
+
+The loader passes `argv[0]`: the port's apploader passes `dvd:/`, and Swiss
+passes the path of what it started. `gc_ogc_storage_open_rom()`
+(`ogc/storage.c`) tries the sources in this order:
+
+| Booted as | `argv[0]` | ROM sources, in order |
+|---|---|---|
+| The disc in the drive: Dolphin, the IPL with an optical drive emulator or a modchip, or Swiss on an ODE | `dvd:/...` | `dvd:/mmgcport/baserom.z64`, then the SD card |
+| A disc image on the SD card, started by Swiss | `sd:/.../x.iso` (also `carda:`/`cardb:` for an SD Gecko) | The ROM inside that file (mounted as `img:`), then the SD card, then `dvd:` |
+| A DOL: Swiss, Dolphin `-e`, any other loader | anything else, or none | The SD card, then `dvd:` (the dev disc, or the game disc) |
+
+"The SD card" means `sd:/mmgcport/baserom.z64`, else the ROM inside a disc
+image at `sd:/mmgcport/mm-gc.iso`. The second form serves loaders that do not
+pass the image's path.
+
+- **`dvd:` reads.** `dvd:` is mounted with libiso9660, and `bridge_rom.c`
+  reads the ROM's sectors directly with `DVD_ReadPrio`.
+- **`img:` reads.** `img:` is the image file on the SD card, mounted with
+  libiso9660 through a `DISC_INTERFACE` that reads the file with libfat.
+  Swiss's DVD emulation patches the DVD functions of Nintendo SDK programs,
+  which it finds by signature. It never patches a libogc program, so this port
+  reads the image file itself.
+- **No ROM found.** The halt screen lists what was tried and why each source
+  failed.
+
+### Saves
+
+| Storage at boot | Where saves go |
+|---|---|
+| SD card | `SD:/mmgcport/mm.fla`, as before (`log.txt` next to it) |
+| No SD card, memory card in slot A (else slot B, unless a USB Gecko is there) | File `mmgcport_flash` (game code `GMME`, maker `00`). It takes 17 blocks: one header block with the comment "Majora's Mask (GC port) / Flash save, 128 KB", then the 128 KB flash image. A Memory Card 59 has room. |
+| Neither | Not kept |
+
+- **Writes.** A store writes only the 8 KB card blocks that changed. MM keeps
+  each save twice, in separate 8 KB-aligned flash areas, so a power cut damages
+  at most the copy being written, and the game falls back to the other.
+- **Card safety.** The card is never formatted, and no other file is touched.
+  If the card is full, the save is not kept and the log says so.
+- **Measured in Dolphin.** Creating the file takes about 3 s. A typical store
+  writes 2 blocks in 0.3 s, on the low-priority flash writer thread.
+
+### Booting the image
+
+- **Dolphin (GUI).** Use File > Open and pick `mm-gc.iso`, or add the folder to
+  the game list. Dolphin boots it with its emulated IPL, which runs the
+  apploader. Saves go to Dolphin's memory card in slot A: by default the GCI
+  folder `Dolphin Emulator\GC\USA\Card A\00-GMME-mmgcport_flash.gci`.
+- **Dolphin (script).** `run_dolphin.sh <iso>` boots the image like the GUI
+  does, without inserting the dev disc.
+- **Swiss, image on the SD card.**
+  1. Copy `build/gc-n64-us/mm-gc.iso` to a FAT32 SD card, preferably as
+     `SD:/mmgcport/mm-gc.iso`. From Windows the file is
+     `\\wsl.localhost\Ubuntu-24.04\home\chris\mm\build\gc-n64-us\mm-gc.iso`.
+     Copy it to a freshly formatted or defragmented card: Swiss may refuse a
+     fragmented image ("Failed to setup the file (too fragmented?)"). No
+     separate `baserom.z64` is needed.
+  2. Put the card in the SD2SP2, or in an SD Gecko in slot A or B, and boot
+     Swiss.
+  3. Browse to the image and start it with A. Swiss loads the main DOL from
+     the image itself (`boot.bin` offset `0x420`, no apploader) and passes the
+     image's path in `argv`. The game then reads the ROM from the image on the
+     same card.
+     - **Swiss's "BS2 Boot" setting.** With it on, the IPL boots the image
+       through Swiss's emulated drive, which the game cannot read once it
+       runs. The game then finds the ROM only if the image is at
+       `SD:/mmgcport/mm-gc.iso`, or if `SD:/mmgcport/baserom.z64` exists.
+  4. `log.txt` and `mm.fla` go to `SD:/mmgcport/`.
+- **Optical drive emulator or burned disc.** On a GC Loader, FlippyDrive,
+  WKF/WODE or a modchipped console, the drive serves the image. The IPL, or
+  Swiss on the ODE, boots it, and the ROM is read from the disc. SD card or
+  memory card saves work as in the table above.
+- **Region.** The image is NTSC-U (`E`). A PAL or Japanese console needs a
+  region-free boot: Swiss provides one, and so do most ODEs and modchips.
+
+## ROM reads and ARAM
+
+The game reads the ROM through `osEPiStartDma`, which calls `gc_rom_read()`
+(`ogc/bridge_rom.c`) synchronously in the calling thread. Four layers serve
+the reads:
+
+| Layer | Contents | Where |
+|---|---|---|
+| Resident ranges, loaded at boot | `0x20700-0x5E06E0`: audio data (5.75 MiB), which the audio thread streams. `0x65C9E0-0xA684D0` (4.05 MiB): `link_animetion` (read every gameplay frame), the item, map and message statics, the yar archives and the message data. | ARAM |
+| Block cache | 8 blocks of up to 64 KB | MEM1 |
+| File cache | Whole files of the ROM's dmadata table (objects, scenes, rooms and so on). The least recently used file is evicted first. Files are stored in 2 KB pages. | The rest of ARAM, 6.2 MiB |
+| Disc | The SD card through libfat. On `dvd:` (the disc image or the dev disc), the file's sectors are read directly with `DVD_ReadPrio`. | |
+
+- **Cache misses.** A miss inside a file reads the whole file from the disc in
+  one sequential read and copies it to ARAM. Later loads of that file come
+  from ARAM. For example, the 313 KB `gameplay_keep` takes about 7 ms from
+  ARAM instead of about 210 ms from the disc.
+- **Audio thread.** It only reads the audio range. That path takes only the
+  audio range's own ARAM lock and bounce buffer, so it never waits for the
+  disc or for another thread's resident read. The hot range has a separate
+  lock, because the graph thread reads it at the lowest game priority.
+- **Statistics.** Every 20 s the log gets `ROM: last N s:` lines. They give
+  reads by layer, disc reads (count, KB, time), read latency (average,
+  slowest call, calls over 2/16/50 ms) and a breakdown per thread.
+- **Build options.** Pass them with
+  `make -f Makefile.gc GC_ROM_FLAGS='...'`. See the top of `bridge_rom.c`.
+  - `-DGC_ROM_TRACE=1` logs one line for each file a thread reads past the
+    resident ranges. Use it for Dolphin measurements only: on hardware, every
+    log line is an SD write.
+  - `-DGC_ROM_HOT_RESIDENT=0 -DGC_ROM_FILE_CACHE=0 -DGC_ROM_DVD_DIRECT=0`
+    restores the old reader.
+- **Real drive timing in Dolphin.** Run
+  `run_dolphin.sh <dol> -ExtraConfig 'Dolphin.Core.FastDiscSpeed=False'`.
+  Reads then run at about 2 MB/s, with 50-100 ms per seek, like a GameCube
+  drive.
+
+Measured in Dolphin with real drive timing, on the dev disc:
+
+| | Old reader | Now |
+|---|---|---|
+| Boot preload | Audio data: 2.98 s | Audio data: 2.70 s, plus the hot range: 1.99 s |
+| Attract loop, first 140 s | 193 disc reads, 12.1 MB, 13.3 s waiting (9.5% of the time). 189 reads took over 16 ms. The game thread waited 1.0 s on archive reads. | 63 disc reads, 1.5 MB, 3.4 s waiting (3.0%). 48 reads took over 16 ms, each the first load of a file. The game thread never waits. |
+| Attract loop, from the third minute on | Same as the first cycle | 0 disc reads. 10-14 us per read on average; the slowest read takes 1-4 ms. |
+| Title, File Select, new game, first 100 s of the prologue (`GC_AUTOSTART=2`) | 101 disc reads, 6.3 MB, 6.1 s waiting (6.1% of the time). 95 reads took over 16 ms. | 34 disc reads, 1.2 MB, 1.6 s waiting (1.6%). 20 reads took over 16 ms. |
+
+The audio thread had 0 underruns in every run, and its reads take 40 us on
+average (0.1 ms at most), as before.
