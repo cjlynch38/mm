@@ -141,6 +141,10 @@ void gfx_tev_apply(GfxPrimKind kind, GfxTevInfo* out) {
 void gfx_tev_invalidate(void) {
 }
 
+/* gfx_fb.c reports RAM it rewrote; there is no texture cache to invalidate here */
+void gfx_tex_ram_written(uint32_t addr, uint32_t bytes) {
+}
+
 /* Texture stub: 8x8 RGB565, quadrants red (top left), green (top right), blue (bottom left), white */
 static u16 sTexData[64] ATTRIBUTE_ALIGN(32);
 static GXTexObj sTexObj;

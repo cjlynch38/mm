@@ -2,7 +2,11 @@
  * GX backend of the N64 display list renderer: GX and EFB/XFB setup, render targets, viewport and
  * scissor, the projection trick that feeds N64 clip coordinates through GX's own perspective divide,
  * triangle batching, texture and fill rectangles, EFB -> XFB copies and presenting frames on the VI
- * thread. See DESIGN.md ("Projection on GX", "Frames and video").
+ * thread. See DESIGN.md ("Projection on GX", "Frames and video", "Framebuffer effects").
+ *
+ * Render targets: the frame is drawn at GFX_SCALE over the whole EFB. Another color image (an off-screen
+ * pass) is drawn at 1x into the EFB's top-left corner, the canvas, which gfx_fb.c saves and restores around
+ * the pass and copies to RAM. Everything that depends on the target's scale goes through sScale.
  *
  * Depth: GX clip space keeps z in [-w, 0] (GX clips outside it) and the viewport maps z/w to window
  * depth (z/w) * (far - near) + far, so window depth grows with distance as on the N64, and the depth
@@ -48,6 +52,9 @@
 #define STATS_INTERVAL_MS 5000
 #define LOG_LIMIT 8
 
+/* gx_prepare's tile for gfx_gx_image_rect: textures are bound by the caller */
+#define GX_TILE_IMAGE (-2)
+
 typedef struct {
     float x, y, z;
     u32 color;
@@ -69,7 +76,15 @@ typedef enum {
     VMODE_SCREEN  /* N64 screen pixels (rectangles), full EFB viewport */
 } VMode;
 
-typedef enum { TARGET_FRAME, TARGET_DEPTH, TARGET_OFFSCREEN } Target;
+typedef enum {
+    TARGET_FRAME,  /* the task's frame, at GFX_SCALE */
+    TARGET_DEPTH,  /* FILL into the z image: depth clear */
+    TARGET_CANVAS, /* another color image, at 1x in the canvas (gfx_fb.c) */
+    TARGET_SKIP    /* a color image gfx_fb.c cannot draw: draws are skipped */
+} Target;
+
+/* Render mode bits (othermode L) that gfx_gbi.h does not list */
+#define RM_IM_RD 0x40 /* the blender reads the color image */
 
 typedef struct {
     void* xfb;
@@ -100,10 +115,20 @@ static u32 sStamp;
 
 /* Render target of the current task */
 static u32 sFrameKey;    /* the frame's color image (KSEG0 form), 0 until the first draw */
-static u32 sTargetCimg;  /* gGfxRdp addresses sTarget was computed for */
+static u32 sTargetCimg;  /* gGfxRdp state sTarget was computed for */
 static u32 sTargetZimg;
+static u8 sTargetSiz;
+static u16 sTargetWidth;
+static bool sTargetFill;
 static Target sTarget;
 static bool sTargetValid;
+static u32 sCanvasKey;   /* color image drawn in the canvas, 0 when the EFB holds only the frame */
+static u8 sCanvasSiz;    /* its pixel size (its width is sTargetW) */
+static int sScale = GFX_SCALE;                             /* EFB pixels per N64 pixel for the target */
+static int sTargetW = GFX_EFB_WIDTH, sTargetH = GFX_EFB_HEIGHT; /* EFB area of the target */
+static int sScissorY0, sScissorY1;                         /* the scissor's N64 rows (gx_apply_scissor) */
+static bool sDepthFilled;  /* the task cleared the z-buffer... */
+static bool sDepthColored; /* ...and then drew colors into its RAM (PreRender captures, Lens of Truth) */
 
 /* EFB contents: after a copy the EFB holds the copy clear color and far depth everywhere */
 static GXColor sClearColor = { 0, 0, 0, 255 };
@@ -146,7 +171,7 @@ static int sBatchCount;
 
 static struct {
     u32 tasks, frames;
-    u32 tris, cpuTris, droppedTris, rects, fillQuads, depthQuads, fillsSkipped, offscreen, batches;
+    u32 tris, cpuTris, droppedTris, rects, fillQuads, depthQuads, fillsSkipped, offscreen, canvasDraws, visMono, batches;
     u64 taskTicks, maxTaskTicks;
 } sStats;
 static u64 sStatsStart;
@@ -183,6 +208,14 @@ static void gx_clear_xfb(void* xfb, u32 size) {
         p[i] = 0x10801080;
     }
     DCFlushRange(xfb, size);
+}
+
+/* State that only gfx_gx_init sets, and gfx_fb.c's quads change: channels and texture coordinate generation */
+static void gx_base_state(void) {
+    GX_SetNumChans(1);
+    GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
+    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
+    GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
 }
 
 void gfx_gx_init(void) {
@@ -256,10 +289,7 @@ void gfx_gx_init(void) {
     GX_SetCurrentMtx(GX_PNMTX0);
 
     // Shade: the vertex color, no lighting (gfx_rsp lights on the CPU)
-    GX_SetNumChans(1);
-    GX_SetChanCtrl(GX_COLOR0A0, GX_DISABLE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHTNULL, GX_DF_NONE, GX_AF_NONE);
-    GX_SetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
-    GX_SetTexCoordGen(GX_TEXCOORD1, GX_TG_MTX2x4, GX_TG_TEX1, GX_IDENTITY);
+    gx_base_state();
     GX_SetNumTexGens(0);
 
     // Bound when a tile cannot be resolved, so the TEV never samples a stale texture: opaque white
@@ -349,8 +379,8 @@ static void gx_viewport_n64(float bias) {
     gx_n64_viewport_z(&sz, &tz);
     f = (tz + sz) / (float)G_MAXZ;
     n = f - sz / (GX_ZK * (float)G_MAXZ);
-    gx_load_viewport((tx - sx) * GFX_SCALE, (ty - sy) * GFX_SCALE, 2.0f * sx * GFX_SCALE, 2.0f * sy * GFX_SCALE,
-                     n - bias, f - bias);
+    gx_load_viewport((tx - sx) * sScale, (ty - sy) * sScale, 2.0f * sx * sScale, 2.0f * sy * sScale, n - bias,
+                     f - bias);
 }
 
 static void gx_set_vmode(VMode mode) {
@@ -373,7 +403,7 @@ static void gx_set_vmode(VMode mode) {
         case VMODE_SCREEN:
             // N64 screen pixels in, y down; z is the window depth 0..1
             gx_load_proj(GX_ORTHOGRAPHIC, 2.0f / GFX_N64_WIDTH, -1.0f, -2.0f / GFX_N64_HEIGHT, 1.0f, 1.0f, -1.0f);
-            gx_load_viewport(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT, 0.0f - bias, 1.0f - bias);
+            gx_load_viewport(0, 0, GFX_N64_WIDTH * sScale, GFX_N64_HEIGHT * sScale, 0.0f - bias, 1.0f - bias);
             break;
         default:
             break;
@@ -382,19 +412,30 @@ static void gx_set_vmode(VMode mode) {
 }
 
 static void gx_apply_scissor(void) {
-    int x0 = (gGfxRdp.scissorUlx * GFX_SCALE) >> 2;
-    int y0 = (gGfxRdp.scissorUly * GFX_SCALE) >> 2;
-    int x1 = (gGfxRdp.scissorLrx * GFX_SCALE) >> 2;
-    int y1 = (gGfxRdp.scissorLry * GFX_SCALE) >> 2;
+    int x0 = (gGfxRdp.scissorUlx * sScale) >> 2;
+    int y0 = (gGfxRdp.scissorUly * sScale) >> 2;
+    int x1 = (gGfxRdp.scissorLrx * sScale) >> 2;
+    int y1 = (gGfxRdp.scissorLry * sScale) >> 2;
 
     x0 = (x0 < 0) ? 0 : x0;
     y0 = (y0 < 0) ? 0 : y0;
-    x1 = (x1 > GFX_EFB_WIDTH) ? GFX_EFB_WIDTH : x1;
-    y1 = (y1 > GFX_EFB_HEIGHT) ? GFX_EFB_HEIGHT : y1;
+    x1 = (x1 > sTargetW) ? sTargetW : x1;
+    y1 = (y1 > sTargetH) ? sTargetH : y1;
     sScissorEmpty = (x1 <= x0) || (y1 <= y0);
     if (!sScissorEmpty) {
         GX_SetScissor(x0, y0, x1 - x0, y1 - y0);
     }
+    // N64 rows a draw can change
+    sScissorY0 = y0 / sScale;
+    sScissorY1 = (y1 + sScale - 1) / sScale;
+}
+
+/* The scissor rectangle in N64 pixels (rounded out), from the RDP state */
+static void gx_scissor_rect(int* x0, int* y0, int* x1, int* y1) {
+    *x0 = gGfxRdp.scissorUlx >> 2;
+    *y0 = gGfxRdp.scissorUly >> 2;
+    *x1 = (gGfxRdp.scissorLrx + 3) >> 2;
+    *y1 = (gGfxRdp.scissorLry + 3) >> 2;
 }
 
 void gfx_gx_set_projection(const float m[4][4]) {
@@ -438,33 +479,120 @@ void gfx_gx_set_projection(const float m[4][4]) {
 /* Render targets                                                                                 */
 /* ============================================================================================== */
 
-static Target gx_target(void) {
+/* Scale and EFB area of the render target; the viewport and scissor follow at the next draw */
+static void gx_set_target_scale(int scale, int w, int h) {
+    sScale = scale;
+    sTargetW = w;
+    sTargetH = h;
+    gfx_gx_state_lost();
+}
+
+/* Back to the frame: an off-screen pass ends (its image goes to RAM, the frame's pixels come back) */
+static void gx_use_frame(void) {
+    if (sCanvasKey != 0) {
+        gfx_gx_flush();
+        gfx_fb_canvas_end();
+        sCanvasKey = 0;
+        gx_set_target_scale(GFX_SCALE, GFX_EFB_WIDTH, GFX_EFB_HEIGHT);
+    }
+}
+
+static bool gx_use_canvas(u32 key) {
+    // The same address with another pixel size or width is another image for gfx_fb.c (and another canvas width)
+    if (sCanvasKey == key && sCanvasSiz == gGfxRdp.colorImageSiz && sTargetW == gGfxRdp.colorImageWidth) {
+        return true;
+    }
+    gfx_gx_flush();
+    if (!gfx_fb_canvas_begin(key, gGfxRdp.colorImageFmt, gGfxRdp.colorImageSiz, gGfxRdp.colorImageWidth)) {
+        return false;
+    }
+    sCanvasKey = key;
+    sCanvasSiz = gGfxRdp.colorImageSiz;
+    gx_set_target_scale(1, gGfxRdp.colorImageWidth, GFX_N64_HEIGHT);
+    return true;
+}
+
+/* Render target for a draw under the current color image: the frame, a depth clear (`fill`: FILL mode into the z
+ * image), or an off-screen image. Switching between the frame and off-screen images happens here, before the draw
+ * binds its textures. */
+static Target gx_target(bool fill) {
     u32 cimg = gGfxRdp.colorImageAddr;
     u32 zimg = gGfxRdp.zImageAddr;
     u32 key;
+    bool isZ;
 
-    if (sTargetValid && cimg == sTargetCimg && zimg == sTargetZimg) {
+    if (sTargetValid && cimg == sTargetCimg && zimg == sTargetZimg && fill == sTargetFill &&
+        gGfxRdp.colorImageSiz == sTargetSiz && gGfxRdp.colorImageWidth == sTargetWidth) {
         return sTarget;
     }
     sTargetCimg = cimg;
     sTargetZimg = zimg;
+    sTargetFill = fill;
+    sTargetSiz = gGfxRdp.colorImageSiz;
+    sTargetWidth = gGfxRdp.colorImageWidth;
     sTargetValid = true;
 
     key = gx_key((u32)gfx_addr(cimg));
-    if (zimg != 0 && key == gx_key((u32)gfx_addr(zimg))) {
-        sTarget = TARGET_DEPTH;
-    } else if (sFrameKey == 0 || key == sFrameKey) {
+    isZ = zimg != 0 && key == gx_key((u32)gfx_addr(zimg));
+    if (sFrameKey == 0 && !isZ) {
         // The first color image of a task that is not the z-buffer is the frame
         sFrameKey = key;
+        gfx_fb_set_frame(key, gGfxRdp.colorImageWidth);
+    }
+
+    if (key == sFrameKey) {
+        gx_use_frame();
         sTarget = TARGET_FRAME;
+    } else if (isZ && fill && sCanvasKey != key) {
+        gx_use_frame();
+        sTarget = TARGET_DEPTH;
+    } else if (gx_use_canvas(key)) {
+        // Colors drawn into the z-buffer's memory (PreRender captures, Lens of Truth) are not depth
+        if (isZ) {
+            sDepthColored = true;
+        }
+        sTarget = TARGET_CANVAS;
     } else {
-        sTarget = TARGET_OFFSCREEN;
+        sTarget = TARGET_SKIP;
         if (sLogCount < LOG_LIMIT) {
             sLogCount++;
             gc_log("gfx: draws into off-screen color image %08X skipped (frame %08X)", key, sFrameKey);
         }
     }
     return sTarget;
+}
+
+/* Whether a rectangle sets each of its pixels without reading the color image: no memory reads in the blender
+ * (IM_RD), no alpha compare dropping pixels */
+static bool gx_rect_opaque(void) {
+    u32 cycle = gGfxRdp.otherModeH & (3u << G_MDSFT_CYCLETYPE);
+
+    if (cycle == G_CYC_FILL) {
+        return true;
+    }
+    if ((gGfxRdp.otherModeL & (3u << G_MDSFT_ALPHACOMPARE)) != G_AC_NONE) {
+        return false;
+    }
+    return cycle == G_CYC_COPY || !(gGfxRdp.otherModeL & RM_IM_RD);
+}
+
+/* Before a draw into the canvas covering N64 pixels [x0, x1) x [y0, y1) (clipped by the scissor here) */
+static void gx_canvas_draw(float x0, float y0, float x1, float y1, bool opaque) {
+    int sx0, sy0, sx1, sy1;
+    int ix0 = (int)x0, iy0 = (int)y0;
+    int ix1 = (int)ceilf(x1), iy1 = (int)ceilf(y1);
+
+    gx_scissor_rect(&sx0, &sy0, &sx1, &sy1);
+    ix0 = (ix0 > sx0) ? ix0 : sx0;
+    iy0 = (iy0 > sy0) ? iy0 : sy0;
+    ix1 = (ix1 < sx1) ? ix1 : sx1;
+    iy1 = (iy1 < sy1) ? iy1 : sy1;
+    // A rectangle that does not start and end on whole pixels only partly covers its edge pixels
+    if (opaque && (x0 != (float)(int)x0 || y0 != (float)(int)y0 || x1 != (float)(int)x1 || y1 != (float)(int)y1)) {
+        opaque = (float)ix0 >= x0 && (float)iy0 >= y0 && (float)ix1 <= x1 && (float)iy1 <= y1;
+    }
+    gfx_fb_canvas_draw(ix0, iy0, ix1, iy1, opaque);
+    sStats.canvasDraws++;
 }
 
 /* ============================================================================================== */
@@ -511,6 +639,27 @@ static void gx_bind(int index, int tile) {
     b->sShiftScale = b->tShiftScale = 1.0f;
 }
 
+/* Make the RAM a tile was loaded from current, if the renderer drew there (VisMono and PreRender's coverage load
+ * the frame they draw into). gfx_tex.c decodes tiles from RAM at bind time; the source is taken to be the last
+ * G_SETTIMG image, from the tile's first row (G_LOADTILE) or its start (G_LOADBLOCK, image width 1), for as many
+ * rows as the tile has, with one row of margin. */
+static void gx_sync_tile_source(int tile) {
+    const GfxTile* t = &gGfxRdp.tiles[tile & 7];
+    u32 addr = gGfxRdp.texImageAddr;
+    u32 stride = ((u32)gGfxRdp.texImageWidth << gGfxRdp.texImageSiz) >> 1; // bytes per image row
+    u32 lineBytes = t->line * 8;
+    u32 rowBytes = (stride > lineBytes) ? stride : lineBytes;
+    u32 rows = (t->lrt >= t->ult) ? ((t->lrt - t->ult) >> 2) + 1 : 1;
+
+    if (addr == 0) {
+        return;
+    }
+    if (gGfxRdp.texImageWidth > 1) {
+        addr += (t->ult >> 2) * stride;
+    }
+    gfx_fb_sync_ram((const void*)addr, (rows + 1) * rowBytes);
+}
+
 /* Bring GX up to date with the RSP/RDP state for a draw of `kind` reading tile `tile` (and tile + 1). */
 static void gx_prepare_slow(GfxPrimKind kind, int tile) {
     u32 dirty = gGfxRdp.dirty;
@@ -534,8 +683,21 @@ static void gx_prepare_slow(GfxPrimKind kind, int tile) {
         sTexBound[0] = sTexBound[1] = false;
     }
 
-    // Textures the combiner reads; TEXEL1 is the next tile
+    // Textures the combiner reads; TEXEL1 is the next tile. Framebuffer contents they read go to RAM before
+    // either is bound (writing RAM makes gfx_tex.c check its textures again).
     sTexTile = tile;
+    if (tile == GX_TILE_IMAGE) {
+        // gfx_gx_image_rect: the caller bound the textures
+        sTexBound[0] = sTexBound[1] = true;
+    }
+    if (gfx_fb_pending()) {
+        if (sInfo.usesTexel0 && !sTexBound[0]) {
+            gx_sync_tile_source(tile);
+        }
+        if (sInfo.usesTexel1 && !sTexBound[1]) {
+            gx_sync_tile_source(tile + 1);
+        }
+    }
     if (sInfo.usesTexel0 && !sTexBound[0]) {
         gx_bind(0, tile);
         sTexBound[0] = true;
@@ -677,14 +839,21 @@ void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
     BatchVtx* out;
     bool cpu;
     int i;
+    Target target = gx_target(false);
 
-    if (gx_target() != TARGET_FRAME) {
+    if (target == TARGET_CANVAS) {
+        // Any pixel inside the scissor, partly covered
+        gx_canvas_draw(0.0f, 0.0f, 4096.0f, 4096.0f, false);
+    } else if (target != TARGET_FRAME) {
         sStats.offscreen++;
         return;
     }
     gx_prepare(GFX_PRIM_TRIANGLE, gGfxRsp.textureTile);
     if (sScissorEmpty) {
         return;
+    }
+    if (target == TARGET_FRAME) {
+        gfx_fb_frame_drawn(sScissorY0, sScissorY1);
     }
 
     cpu = (sTriVMode != VMODE_PERSP);
@@ -725,7 +894,9 @@ void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
         gx_texcoords(out, v->s, v->t);
     }
     sStats.tris++;
-    sColorClean = sDepthClean = false;
+    if (target == TARGET_FRAME) {
+        sColorClean = sDepthClean = false;
+    }
 }
 
 /* Quad in N64 screen pixels as two triangles (VMODE_SCREEN). st[i] are the texel coordinates of the
@@ -757,22 +928,164 @@ static inline float gx_rect_depth(void) {
     return (gGfxRdp.otherModeL & G_ZS_PRIM) ? gx_prim_depth() : 0.0f;
 }
 
+/* gDPSetCombineLERP's words, as gbi.h packs them */
+#define GX_N64_CC_HI(a0, c0, Aa0, Ac0, a1, c1)                                                                    \
+    ((((a0) & 0xF) << 20) | (((c0) & 0x1F) << 15) | (((Aa0) & 7) << 12) | (((Ac0) & 7) << 9) | (((a1) & 0xF) << 5) | \
+     ((c1) & 0x1F))
+#define GX_N64_CC_LO(b0, d0, Ab0, Ad0, b1, Aa1, Ac1, d1, Ab1, Ad1)                                              \
+    (((u32)((b0) & 0xF) << 28) | (((d0) & 7) << 15) | (((Ab0) & 7) << 12) | (((Ad0) & 7) << 9) |                \
+     (((b1) & 0xF) << 24) | (((Aa1) & 7) << 21) | (((Ac1) & 7) << 18) | (((d1) & 7) << 6) | (((Ab1) & 7) << 3) | \
+     ((Ad1) & 7))
+
+/* z_vismono.c: (1 - 0) * TEXEL1_ALPHA + TEXEL0, alpha 1; then (PRIMITIVE - ENVIRONMENT) * COMBINED + ENVIRONMENT,
+ * alpha PRIMITIVE */
+#define VISMONO_CC_HI \
+    GX_N64_CC_HI(G_CCMUX_1, G_CCMUX_TEXEL1_ALPHA, G_ACMUX_0, G_ACMUX_0, G_CCMUX_PRIMITIVE, G_CCMUX_COMBINED)
+#define VISMONO_CC_LO                                                                                         \
+    GX_N64_CC_LO(G_CCMUX_0, G_CCMUX_TEXEL0, G_ACMUX_0, G_ACMUX_1, G_CCMUX_ENVIRONMENT, G_ACMUX_0, G_ACMUX_0, \
+                 G_CCMUX_ENVIRONMENT, G_ACMUX_0, G_ACMUX_PRIMITIVE)
+
+static int sVisMonoNext = -1; /* VisMono: the row its next rectangle starts at; -1: no copy of the frame */
+static GXTexObj sVisMonoTex;
+
+/* Pixel (r, g, b) -> lerp(env, prim, (2 r + 4 g + b) / 7). Stages 0-2 add up the channels (texture swap tables RRR,
+ * GGG, BBB) times konst weights, stage 3 interpolates; the blend takes prim alpha, as the 2nd cycle's blender. */
+static void gx_vismono_state(void) {
+    static const u8 swaps[3] = { GX_TEV_SWAP1, GX_TEV_SWAP2, GX_TEV_SWAP3 };
+    static const u8 weights[3] = { 73, 146, 36 }; /* 2/7, 4/7, 1/7 of 255 */
+    u32 prim = gGfxRdp.primColor, env = gGfxRdp.envColor;
+    GXColor envColor = { env >> 24, env >> 16, env >> 8, env };
+    GXColor primColor = { prim >> 24, prim >> 16, prim >> 8, prim };
+    int i;
+
+    GX_SetTevSwapModeTable(GX_TEV_SWAP1, GX_CH_RED, GX_CH_RED, GX_CH_RED, GX_CH_ALPHA);
+    GX_SetTevSwapModeTable(GX_TEV_SWAP2, GX_CH_GREEN, GX_CH_GREEN, GX_CH_GREEN, GX_CH_ALPHA);
+    GX_SetTevSwapModeTable(GX_TEV_SWAP3, GX_CH_BLUE, GX_CH_BLUE, GX_CH_BLUE, GX_CH_ALPHA);
+    for (i = 0; i < 3; i++) {
+        GXColor k = { weights[i], weights[i], weights[i], 0 };
+
+        GX_SetTevKColor(GX_KCOLOR0 + i, k);
+        GX_SetTevDirect(GX_TEVSTAGE0 + i);
+        GX_SetTevOrder(GX_TEVSTAGE0 + i, GX_TEXCOORD0, GX_TEXMAP0, GX_COLORNULL);
+        GX_SetTevSwapMode(GX_TEVSTAGE0 + i, GX_TEV_SWAP0, swaps[i]);
+        GX_SetTevKColorSel(GX_TEVSTAGE0 + i, GX_TEV_KCSEL_K0 + i);
+        GX_SetTevColorIn(GX_TEVSTAGE0 + i, GX_CC_ZERO, GX_CC_TEXC, GX_CC_KONST, (i == 0) ? GX_CC_ZERO : GX_CC_CPREV);
+        GX_SetTevAlphaIn(GX_TEVSTAGE0 + i, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO);
+        GX_SetTevColorOp(GX_TEVSTAGE0 + i, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GX_SetTevAlphaOp(GX_TEVSTAGE0 + i, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    }
+    GX_SetTevColor(GX_TEVREG1, envColor);
+    GX_SetTevColor(GX_TEVREG2, primColor);
+    GX_SetTevDirect(GX_TEVSTAGE3);
+    GX_SetTevOrder(GX_TEVSTAGE3, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLORNULL);
+    GX_SetTevSwapMode(GX_TEVSTAGE3, GX_TEV_SWAP0, GX_TEV_SWAP0);
+    GX_SetTevColorIn(GX_TEVSTAGE3, GX_CC_C1, GX_CC_C2, GX_CC_CPREV, GX_CC_ZERO);
+    GX_SetTevAlphaIn(GX_TEVSTAGE3, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_A2);
+    GX_SetTevColorOp(GX_TEVSTAGE3, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetTevAlphaOp(GX_TEVSTAGE3, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+    GX_SetNumTevStages(4);
+    GX_SetNumIndStages(0);
+    GX_SetFog(GX_FOG_NONE, 0, 1, 0.1f, 1, envColor);
+    GX_SetBlendMode(GX_BM_BLEND, GX_BL_SRCALPHA, GX_BL_INVSRCALPHA, GX_LO_COPY);
+    GX_SetAlphaCompare(GX_ALWAYS, 0, GX_AOP_AND, GX_ALWAYS, 0);
+    GX_SetZMode(GX_FALSE, GX_ALWAYS, GX_FALSE);
+    GX_SetColorUpdate(GX_TRUE);
+    GX_SetAlphaUpdate(GX_FALSE);
+    GX_LoadTexObj(&sVisMonoTex, GX_TEXMAP0);
+}
+
+/*
+ * VisMono_DesaturateDList's rectangles: rows [y, y + h) of the frame loaded as CI8 (two tiles one byte apart: the
+ * high and low byte of each pixel, through VisMono_DesaturateTLUT's IA16 palette, I + A being the luminance) and
+ * drawn back in place in 2-cycle mode. At GFX_SCALE the EFB samples each N64 pixel twice along s, at two different
+ * bytes (vertical stripes), and every rectangle converts two textures: the rows are drawn from a GX copy of the frame
+ * instead, through gx_vismono_state. Returns false (draw normally) for anything else.
+ */
+static bool gx_vismono(float ulx, float uly, float lrx, float lry, int tile, float s, float t, float dsdx, float dtdy,
+                       bool flip) {
+    const u32 cycleMask = 3u << G_MDSFT_CYCLETYPE;
+    const u32 tlutMask = 3u << G_MDSFT_TEXTLUT;
+    float st[4][2];
+    int y0 = (int)uly;
+
+    if (gGfxRdp.combineHi != VISMONO_CC_HI || gGfxRdp.combineLo != VISMONO_CC_LO || flip || tile != 0 ||
+        (gGfxRdp.otherModeH & cycleMask) != G_CYC_2CYCLE || (gGfxRdp.otherModeH & tlutMask) != G_TT_IA16 ||
+        dsdx != 2.0f || dtdy != 1.0f || s != 2.0f || t != 0.0f || ulx != 0.0f || uly != (float)y0 ||
+        gGfxFb.frameWidth != GFX_N64_WIDTH || gGfxRdp.tiles[0].fmt != G_IM_FMT_CI ||
+        gGfxRdp.tiles[0].siz != G_IM_SIZ_8b ||
+        gx_key(gGfxRdp.texImageAddr) != sFrameKey + (u32)y0 * GFX_N64_WIDTH * 2) {
+        return false;
+    }
+    // The rectangles go down the frame, each reading rows not drawn yet: one copy of the frame serves them all
+    if (y0 != sVisMonoNext && !gfx_fb_frame_texture(&sVisMonoTex)) {
+        return false;
+    }
+    sVisMonoNext = (int)ceilf(lry);
+
+    gfx_gx_flush();
+    gx_set_num_tex(1);
+    memset(&sTex[0], 0, sizeof(sTex[0]));
+    sTex[0].valid = true;
+    sTex[0].width = GFX_N64_WIDTH;
+    sTex[0].height = GFX_N64_HEIGHT;
+    sTex[0].sShiftScale = sTex[0].tShiftScale = 1.0f;
+    memset(&sInfo, 0, sizeof(sInfo));
+    gx_set_vmode(VMODE_SCREEN);
+    gx_apply_scissor();
+    gGfxRdp.dirty &= ~GFX_DIRTY_SCISSOR;
+    if (!sScissorEmpty) {
+        gx_vismono_state();
+        st[0][0] = 0.0f;
+        st[0][1] = uly;
+        st[1][0] = lrx;
+        st[1][1] = uly;
+        st[2][0] = 0.0f;
+        st[2][1] = lry;
+        st[3][0] = lrx;
+        st[3][1] = lry;
+        gx_quad(ulx, uly, lrx, lry, 0.0f, 0xFFFFFFFF, st);
+        gfx_gx_flush();
+        // Back to the swap tables gfx_tev.c expects (it never sets them)
+        GX_SetTevSwapMode(GX_TEVSTAGE0, GX_TEV_SWAP0, GX_TEV_SWAP0);
+        GX_SetTevSwapMode(GX_TEVSTAGE1, GX_TEV_SWAP0, GX_TEV_SWAP0);
+        GX_SetTevSwapMode(GX_TEVSTAGE2, GX_TEV_SWAP0, GX_TEV_SWAP0);
+        gfx_fb_frame_drawn(y0, sVisMonoNext);
+        sColorClean = sDepthClean = false;
+    }
+    sStateValid = false;
+    sKind = -1;
+    sTexTile = -1;
+    sTexBound[0] = sTexBound[1] = false;
+    gfx_tev_invalidate();
+    sStats.visMono++;
+    return true;
+}
+
 void gfx_gx_texrect(float ulx, float uly, float lrx, float lry, int tile, float s, float t, float dsdx,
                     float dtdy, bool flip) {
     float st[4][2];
     float dx = lrx - ulx;
     float dy = lry - uly;
+    Target target;
 
-    if (gx_target() != TARGET_FRAME) {
-        sStats.offscreen++;
+    if (lrx <= ulx || lry <= uly) {
         return;
     }
-    if (lrx <= ulx || lry <= uly) {
+    target = gx_target(false);
+    if (target == TARGET_CANVAS) {
+        gx_canvas_draw(ulx, uly, lrx, lry, gx_rect_opaque());
+    } else if (target != TARGET_FRAME) {
+        sStats.offscreen++;
+        return;
+    } else if (gx_vismono(ulx, uly, lrx, lry, tile, s, t, dsdx, dtdy, flip)) {
         return;
     }
     gx_prepare(GFX_PRIM_TEXRECT, tile);
     if (sScissorEmpty) {
         return;
+    }
+    if (target == TARGET_FRAME) {
+        gfx_fb_frame_drawn((int)uly, (int)ceilf(lry));
     }
 
     if (!flip) {
@@ -789,7 +1102,54 @@ void gfx_gx_texrect(float ulx, float uly, float lrx, float lry, int tile, float 
     }
     gx_quad(ulx, uly, lrx, lry, gx_rect_depth(), 0xFFFFFFFF, st);
     sStats.rects++;
-    sColorClean = sDepthClean = false;
+    if (target == TARGET_FRAME) {
+        sColorClean = sDepthClean = false;
+    }
+}
+
+void gfx_gx_image_rect(float ulx, float uly, float lrx, float lry, const GfxTexBinding* b, float s, float t,
+                       float dsdx, float dtdy) {
+    float st[4][2];
+    Target target;
+
+    if (lrx <= ulx || lry <= uly || b == NULL || !b->valid) {
+        return;
+    }
+    target = gx_target(false);
+    if (target == TARGET_CANVAS) {
+        gx_canvas_draw(ulx, uly, lrx, lry, gx_rect_opaque());
+    } else if (target != TARGET_FRAME) {
+        sStats.offscreen++;
+        return;
+    }
+    // TEXEL0 is the caller's image (already in GX_TEXMAP0), TEXEL1 the white dummy. GX_TILE_IMAGE keeps
+    // gx_prepare from binding tiles; the next draw from a tile binds both maps again.
+    gfx_gx_flush();
+    sTex[0] = *b;
+    GX_LoadTexObj(&sDummyTex, GX_TEXMAP1);
+    memset(&sTex[1], 0, sizeof(sTex[1]));
+    sTex[1].width = 8;
+    sTex[1].height = 4;
+    sTex[1].sShiftScale = sTex[1].tShiftScale = 1.0f;
+    gx_prepare(GFX_PRIM_TEXRECT, GX_TILE_IMAGE);
+    if (sScissorEmpty) {
+        return;
+    }
+    if (target == TARGET_FRAME) {
+        gfx_fb_frame_drawn((int)uly, (int)ceilf(lry));
+    }
+
+    st[0][0] = s;                     st[0][1] = t;
+    st[1][0] = s + (lrx - ulx) * dsdx; st[1][1] = t;
+    st[2][0] = s;                     st[2][1] = t + (lry - uly) * dtdy;
+    st[3][0] = s + (lrx - ulx) * dsdx; st[3][1] = t + (lry - uly) * dtdy;
+    gx_quad(ulx, uly, lrx, lry, gx_rect_depth(), 0xFFFFFFFF, st);
+    // The quad's texture coordinates were computed with this binding: draw it before anything else is bound
+    gfx_gx_flush();
+    sStats.rects++;
+    if (target == TARGET_FRAME) {
+        sColorClean = sDepthClean = false;
+    }
 }
 
 /* FILL mode fill color as an RGBA8 color: the first of two RGBA5551 pixels, or RGBA8888 for 32-bit images */
@@ -802,6 +1162,10 @@ static GXColor gx_fill_color(void) {
         c.g = fill >> 16;
         c.b = fill >> 8;
         c.a = fill;
+    } else if (gGfxRdp.colorImageSiz == G_IM_SIZ_8b) {
+        // Four 8-bit pixels: an intensity, which goes to red like the other draws into 8-bit images
+        c.r = c.g = c.b = fill >> 24;
+        c.a = 255;
     } else {
         u32 p = fill >> 16;
         u32 r = (p >> 11) & 0x1F, g = (p >> 6) & 0x1F, b = (p >> 1) & 0x1F;
@@ -832,6 +1196,8 @@ static void gx_fill_depth(float ulx, float uly, float lrx, float lry) {
         sLoggedFillZ = true;
         gc_log("gfx: z-buffer filled with %08X, cleared to far instead (logged once)", gGfxRdp.fillColor);
     }
+    sDepthFilled = true;
+    sDepthColored = false;
     if (full && sDepthClean) {
         sStats.fillsSkipped++;
         return;
@@ -851,9 +1217,10 @@ static void gx_fill_depth(float ulx, float uly, float lrx, float lry) {
     }
 }
 
-static void gx_fill_color_rect(float ulx, float uly, float lrx, float lry) {
+/* FILL-mode rectangle into the frame (frame: the EFB clean-state logic applies) or the canvas */
+static void gx_fill_color_rect(float ulx, float uly, float lrx, float lry, bool frame) {
     GXColor color = gx_fill_color();
-    bool full = gx_covers_screen(ulx, uly, lrx, lry);
+    bool full = frame && gx_covers_screen(ulx, uly, lrx, lry);
 
     color.a = 255;
     if (full) {
@@ -874,28 +1241,39 @@ static void gx_fill_color_rect(float ulx, float uly, float lrx, float lry) {
         gfx_gx_flush();
     }
     sStats.fillQuads++;
-    sColorClean = full;
-    sCleanColor = color;
+    if (frame) {
+        sColorClean = full;
+        sCleanColor = color;
+    }
 }
 
 void gfx_gx_fillrect(float ulx, float uly, float lrx, float lry) {
-    Target target = gx_target();
+    bool fillMode = (gGfxRdp.otherModeH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_FILL;
+    Target target;
 
     if (lrx <= ulx || lry <= uly) {
         return;
     }
-    if ((gGfxRdp.otherModeH & (3 << G_MDSFT_CYCLETYPE)) == G_CYC_FILL) {
+    target = gx_target(fillMode);
+    if (fillMode) {
         if (target == TARGET_DEPTH) {
             gx_fill_depth(ulx, uly, lrx, lry);
         } else if (target == TARGET_FRAME) {
-            gx_fill_color_rect(ulx, uly, lrx, lry);
+            // (a fill the clean EFB makes unnecessary still changes the frame's RAM on the N64)
+            gfx_fb_frame_drawn((int)uly, (int)ceilf(lry));
+            gx_fill_color_rect(ulx, uly, lrx, lry, true);
+        } else if (target == TARGET_CANVAS) {
+            gx_canvas_draw(ulx, uly, lrx, lry, true);
+            gx_fill_color_rect(ulx, uly, lrx, lry, false);
         } else {
             sStats.offscreen++;
         }
         return;
     }
 
-    if (target != TARGET_FRAME) {
+    if (target == TARGET_CANVAS) {
+        gx_canvas_draw(ulx, uly, lrx, lry, gx_rect_opaque());
+    } else if (target != TARGET_FRAME) {
         sStats.offscreen++;
         return;
     }
@@ -905,7 +1283,24 @@ void gfx_gx_fillrect(float ulx, float uly, float lrx, float lry) {
     }
     gx_quad(ulx, uly, lrx, lry, gx_rect_depth(), 0xFFFFFFFF, NULL);
     sStats.rects++;
-    sColorClean = sDepthClean = false;
+    if (target == TARGET_FRAME) {
+        gfx_fb_frame_drawn((int)uly, (int)ceilf(lry));
+        sColorClean = sDepthClean = false;
+    }
+}
+
+void gfx_gx_state_lost(void) {
+    gfx_gx_flush();
+    gx_base_state();
+    sNumTex = -1;
+    sVMode = VMODE_NONE;
+    sGxProjValid = false;
+    sGxVpValid = false;
+    sStateValid = false;
+    sKind = -1;
+    sTexBound[0] = sTexBound[1] = false;
+    gGfxRdp.dirty |= GFX_DIRTY_SCISSOR | GFX_DIRTY_VIEWPORT;
+    gfx_tev_invalidate();
 }
 
 /* ============================================================================================== */
@@ -925,18 +1320,34 @@ void gfx_gx_task_begin(void) {
     sTexTile = -1;
     sTexBound[0] = sTexBound[1] = false;
     sBatchCount = 0;
+    sCanvasKey = 0;
+    sScale = GFX_SCALE;
+    sTargetW = GFX_EFB_WIDTH;
+    sTargetH = GFX_EFB_HEIGHT;
+    sDepthFilled = sDepthColored = false;
+    sVisMonoNext = -1;
+    gfx_fb_task_begin();
 }
 
 static void gx_log_stats(u64 now) {
     u32 ms = ticks_to_millisecs(now - sStatsStart);
     u32 tasks = (sStats.tasks != 0) ? sStats.tasks : 1;
+    GfxFbStats fb;
 
     gc_log("gx: %u tasks in %u ms, %u frames; per task: %u tris (%u via CPU, %u dropped), %u rects, %u batches; "
-           "fills: %u color, %u depth, %u skipped; %u off-screen draws; task %u us avg, %u us max",
+           "fills: %u color, %u depth, %u skipped; %u off-screen draws, %u skipped; %u VisMono rects; task %u us avg, "
+           "%u us max",
            sStats.tasks, ms, sStats.frames, sStats.tris / tasks, sStats.cpuTris / tasks, sStats.droppedTris / tasks,
            sStats.rects / tasks, sStats.batches / tasks, sStats.fillQuads, sStats.depthQuads, sStats.fillsSkipped,
-           sStats.offscreen, (u32)ticks_to_microsecs(sStats.taskTicks / tasks),
+           sStats.canvasDraws, sStats.offscreen, sStats.visMono, (u32)ticks_to_microsecs(sStats.taskTicks / tasks),
            (u32)ticks_to_microsecs(sStats.maxTaskTicks));
+    gfx_fb_take_stats(&fb);
+    if (fb.readbacks != 0 || fb.passes != 0 || fb.depthWrites != 0) {
+        gc_log("gx: fb: %u frame readbacks (%u rows), %u off-screen passes, %u writes and %u loads of off-screen "
+               "images, %u depth writes; %u us per task, %u us of it waiting for GX", fb.readbacks, fb.readbackRows,
+               fb.passes, fb.copyOuts, fb.uploads, fb.depthWrites, (u32)ticks_to_microsecs(fb.ticks / tasks),
+               (u32)ticks_to_microsecs(fb.waitTicks / tasks));
+    }
     memset(&sStats, 0, sizeof(sStats));
     sStatsStart = now;
 }
@@ -985,6 +1396,10 @@ void gfx_gx_task_end(void) {
     int i;
 
     gfx_gx_flush();
+    // An off-screen pass still open ends here; the z-buffer's RAM gets the frame's depth if the task cleared it
+    // and drew no colors into it since
+    gx_use_frame();
+    gfx_fb_task_end(gfx_addr(gGfxRdp.zImageAddr), sDepthFilled && !sDepthColored);
 
     if (key != 0) {
         // With 3 XFBs one is always free; with 2, the previous frame stays on screen until the next retrace

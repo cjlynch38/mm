@@ -5,6 +5,7 @@
  * all the device files use. Calls that the contract forbids while holding the OS lock fail the test.
  */
 #include "gc_ultra_internal.h"
+#include "gc_game.h"
 #include "stdbool.h"
 #include "mock.h"
 
@@ -128,4 +129,17 @@ u32 __gcIoRead(u32 addr) {
 }
 
 void __gcIoWrite(u32 addr, u32 data) {
+}
+
+// Game-side hooks the device files call, as weak no-ops (a test may define its own): the GC_AUTOSTART
+// Start press (port/gc/game/trace.c) and the software RSP tasks run by osSpTaskStartGo (port/gc/audio,
+// port/gc/game/njpeg_cpu.c; port/gc/ultra/task_weak.c has the same defaults)
+__attribute__((weak)) s32 Gc_AutoStartPressed(void) {
+    return false;
+}
+
+__attribute__((weak)) void Gc_AudRunTask(OSTask* task) {
+}
+
+__attribute__((weak)) void Gc_NJpegRunTask(OSTask* task) {
 }

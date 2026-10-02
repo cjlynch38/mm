@@ -5,7 +5,8 @@
  * and point lighting, fog, texgen, culling, display list calls / branches / G_BRANCH_Z / G_CULLDL,
  * segments, G_MODIFYVTX, texture rectangles, forced matrices, S2DEX2 switching and logging, the microcode's
  * light direction quantization and matrix saturation, bad addresses in display lists, the statistics
- * lines, and random display lists (fuzzing under the sanitizers).
+ * lines, and random display lists (fuzzing under the sanitizers, S2DEX2 commands included). The S2DEX2
+ * commands themselves are tested in test_s2dex.c.
  */
 #include <math.h>
 #include <stdio.h>
@@ -13,19 +14,6 @@
 #include <string.h>
 #include <time.h>
 #include "test.h"
-
-static int sChecks, sFailures;
-
-#define CHECK(cond, ...)                                     \
-    do {                                                     \
-        sChecks++;                                           \
-        if (!(cond)) {                                       \
-            sFailures++;                                     \
-            printf("FAIL %s:%d: ", __FILE__, __LINE__);      \
-            printf(__VA_ARGS__);                             \
-            printf("\n");                                    \
-        }                                                    \
-    } while (0)
 
 /* ============================================================================================== */
 /* Display list builder and GBI encoders (F3DEX2 encodings from include/PR/gbi.h)                 */
@@ -1293,15 +1281,15 @@ static void test_force_and_lazy_projection(void) {
 }
 
 static void test_s2dex_switch(void) {
-    M4 p, id, bad;
+    M4 p, id;
     Dl d = dl_new(64);
     uint32_t vb = vtx_buf(3);
+    uint32_t zero = ram_alloc(64); // an empty uObjBg / uObjSprite: nothing to draw
     uint32_t got[4];
     int logs;
 
     m_scale(p, 0.01, 0.01, 0.01);
     m_identity(id);
-    m_scale(bad, 50, 50, 50);
     vtx_set(vb, 0, -10, -10, 0, 0, 0, 0, 0, 127, 255);
     vtx_set(vb, 1, 10, -10, 0, 0, 0, 0, 0, 127, 255);
     vtx_set(vb, 2, 4, 8, 0, 0, 0, 0, 0, 127, 255);
@@ -1312,10 +1300,11 @@ static void test_s2dex_switch(void) {
     gVtx(&d, vb, 3, 0);
     gTri1(&d, 0, 1, 2);
     gLoadUcode(&d, ucode_addr(gspS2DEX2_fifoTextStart) & 0x1FFFFFFF, 0); // as gSPLoadUcodeL (physical)
-    op(&d, CMD(0x0A), 0x80001000);                                         // G_BG_COPY: skipped
-    op(&d, CMD(0xDA), put_mtx(bad));                                       // G_OBJ_RECTANGLE_R (= G_MTX in F3DEX2)
-    op(&d, CMD(0x01) | (3 << 12) | (3 << 1), 0x80001000);                  // G_OBJ_RECTANGLE (= G_VTX)
-    op(&d, CMD(G_TEXRECT), 0);                                             // G_RDPHALF_0 in S2DEX2
+    op(&d, CMD(0x0A), zero);                                               // G_BG_COPY of an empty frame
+    op(&d, CMD(0xDA), zero);                                               // G_OBJ_RECTANGLE_R (= G_MTX in F3DEX2)
+    op(&d, CMD(0x01) | (3 << 12) | (3 << 1), zero);                        // G_OBJ_RECTANGLE (= G_VTX)
+    op(&d, CMD(0x03), 0x1234);                                             // no such S2DEX2 command: logged
+    op(&d, CMD(G_TEXRECT), 0);                                             // G_RDPHALF_0, no G_RDPHALF_2 follows
     gMarker(&d, 0x51);                                                     // RDP: passed through
     gSegment(&d, 9, 0x00123400);                                           // shared: applied
     gLoadUcode(&d, ucode_addr(gspF3DZEX2_NoN_PosLight_fifoTextStart), 0);
@@ -1327,13 +1316,14 @@ static void test_s2dex_switch(void) {
 
     CHECK(gTriCount == 2, "triangles before and after S2DEX2 (%d)", gTriCount);
     CHECK(markers(got, 4) == 1 && got[0] == 0x51, "RDP commands pass through while S2DEX2 is loaded");
-    CHECK(gTexrectCount == 0, "S2DEX2's G_RDPHALF_0 is not a texture rectangle");
+    CHECK(gTexrectCount == 0 && gImageRectCount == 0 && gBindCount == 0, "nothing drawn by empty S2DEX2 objects");
     CHECK(gGfxSegments[9] == 0x00123400, "segments set under S2DEX2");
     CHECK(gGfxRsp.geometryMode == G_CLIPPING, "F3DZEX2 reload resets the geometry mode (%08X)", gGfxRsp.geometryMode);
     CHECK(gGfxRsp.textureOn == G_OFF && gGfxRsp.textureScaleS == 0.0f && gGfxRsp.fogMultiplier == 0 &&
               gGfxRsp.fogOffset == 0,
           "F3DZEX2 reload resets G_TEXTURE and fog");
-    CHECK(gLogCount > logs, "skipped S2DEX2 commands are logged");
+    CHECK(gLogCount > logs && strstr(gLastLog, "S2DEX2 command 03") != NULL, "unknown S2DEX2 commands are logged: %s",
+          gLastLog);
     if (gTriCount == 2) {
         CHECK(gTris[1].v[2].x == gTris[0].v[2].x && gTris[1].v[2].w == gTris[0].v[2].w,
               "matrices survive the microcode switch (%f vs %f)", gTris[1].v[2].x, gTris[0].v[2].x);
@@ -1582,14 +1572,15 @@ static uint32_t fuzz_tri(void) {
 }
 
 static void test_fuzz(void) {
-    enum { LISTS = 48, LEAVES = 12, CMDS = 64, DATA = 64 * 1024, RUNS = 5000, SANE_MTX = 8, SANE_VTX = 256 };
+    enum { LISTS = 48, LEAVES = 12, CMDS = 64, DATA = 64 * 1024, RUNS = 5000, SANE_MTX = 8, SANE_VTX = 256, SANE_BG = 16 };
     static const uint8_t ops[] = {
         G_VTX,          G_VTX,    G_VTX,       G_MODIFYVTX,  G_CULLDL,         G_BRANCH_Z,       G_TRI1,
         G_TRI1,         G_TRI1,   G_TRI2,      G_TRI2,       G_QUAD,           G_LINE3D,         G_TEXTURE,
         G_POPMTX,       G_GEOMETRYMODE, G_MTX, G_MTX,        G_MOVEWORD,       G_MOVEWORD,       G_MOVEMEM,
         G_MOVEMEM,      G_LOAD_UCODE, G_DL,    G_DL,         G_SPNOOP,         G_RDPHALF_1,      G_TEXRECT,
         G_RDPHALF_2,    G_SETOTHERMODE_L, G_SETOTHERMODE_H, G_SETPRIMCOLOR, G_SPNOOP, G_DMA_IO, G_SPECIAL_1,
-        0x0A,           0xDA,     0xE4,        0x55,
+        0x0A,           0xDA,     0xE4,        0x55,         0x09,             0x09,             0x0A,
+        0x0B,           0xDC,     G_SETCIMG,   G_SETZIMG,    G_LOADTLUT,       G_RDPSETOTHERMODE, G_SETSCISSOR,
     };
     static const uint32_t geomFlags[] = {
         G_ZBUFFER, G_SHADE, G_CULL_FRONT, G_CULL_BACK, G_FOG, G_LIGHTING, G_TEXTURE_GEN, G_TEXTURE_GEN_LINEAR,
@@ -1601,17 +1592,17 @@ static void test_fuzz(void) {
                                      G_MW_LIGHTCOL, G_MW_FORCEMTX, G_MW_PERSPNORM, 0x58 };
     static const uint8_t modOfs[] = { G_MWO_POINT_RGBA, G_MWO_POINT_ST, G_MWO_POINT_XYSCREEN, G_MWO_POINT_ZSCREEN,
                                       0x20 };
-    uint32_t lists[LISTS], data, saneMtx, saneVtx, callAt;
-    Dl top;
+    uint32_t lists[LISTS], data, saneMtx, saneVtx, saneBg, callAt, callAtS2d;
+    Dl top, topS2d;
     M4 persp, mv;
     uint8_t* p;
     int i, j, run, logsBefore = gLogCount;
     clock_t c0;
     double secs;
-    long tris = 0, rdp = 0, rects = 0;
+    long tris = 0, rdp = 0, rects = 0, images = 0;
 
     if (getenv("GFX_FUZZ_SEED") != NULL) { // other seeds: GFX_FUZZ_SEED=n make -C port/gc/tests/gfx_host run
-        sRand = (uint32_t)strtoul(getenv("GFX_FUZZ_SEED"), NULL, 0) | 1;
+        sRand = ((uint32_t)strtoul(getenv("GFX_FUZZ_SEED"), NULL, 0) << 1) | 1; // nonzero, one state per seed
     }
     // G_ENDDL everywhere past the first MiB (test data lives below), then random data and lists
     for (i = 1 << 20; i < (int)0x01800000; i += 8) {
@@ -1646,6 +1637,26 @@ static void test_fuzz(void) {
         wr16(a + 2, (uint16_t)(int16_t)((int)(rnd() % 801) - 400));
         wr16(a + 4, (uint16_t)(int16_t)((int)(rnd() % 801) - 400));
     }
+    // S2DEX2 backgrounds (uObjBg) of plausible sizes, scales and positions, their images in the data
+    saneBg = saneVtx + SANE_VTX * 16;
+    for (i = 0; i < SANE_BG; i++) {
+        uint32_t a = saneBg + (uint32_t)i * 40, w = 1 + rnd() % 400, h = 1 + rnd() % 300;
+
+        wr16(a + 0, (uint16_t)(rnd() % (w * 64)));
+        wr16(a + 2, (uint16_t)(w * 4 + rnd() % 4));
+        wr16(a + 4, (uint16_t)(int16_t)((int)(rnd() % 1600) - 400));
+        wr16(a + 6, (uint16_t)(rnd() % 2000));
+        wr16(a + 8, (uint16_t)(rnd() % (h * 64)));
+        wr16(a + 10, (uint16_t)(h * 4 + rnd() % 4));
+        wr16(a + 12, (uint16_t)(int16_t)((int)(rnd() % 1200) - 300));
+        wr16(a + 14, (uint16_t)(rnd() % 1500));
+        wr32(a + 16, data + rnd() % DATA);
+        p = ram_ptr(a);
+        p[22] = (uint8_t)(rnd() % 5), p[23] = (uint8_t)(rnd() % 4), p[25] = (uint8_t)(rnd() % 16);
+        p[27] = (uint8_t)(rnd() & 0x11);
+        wr16(a + 28, (uint16_t)(1 + rnd() % 8192));
+        wr16(a + 30, (uint16_t)(1 + rnd() % 8192));
+    }
     for (i = 0; i < LISTS; i++) {
         lists[i] = ram_alloc(CMDS * 8);
     }
@@ -1666,7 +1677,7 @@ static void test_fuzz(void) {
 
             if (j == CMDS - 1) {
                 op8 = G_ENDDL, w0 = CMD(G_ENDDL), any = false;
-            } else if (op8 == G_BRANCH_Z && j == CMDS - 2) {
+            } else if (op8 == G_BRANCH_Z && j >= CMDS - 3) {
                 op8 = G_SPNOOP, w0 = CMD(G_SPNOOP), any = false;
             }
             switch (op8) {
@@ -1758,14 +1769,25 @@ static void test_fuzz(void) {
                     }
                     break;
                 case G_BRANCH_Z:
-                    wr32(a, CMD(G_RDPHALF_1));
-                    wr32(a + 4, fwd);
-                    a += 8, j++;
-                    w0 = CMD(G_BRANCH_Z) | ((rnd() % 32) * 2);
+                    // G_TEXRECT, G_RDPHALF_1, G_BRANCH_Z: under S2DEX2 the first and last are G_RDPHALF_0 and a
+                    // G_SELECT_DL branch whose address halves (the low halves of their w0) are the same forward
+                    // target. A list's high half (0x8000..0x800F) is a vertex index (0..7) for G_BRANCH_Z.
+                    wr32(a, CMD(G_TEXRECT) | (fwd & 0xFFFF));
+                    wr32(a + 4, rnd());
+                    wr32(a + 8, CMD(G_RDPHALF_1));
+                    wr32(a + 12, fwd);
+                    a += 16, j += 2;
+                    w0 = CMD(G_BRANCH_Z) | ((uint32_t)G_DL_NOPUSH << 16) | (fwd >> 16);
                     w1 = rnd() % 0x8000;
                     break;
                 case G_RDPHALF_1:
                     w1 = (r < 4) ? rnd() & 0x00FFFFFF : 0xDEAD0000u; // garbage, never a list
+                    break;
+                case 0x09: // S2DEX2 G_BG_1CYC / G_BG_COPY
+                case 0x0A:
+                    if (r < 6) {
+                        w1 = saneBg + (rnd() % SANE_BG) * 40;
+                    }
                     break;
                 case G_LOAD_UCODE:
                     w1 = (r < 3) ? ucode_addr(gspS2DEX2_fifoTextStart)
@@ -1786,23 +1808,37 @@ static void test_fuzz(void) {
     callAt = top.cur;
     gDL(&top, lists[0]);
     gEnd(&top);
+    // The same with S2DEX2 loaded before the call, so that every seed draws backgrounds
+    topS2d = dl_new(16);
+    setup(&topS2d, persp, mv);
+    op(&topS2d, CMD(G_RDPHALF_1), 0);
+    op(&topS2d, CMD(G_LOAD_UCODE) | 0x7FF, ucode_addr(gspS2DEX2_fifoTextStart));
+    callAtS2d = topS2d.cur;
+    gDL(&topS2d, lists[0]);
+    gEnd(&topS2d);
     c0 = clock();
     for (run = 0; run < RUNS; run++) {
-        wr32(callAt + 4, lists[rnd() % LISTS]);
+        uint32_t list = lists[rnd() % LISTS];
+
+        wr32(callAt + 4, list);
+        wr32(callAtS2d + 4, list);
+        gFbReady = (run & 2) != 0; // random G_SETCIMGs make most images render targets: drawn only with gfx_fb.c
         mock_reset();
         gfx_rsp_reset();
-        gfx_rsp_run((run & 7) ? top.start : lists[rnd() % LISTS]);
-        tris += gTriCount, rdp += gRdpCount, rects += gTexrectCount;
+        gfx_rsp_run(((run & 7) == 0) ? lists[rnd() % LISTS] : ((run & 7) == 6) ? topS2d.start : top.start);
+        tris += gTriCount, rdp += gRdpCount, rects += gTexrectCount, images += gImageRectCount;
     }
     secs = (double)(clock() - c0) / CLOCKS_PER_SEC;
-    CHECK(tris > 2000 && rdp > 10000 && rects > 1000, "fuzz exercised the pipeline: %ld tris, %ld RDP, %ld texrects",
-          tris, rdp, rects);
+    CHECK(tris > 2000 && rdp > 10000 && rects > 1000 && images > 100,
+          "fuzz exercised the pipeline: %ld tris, %ld RDP, %ld texrects, %ld S2DEX2 image rects", tris, rdp, rects,
+          images);
     CHECK(gNonFinite == 0, "fuzz: %d non-finite vertices or projections reached GX", gNonFinite);
     CHECK(gLogCount - logsBefore < 200, "fuzz: logging stays bounded (%d lines)", gLogCount - logsBefore);
     // A run that hit the command limit would take a good fraction of a second
     CHECK(secs < 10.0, "fuzz: %d runs took %.2f s", RUNS, secs);
     if (getenv("GFX_TEST_VERBOSE") != NULL) {
-        printf("  fuzz: %d runs, %ld tris, %ld RDP commands, %ld texrects, %.3f s\n", RUNS, tris, rdp, rects, secs);
+        printf("  fuzz: %d runs, %ld tris, %ld RDP commands, %ld texrects, %ld image rects, %.3f s\n", RUNS, tris, rdp,
+               rects, images, secs);
     }
     ram_reset();
 }
@@ -1812,6 +1848,15 @@ static void test_stats(void) {
 
     // gc_time_ticks advances 100 us per call in the mock; stats log every 3 s. The texture cache line
     // (gfx_internal.h: gfx_rsp_stats_frame logs gfx_tex_get_stats) shows activity since the last line.
+    // First an interval that logs what earlier tests left (S2DEX2 activity has a line of its own).
+    gfx_rsp_reset();
+    gfx_rsp_run(0);
+    for (i = 0; i < 100000 && gLogCount == before; i++) {
+        gfx_rsp_stats_frame();
+    }
+    gfx_rsp_reset();
+    gfx_rsp_run(0);
+    before = gLogCount;
     gTexStats.binds = 1000, gTexStats.hits = 900, gTexStats.misses = 100;
     gTexStats.entries = 42, gTexStats.bytesUsed = 512 * 1024, gTexStats.bytesTotal = 2048 * 1024;
     for (i = 0; i < 100000 && gLogCount == before; i++) {
@@ -1862,8 +1907,9 @@ int main(void) {
     test_matrix_saturation();
     test_bad_pointers();
     test_stats();
+    test_s2dex();
     test_fuzz();
 
-    printf("gfx_rsp host test: %d checks, %d failures\n", sChecks, sFailures);
-    return sFailures != 0;
+    printf("gfx_rsp / gfx_s2dex host test: %d checks, %d failures\n", gChecks, gFailures);
+    return gFailures != 0;
 }

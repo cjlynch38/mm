@@ -10,6 +10,8 @@
  *    clamp and mask with GX wrap modes (masked regions inside a clamp are expanded on the CPU).
  *  - Texture cache: buddy allocator over one fixed block of memory, LRU eviction, content hashes checked
  *    once per task, so textures the game rewrites are converted again.
+ *  - Whole images bound straight from RAM (gfx_tex_bind_image: S2DEX2 backgrounds, framebuffer textures), cached
+ *    the same way.
  */
 #include <string.h>
 #include "gfx_internal.h"
@@ -27,7 +29,7 @@
 #define TEX_MAX_ENTRIES 1024
 #define TEX_HASH_SIZE 1024 /* power of two */
 #define TEX_MAX_DIM 1024   /* GX limit, and the RDP's largest clamp */
-#define TEX_MAX_TEXELS (256 * 256)
+#define TEX_MAX_TEXELS (256 * 256) /* tiles; images may use up to TEX_MAX_DIM squared */
 #define TEX_SCRATCH_BYTES (16u << 10)
 #define TEX_NONE 0xFFFFFFFFu
 
@@ -69,16 +71,17 @@ enum {
     CONV_RGBA16,   /* RGBA5551 -> GX RGB5A3 */
     CONV_IA16,     /* IA16 (8-bit I, 8-bit A) -> GX IA8 (also the other 16-bit formats) */
     CONV_RGBA32,   /* RGBA8888 -> GX RGBA8 */
+    CONV_YUV16,    /* YUV16 (U Y0 V Y1 per texel pair) -> GX RGBA8 (images only; TMEM splits YUV over both halves) */
     CONV_COUNT
 };
 
 static const uint8_t sConvSiz[CONV_COUNT] = {
-    G_IM_SIZ_4b, G_IM_SIZ_4b, G_IM_SIZ_4b, G_IM_SIZ_4b,  G_IM_SIZ_4b,  G_IM_SIZ_8b,
-    G_IM_SIZ_8b, G_IM_SIZ_8b, G_IM_SIZ_8b, G_IM_SIZ_16b, G_IM_SIZ_16b, G_IM_SIZ_32b,
+    G_IM_SIZ_4b, G_IM_SIZ_4b, G_IM_SIZ_4b,  G_IM_SIZ_4b,  G_IM_SIZ_4b,  G_IM_SIZ_8b,  G_IM_SIZ_8b,
+    G_IM_SIZ_8b, G_IM_SIZ_8b, G_IM_SIZ_16b, G_IM_SIZ_16b, G_IM_SIZ_32b, G_IM_SIZ_16b,
 };
 static const uint8_t sConvGxFmt[CONV_COUNT] = {
-    GX_TF_I4,  GX_TF_IA4,    GX_TF_I8,  GX_TF_RGB5A3, GX_TF_IA8, GX_TF_I8,
-    GX_TF_IA4, GX_TF_RGB5A3, GX_TF_IA8, GX_TF_RGB5A3, GX_TF_IA8, GX_TF_RGBA8,
+    GX_TF_I4,     GX_TF_IA4, GX_TF_I8,     GX_TF_RGB5A3, GX_TF_IA8,   GX_TF_I8,    GX_TF_IA4,
+    GX_TF_RGB5A3, GX_TF_IA8, GX_TF_RGB5A3, GX_TF_IA8,    GX_TF_RGBA8, GX_TF_RGBA8,
 };
 
 /* Cache key: everything the converted texture depends on, apart from the bytes it was converted from */
@@ -86,6 +89,7 @@ static const uint8_t sConvGxFmt[CONV_COUNT] = {
 #define KEY_SWAP_ODD 0x02 /* odd rows have their 32-bit words swapped in RAM (LOADBLOCK with dxt 0) */
 #define KEY_PAL_ADDR 0x04 /* pal is the RAM address of the palette */
 #define KEY_PAL_HASH 0x08 /* pal is a content hash of a palette gathered from the replayed TMEM */
+#define KEY_IMAGE 0x10    /* gfx_tex_bind_image: src is the image's CPU address (hashed over its own row length) */
 
 typedef struct {
     uint32_t src;           /* resolved RAM address of row 0 (or a content hash with KEY_SLOW) */
@@ -93,12 +97,15 @@ typedef struct {
     uint32_t pal;           /* palette address or hash; the palette number for CONV_CI4_I8 */
     uint16_t width, height; /* GX texture */
     uint16_t srcW, srcH;    /* N64 texels per row, rows read from TMEM */
+    uint16_t palCount;      /* palette entries read at `pal` with KEY_PAL_ADDR (the others are 0) */
     uint8_t conv;
     uint8_t flags;      /* KEY_* */
     uint8_t mapS, mapT; /* 0, or a masked region expanded inside a clamp: 0x80 | mirror << 4 | mask */
+    uint8_t pad[2];
 } TexKey;
 
-_Static_assert(sizeof(TexKey) == 24, "TexKey is hashed and compared as 6 words");
+#define TEX_KEY_WORDS 7
+_Static_assert(sizeof(TexKey) == TEX_KEY_WORDS * 4, "TexKey is hashed and compared as words");
 
 typedef struct {
     TexKey key;
@@ -113,9 +120,11 @@ typedef struct {
     uint8_t used;
 } TexEntry;
 
-/* Last binding per texture map: a repeated bind of an unchanged tile skips resolution and lookup */
+/* Last binding per texture map: a repeated bind of an unchanged tile skips resolution and lookup. An image binding
+ * (gfx_tex_bind_image) is recorded only to keep its texture from being evicted while the map holds it. */
 typedef struct {
     bool valid;
+    bool image;
     int16_t entry;
     uint32_t frame, tmemGen, omH;
     GfxTile tile;
@@ -132,7 +141,18 @@ typedef struct {
     uint8_t* dst;
 } TexJob;
 
-enum { LOG_LOAD4B, LOG_TMEM_WRAP, LOG_FORMAT, LOG_TOO_BIG, LOG_SCRATCH, LOG_RAM, LOG_NO_FIT, LOG_COUNT };
+enum {
+    LOG_LOAD4B,
+    LOG_TMEM_WRAP,
+    LOG_FORMAT,
+    LOG_TOO_BIG,
+    LOG_SCRATCH,
+    LOG_RAM,
+    LOG_NO_FIT,
+    LOG_IMAGE,
+    LOG_UNLOADED,
+    LOG_COUNT
+};
 
 /* ================================================================================================ */
 /* State                                                                                            */
@@ -173,6 +193,16 @@ static uint8_t sLogged[LOG_COUNT];
             gc_log(__VA_ARGS__); \
         }                        \
     } while (0)
+
+/* RAM addresses in cache keys: KSEG0 on the GameCube (the uncached mirror is the same memory); host tests use
+ * their own pointers */
+static uint32_t tex_key_addr(uint32_t addr) {
+#ifdef GEKKO
+    return (addr & 0x1FFFFFFF) | 0x80000000;
+#else
+    return addr;
+#endif
+}
 
 static bool tex_ram_ok(uint32_t addr, uint32_t bytes) {
     if (addr >= TEX_RAM_START && addr < TEX_RAM_END && bytes <= TEX_RAM_END - addr) {
@@ -581,9 +611,11 @@ static bool tex_any_load(uint32_t a, uint32_t n, bool is32, uint32_t limit) {
     return false;
 }
 
-/* Palette entries [first, first + n) of the TLUT (TMEM words 256 + first...) in one TLUT load */
-static bool tex_find_pal(uint32_t first, uint32_t n, uint32_t* addr) {
-    uint32_t a = (256 + first) * 8, b = a + n * 8;
+/* Palette entries [first, first + n) of the TLUT (TMEM words 256 + first...): the first `count` of them in one TLUT
+ * load, the others never loaded (0, as in the replayed TMEM). A CI8 texture often comes with a TLUT of fewer than
+ * 256 entries. */
+static bool tex_find_pal(uint32_t first, uint32_t n, uint32_t* addr, uint32_t* count) {
+    uint32_t a = (256 + first) * 8, b = a + n * 8, loaded;
     const TmemLoad* ld;
     int i, j;
 
@@ -592,15 +624,19 @@ static bool tex_find_pal(uint32_t first, uint32_t n, uint32_t* addr) {
         return false;
     }
     ld = &sLoads[i];
-    if (ld->kind != LOAD_TLUT || b > ld->end) {
+    if (ld->kind != LOAD_TLUT) {
         return false;
     }
-    for (j = i + 1; j < sNumLoads; j++) {
-        if (tmem_overlaps(&sLoads[j], a, b)) {
+    loaded = (ld->end < b) ? ld->end : b;
+    for (j = 0; j < sNumLoads; j++) {
+        /* Newer loads anywhere in the palette, older ones past the end of this load */
+        if ((j > i && tmem_overlaps(&sLoads[j], a, b)) ||
+            (j < i && loaded < b && tmem_overlaps(&sLoads[j], loaded, b))) {
             return false;
         }
     }
     *addr = ld->src + ((a - ld->start) >> 3) * 2;
+    *count = (loaded - a) >> 3;
     return true;
 }
 
@@ -629,13 +665,9 @@ static uint32_t tex_hash(const uint8_t* p, uint32_t n, uint32_t h) {
     return h ^ (h >> 16);
 }
 
-static uint32_t tex_hash_ram(uint32_t addr, uint32_t stride, uint32_t rowBytes, uint32_t rows) {
-    const uint8_t* p;
+static uint32_t tex_hash_rows(const uint8_t* p, uint32_t stride, uint32_t rowBytes, uint32_t rows) {
     uint32_t h = 0x165667B1 ^ rowBytes, y;
 
-    if (!tex_ram_ok(addr, (rows - 1) * stride + rowBytes) || (p = gfx_addr(addr)) == NULL) {
-        return 0;
-    }
     if (stride == rowBytes) {
         return tex_hash(p, rowBytes * rows, h);
     }
@@ -645,12 +677,21 @@ static uint32_t tex_hash_ram(uint32_t addr, uint32_t stride, uint32_t rowBytes, 
     return h;
 }
 
+static uint32_t tex_hash_ram(uint32_t addr, uint32_t stride, uint32_t rowBytes, uint32_t rows) {
+    const uint8_t* p;
+
+    if (!tex_ram_ok(addr, (rows - 1) * stride + rowBytes) || (p = gfx_addr(addr)) == NULL) {
+        return 0;
+    }
+    return tex_hash_rows(p, stride, rowBytes, rows);
+}
+
 static uint32_t key_hash(const TexKey* k) {
-    uint32_t w[6], h = 0x811C9DC5;
+    uint32_t w[TEX_KEY_WORDS], h = 0x811C9DC5;
     int i;
 
     memcpy(w, k, sizeof(w));
-    for (i = 0; i < 6; i++) {
+    for (i = 0; i < TEX_KEY_WORDS; i++) {
         h = (h ^ w[i]) * 0x01000193;
         h ^= h >> 15;
     }
@@ -893,6 +934,19 @@ static uint32_t ia16_to_ia8(uint32_t c) {
     return ((c & 0xFF) << 8) | (c >> 8); /* N64: intensity, alpha; GX: alpha, intensity */
 }
 
+static uint32_t clamp_u8(int32_t v) {
+    return (v < 0) ? 0 : (v > 255) ? 255 : (uint32_t)v;
+}
+
+/* YUV to opaque RGBA8 with the RDP's conversion and libultra's default coefficients (G_CV_K0..K3, /128) */
+static uint32_t yuv_to_rgba(uint32_t y, int32_t u, int32_t v) {
+    int32_t r = (int32_t)y + ((175 * v + 64) >> 7);
+    int32_t g = (int32_t)y + ((-43 * u - 89 * v + 64) >> 7);
+    int32_t b = (int32_t)y + ((222 * u + 64) >> 7);
+
+    return (clamp_u8(r) << 24) | (clamp_u8(g) << 16) | (clamp_u8(b) << 8) | 0xFF;
+}
+
 /* One N64 texel of `row`, converted to the GX texel value (4, 8, 16 bits, or RGBA for RGBA8) */
 static inline __attribute__((always_inline)) uint32_t tex_fetch(int conv, const uint8_t* row, uint32_t x,
                                                                 uint32_t ci4pal) {
@@ -929,6 +983,11 @@ static inline __attribute__((always_inline)) uint32_t tex_fetch(int conv, const 
             return rgba16_to_rgb5a3((row[x * 2] << 8) | row[x * 2 + 1]);
         case CONV_IA16:
             return ia16_to_ia8((row[x * 2] << 8) | row[x * 2 + 1]);
+        case CONV_YUV16: {
+            const uint8_t* p = row + (x & ~1u) * 2;
+
+            return yuv_to_rgba(p[1 + (x & 1) * 2], (int32_t)p[0] - 128, (int32_t)p[2] - 128);
+        }
         default: /* CONV_RGBA32 */
             return ((uint32_t)row[x * 4] << 24) | (row[x * 4 + 1] << 16) | (row[x * 4 + 2] << 8) | row[x * 4 + 3];
     }
@@ -1018,6 +1077,7 @@ static void tex_run(const TexJob* j) {
         TEX_CASE(CONV_RGBA16)
         TEX_CASE(CONV_IA16)
         TEX_CASE(CONV_RGBA32)
+        TEX_CASE(CONV_YUV16)
 #undef TEX_CASE
     }
 }
@@ -1162,6 +1222,26 @@ static void tex_load_obj(GXTexObj* obj, int texMap) {
     GX_LoadTexObj(obj, texMap);
 }
 
+/* Palette for a CI conversion: `n` RGBA16 or IA16 entries from p, then 0 up to `total` */
+static void tex_convert_pal(const uint8_t* p, uint32_t n, uint32_t total, int conv) {
+    bool ia = conv == CONV_CI4_IA || conv == CONV_CI8_IA;
+    uint32_t i;
+
+    for (i = 0; i < total; i++) {
+        uint32_t c = (i < n) ? ((p[i * 2] << 8) | p[i * 2 + 1]) : 0;
+
+        sPal[i] = ia ? ia16_to_ia8(c) : rgba16_to_rgb5a3(c);
+    }
+}
+
+/* A texture converted again in the middle of a task (gfx_tex_ram_written): draws already queued may still read the
+ * old texels from the same memory */
+static void tex_sync_rewrite(void) {
+    gfx_gx_flush();
+    GX_DrawDone();
+    sStats.syncs++;
+}
+
 static bool tex_fail(GfxTexBinding* out) {
     out->valid = false;
     sStats.failures++;
@@ -1174,11 +1254,12 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
     TexMemo* memo = NULL;
     TexKey key;
     int conv, siz, e;
-    bool is32, fast, swapOdd = false, linear, convert = false;
+    bool is32, fast, swapOdd = false, linear, copy, convert = false;
     uint32_t limit;
     uint8_t wrapS, wrapT;
     uint16_t width, height, srcW, srcH;
     uint32_t tmemAddr, lineBytes, tmemRow, ramRow, src = 0, stride = 0, palFirst = 0, palCount = 0, palAddr = 0;
+    uint32_t palRam = 0;
     uint32_t h, size, mul;
     GXTexObj obj;
     TexEntry* en;
@@ -1195,7 +1276,7 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
     omH = gGfxRdp.otherModeH & OM_BIND_BITS;
     if (texMap == GX_TEXMAP0 || texMap == GX_TEXMAP1) {
         memo = &sMemo[texMap == GX_TEXMAP1];
-        if (memo->valid && memo->frame == sFrame && memo->tmemGen == sTmemGen && memo->omH == omH &&
+        if (memo->valid && !memo->image && memo->frame == sFrame && memo->tmemGen == sTmemGen && memo->omH == omH &&
             memcmp(&memo->tile, t, sizeof(*t)) == 0) {
             sStats.hits++;
             sEntries[memo->entry].usedFrame = sFrame;
@@ -1221,8 +1302,12 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
                 ? 2048
                 : TMEM_BYTES;
     memset(&key, 0, sizeof(key));
-    tex_axis(t->uls, t->lrs, t->masks, t->cms, &width, &srcW, &wrapS, &key.mapS);
-    tex_axis(t->ult, t->lrt, t->maskt, t->cmt, &height, &srcH, &wrapT, &key.mapT);
+    /* COPY mode only masks (and mirrors) texture coordinates: the RDP skips the clamp there */
+    copy = (omH & (3u << G_MDSFT_CYCLETYPE)) == G_CYC_COPY;
+    tex_axis(t->uls, t->lrs, t->masks, (copy && t->masks != 0) ? (t->cms & ~G_TX_CLAMP) : t->cms, &width, &srcW,
+             &wrapS, &key.mapS);
+    tex_axis(t->ult, t->lrt, t->maskt, (copy && t->maskt != 0) ? (t->cmt & ~G_TX_CLAMP) : t->cmt, &height, &srcH,
+             &wrapT, &key.mapT);
     tmemAddr = (t->tmem * 8) & (limit - 1);
     lineBytes = t->line * 8;
 
@@ -1255,7 +1340,11 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
         key.flags |= swapOdd ? KEY_SWAP_ODD : 0;
     } else {
         if (!tex_any_load(tmemAddr, (srcH - 1) * lineBytes + tmemRow, is32, limit)) {
-            return tex_fail(out); /* nothing was loaded where the tile reads */
+            /* Nothing was loaded where the tile reads in this task (TMEM is not kept across tasks) */
+            TEX_LOG_ONCE(LOG_UNLOADED, "gfx: tex: tile %d (fmt %d siz %d tmem %03X line %u, %ux%u) reads TMEM that no "
+                         "load of this task wrote (%d loads)", tile & 7, t->fmt, t->siz, t->tmem, t->line,
+                         (unsigned int)srcW, (unsigned int)srcH, sNumLoads);
+            return tex_fail(out);
         }
         if (ramRow * srcH > sizeof(sScratch)) {
             TEX_LOG_ONCE(LOG_SCRATCH, "gfx: tex: %ux%u texture (tile %d) needs too much scratch", (unsigned int)srcW,
@@ -1277,8 +1366,9 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
         palCount = 256;
     }
     if (palCount != 0) {
-        if (tex_find_pal(palFirst, palCount, &palAddr) && tex_ram_ok(palAddr, palCount * 2)) {
+        if (tex_find_pal(palFirst, palCount, &palAddr, &palRam) && tex_ram_ok(palAddr, palRam * 2)) {
             key.pal = palAddr;
+            key.palCount = palRam;
             key.flags |= KEY_PAL_ADDR;
         } else {
             uint32_t i, w;
@@ -1309,7 +1399,7 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
         en = &sEntries[e];
         if (en->validFrame != sFrame) {
             uint32_t dh = (key.flags & KEY_SLOW) ? 0 : tex_hash_ram(src, stride, tmemRow * mul, srcH);
-            uint32_t ph = (key.flags & KEY_PAL_ADDR) ? tex_hash_ram(palAddr, palCount * 2, palCount * 2, 1) : 0;
+            uint32_t ph = (key.flags & KEY_PAL_ADDR) ? tex_hash_ram(palAddr, palRam * 2, palRam * 2, 1) : 0;
 
             en->validFrame = sFrame;
             if (dh != en->dataHash || ph != en->palHash) {
@@ -1338,25 +1428,22 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
         en = &sEntries[e];
         en->validFrame = sFrame;
         en->dataHash = (key.flags & KEY_SLOW) ? 0 : tex_hash_ram(src, stride, tmemRow * mul, srcH);
-        en->palHash = (key.flags & KEY_PAL_ADDR) ? tex_hash_ram(palAddr, palCount * 2, palCount * 2, 1) : 0;
+        en->palHash = (key.flags & KEY_PAL_ADDR) ? tex_hash_ram(palAddr, palRam * 2, palRam * 2, 1) : 0;
         convert = true;
         sStats.misses++;
+    }
+    if (convert && en->usedFrame == sFrame) {
+        tex_sync_rewrite();
     }
     en->usedFrame = sFrame;
 
     if (convert) {
         TexJob job;
-        uint32_t i;
 
-        if (palCount != 0) {
-            const uint8_t* p = (key.flags & KEY_PAL_ADDR) ? gfx_addr(palAddr) : sPalScratch;
-            bool palIA = conv == CONV_CI4_IA || conv == CONV_CI8_IA;
-
-            for (i = 0; i < palCount; i++) {
-                uint32_t c = (p[i * 2] << 8) | p[i * 2 + 1];
-
-                sPal[i] = palIA ? ia16_to_ia8(c) : rgba16_to_rgb5a3(c);
-            }
+        if (key.flags & KEY_PAL_ADDR) {
+            tex_convert_pal(gfx_addr(palAddr), palRam, palCount, conv);
+        } else if (palCount != 0) {
+            tex_convert_pal(sPalScratch, palCount, palCount, conv);
         }
         if (fast && !swapOdd) {
             job.rows = gfx_addr(src);
@@ -1400,6 +1487,7 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
 
     if (memo != NULL) {
         memo->valid = true;
+        memo->image = false;
         memo->entry = e;
         memo->frame = sFrame;
         memo->tmemGen = sTmemGen;
@@ -1407,6 +1495,165 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
         memo->tile = *t;
         memo->obj = obj;
         memo->binding = *out;
+    }
+    return true;
+}
+
+/* Whether `bytes` at a CPU pointer are game RAM (MEM1, cached or uncached mirror). Host tests use host pointers. */
+static bool tex_ptr_ok(const void* p, uint32_t bytes) {
+#ifdef GEKKO
+    uint32_t a = (uint32_t)p;
+
+    if ((a >> 30) >= 2 && (a & 0x3FFFFFFF) < TEX_RAM_END - TEX_RAM_START &&
+        bytes <= TEX_RAM_END - TEX_RAM_START - (a & 0x3FFFFFFF)) {
+        return true;
+    }
+    TEX_LOG_ONCE(LOG_RAM, "gfx: tex: image address %08X (+%u) is outside RAM", (unsigned int)a, (unsigned int)bytes);
+    return false;
+#else
+    return p != NULL;
+#endif
+}
+
+bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height, uint16_t stride,
+                        const void* tlut, bool tlutIA, bool linear, int texMap, GfxTexBinding* out) {
+    const uint8_t* rows = addr;
+    TexMemo* memo = NULL;
+    TexKey key;
+    TexEntry* en;
+    GXTexObj obj;
+    uint32_t rowBytes, strideBytes, palCount = 0, h;
+    int conv, gxFmt, e;
+    bool convert = false;
+
+    sStats.binds++;
+    out->valid = false;
+    if (!sInit) {
+        gfx_tex_init();
+    }
+    if (texMap == GX_TEXMAP0 || texMap == GX_TEXMAP1) {
+        /* The map is about to hold this image, not the memo's tile */
+        memo = &sMemo[texMap == GX_TEXMAP1];
+        memo->valid = false;
+    }
+    if (sArena == NULL) {
+        return tex_fail(out);
+    }
+    if (rows == NULL || width == 0 || height == 0 || width > TEX_MAX_DIM || height > TEX_MAX_DIM || stride < width) {
+        TEX_LOG_ONCE(LOG_IMAGE, "gfx: tex: image %ux%u (stride %u) at %08X not supported", (unsigned int)width,
+                     (unsigned int)height, (unsigned int)stride, (unsigned int)(uintptr_t)addr);
+        return tex_fail(out);
+    }
+
+    /* Formats as the RDP decodes them; a palette applies to 4- and 8-bit texels */
+    if (fmt == G_IM_FMT_YUV && siz == G_IM_SIZ_16b) {
+        conv = CONV_YUV16;
+    } else {
+        conv = tex_conv(fmt, siz, (tlut != NULL) ? (OM_TEXTLUT_ON | (tlutIA ? OM_TEXTLUT_IA : 0)) : 0);
+    }
+    gxFmt = sConvGxFmt[conv];
+    rowBytes = row_ram_bytes(sConvSiz[conv], (conv == CONV_YUV16) ? (width + 1u) & ~1u : width);
+    strideBytes = row_ram_bytes(sConvSiz[conv], stride);
+    if (conv == CONV_CI4_RGBA || conv == CONV_CI4_IA) {
+        palCount = 16;
+    } else if (conv == CONV_CI8_RGBA || conv == CONV_CI8_IA) {
+        palCount = 256;
+    }
+    if (!tex_ptr_ok(rows, (height - 1u) * strideBytes + rowBytes) ||
+        (palCount != 0 && !tex_ptr_ok(tlut, palCount * 2))) {
+        return tex_fail(out);
+    }
+
+    memset(&key, 0, sizeof(key));
+    key.src = tex_key_addr((uint32_t)(uintptr_t)rows);
+    key.stride = strideBytes;
+    key.width = key.srcW = width;
+    key.height = key.srcH = height;
+    key.conv = conv;
+    key.flags = KEY_IMAGE;
+    if (palCount != 0) {
+        key.pal = tex_key_addr((uint32_t)(uintptr_t)tlut);
+        key.palCount = palCount;
+        key.flags |= KEY_PAL_ADDR;
+    }
+
+    /* Cache lookup, with the contents checked once per task */
+    h = key_hash(&key);
+    e = cache_find(&key, h);
+    if (e >= 0) {
+        en = &sEntries[e];
+        if (en->validFrame != sFrame) {
+            uint32_t dh = tex_hash_rows(rows, strideBytes, rowBytes, height);
+            uint32_t ph = (palCount != 0) ? tex_hash_rows(tlut, palCount * 2, palCount * 2, 1) : 0;
+
+            en->validFrame = sFrame;
+            if (dh != en->dataHash || ph != en->palHash) {
+                en->dataHash = dh;
+                en->palHash = ph;
+                convert = true;
+                sStats.reconverts++;
+            }
+        }
+        if (!convert) {
+            sStats.hits++;
+        }
+        lru_unlink(e);
+        lru_push_front(e);
+    } else {
+        e = cache_insert(&key, h, gx_tex_bytes(gxFmt, width, height));
+        if (e < 0) {
+            TEX_LOG_ONCE(LOG_NO_FIT, "gfx: tex: %ux%u image (%u bytes) does not fit in the texture cache",
+                         (unsigned int)width, (unsigned int)height, (unsigned int)gx_tex_bytes(gxFmt, width, height));
+            return tex_fail(out);
+        }
+        en = &sEntries[e];
+        en->validFrame = sFrame;
+        en->dataHash = tex_hash_rows(rows, strideBytes, rowBytes, height);
+        en->palHash = (palCount != 0) ? tex_hash_rows(tlut, palCount * 2, palCount * 2, 1) : 0;
+        convert = true;
+        sStats.misses++;
+    }
+    if (convert && en->usedFrame == sFrame) {
+        tex_sync_rewrite();
+    }
+    en->usedFrame = sFrame;
+
+    if (convert) {
+        TexJob job;
+
+        if (palCount != 0) {
+            tex_convert_pal(tlut, palCount, palCount, conv);
+        }
+        tex_build_map(sMapS, width, 0);
+        tex_build_map(sMapT, height, 0);
+        job.conv = conv;
+        job.width = width;
+        job.height = height;
+        job.rows = rows;
+        job.rowStride = strideBytes;
+        job.ci4pal = 0;
+        job.dst = sArena + en->offset;
+        tex_run(&job);
+        DCFlushRange(job.dst, gx_tex_bytes(gxFmt, width, height));
+        sNeedInvalidate = true;
+    }
+
+    GX_InitTexObj(&obj, sArena + en->offset, width, height, gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&obj, linear ? GX_LINEAR : GX_NEAR, linear ? GX_LINEAR : GX_NEAR);
+    tex_load_obj(&obj, texMap);
+
+    out->valid = true;
+    out->width = width;
+    out->height = height;
+    out->sOffset = out->tOffset = 0.0f;
+    out->sShiftScale = out->tShiftScale = 1.0f;
+    out->linear = linear;
+
+    if (memo != NULL) {
+        memo->valid = true;
+        memo->image = true;
+        memo->entry = e;
+        memo->frame = sFrame;
     }
     return true;
 }
@@ -1467,6 +1714,37 @@ void gfx_tex_frame(void) {
     /* Contents are checked lazily: the first bind of each entry in a task hashes its source again */
     sFrame++;
     sMemo[0].valid = sMemo[1].valid = false;
+}
+
+void gfx_tex_ram_written(uint32_t addr, uint32_t bytes) {
+    uint32_t a = tex_key_addr(addr), b = a + bytes;
+    int e;
+
+    /* The replayed TMEM is rebuilt from RAM; textures read from the range are hashed again at their next bind */
+    sVTmemGen = 0;
+    for (e = sLruHead; e >= 0; e = sEntries[e].lruNext) {
+        TexEntry* en = &sEntries[e];
+        const TexKey* k = &en->key;
+        bool hit = false;
+
+        if (!(k->flags & KEY_SLOW)) {
+            uint32_t rowBytes = row_ram_bytes(sConvSiz[k->conv], k->srcW) * 2 + 8; /* bound: 32-bit tiles, padding */
+
+            hit = range_overlap(k->src, k->src + (k->srcH - 1u) * k->stride + rowBytes, a, b);
+        }
+        if (k->flags & KEY_PAL_ADDR) {
+            hit |= range_overlap(k->pal, k->pal + k->palCount * 2u, a, b);
+        }
+        if (hit) {
+            en->validFrame = 0;
+            if (sMemo[0].entry == e) {
+                sMemo[0].valid = false;
+            }
+            if (sMemo[1].entry == e) {
+                sMemo[1].valid = false;
+            }
+        }
+    }
 }
 
 void gfx_tex_get_stats(GfxTexStats* out) {

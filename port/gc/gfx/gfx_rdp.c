@@ -2,15 +2,20 @@
  * RDP side of the N64 renderer: the RDP commands forwarded by the display list interpreter (color, z and
  * texture images, combiner, other modes, colors, tiles, TMEM loads, scissor) update gGfxRdp, and fill and
  * texture rectangles are decoded into N64 pixel coordinates for gfx_gx.c. TMEM loads are recorded by
- * gfx_tex.c.
+ * gfx_tex.c. Texture rectangles whose texture repeats within an N64 pixel are drawn in one-pixel strips, so that
+ * the higher-resolution EFB samples them as the RDP does.
  */
+#include <math.h>
 #include <string.h>
 #include "gfx_internal.h"
+
+/* Texture rectangles drawn pixel by pixel (strips along both axes) at most this large; larger ones get rows only */
+#define RDP_RECT_MAX_CELLS 4096
 
 GfxRdpState gGfxRdp;
 
 /* G_SETCONVERT / G_SETKEYR / G_SETKEYGB. Kept for completeness: nothing on GX uses YUV conversion or the
- * chroma key yet (MM's YUV images go through S2DEX2, which is not interpreted). */
+ * chroma key (MM never decodes its JPEG code's YUV output, and never keys). */
 static struct {
     int16_t k[6];
     uint32_t keyR;
@@ -133,10 +138,11 @@ void gfx_rdp_command(uint32_t w0, uint32_t w1) {
     int tile = (w1 >> 24) & 7;
 
     switch (op) {
+        /* Image widths: gbi.h packs 12 bits, the RDP reads 10 */
         case G_SETCIMG: {
             uint8_t fmt = (w0 >> 21) & 7;
             uint8_t siz = (w0 >> 19) & 3;
-            uint16_t width = (w0 & 0xFFF) + 1;
+            uint16_t width = (w0 & 0x3FF) + 1;
 
             if (w1 != gGfxRdp.colorImageAddr || fmt != gGfxRdp.colorImageFmt || siz != gGfxRdp.colorImageSiz ||
                 width != gGfxRdp.colorImageWidth) {
@@ -155,7 +161,7 @@ void gfx_rdp_command(uint32_t w0, uint32_t w1) {
             gGfxRdp.texImageAddr = rdp_resolve(w1);
             gGfxRdp.texImageFmt = (w0 >> 21) & 7;
             gGfxRdp.texImageSiz = (w0 >> 19) & 3;
-            gGfxRdp.texImageWidth = (w0 & 0xFFF) + 1;
+            gGfxRdp.texImageWidth = (w0 & 0x3FF) + 1;
             break;
 
         case G_SETCOMBINE:
@@ -289,6 +295,78 @@ void gfx_rdp_command(uint32_t w0, uint32_t w1) {
     }
 }
 
+/* Whether a tile axis wraps (mask without clamp) at a rate of at least half its period per N64 pixel, after the
+ * tile shift. The RDP samples a texture rectangle once per pixel, at the pixel's own s/t; the EFB samples each N64
+ * pixel GFX_SCALE times along the axis, and those samples would land on unrelated texels of the pattern. The N64
+ * logo's shine (shift 11, mask 5) steps 32 texels per row: every row of a rectangle reads the same shine row, where
+ * the EFB's two rows per N64 row would read rows 16 texels apart. */
+static bool rdp_rect_axis_aliases(const GfxTile* t, bool sAxis, float step) {
+    uint32_t mask = sAxis ? t->masks : t->maskt;
+    uint32_t cm = sAxis ? t->cms : t->cmt;
+    uint32_t shift = sAxis ? t->shifts : t->shiftt;
+    float period, scaled;
+
+    if (mask == 0 || (cm & G_TX_CLAMP)) {
+        return false;
+    }
+    period = (float)(1u << ((mask > 10) ? 10 : mask)) * ((cm & G_TX_MIRROR) ? 2.0f : 1.0f);
+    scaled = (step < 0.0f) ? -step : step;
+    if (shift > 10) {
+        scaled *= (float)(1u << (16 - shift));
+    } else {
+        scaled /= (float)(1u << shift);
+    }
+    return scaled >= period * 0.5f;
+}
+
+/* Draw a texture rectangle as strips one N64 pixel wide along x and/or y, with s/t constant across each strip
+ * along that axis, as the RDP computes them per pixel */
+static void rdp_texrect_strips(float x0, float y0, float x1, float y1, int tile, float s, float t, float dsdx,
+                               float dtdy, bool flip, bool rows, bool cols) {
+    /* Per screen axis: which texture coordinate advances along it, and by how much per pixel */
+    float stepX = flip ? dtdy : dsdx, stepY = flip ? dsdx : dtdy;
+    float ry0, ry1, cx0, cx1;
+
+    for (ry0 = y0; ry0 < y1; ry0 = ry1) {
+        float rs = s, rt = t, rStepY = stepY;
+
+        ry1 = rows ? floorf(ry0) + 1.0f : y1;
+        if (ry1 > y1) {
+            ry1 = y1;
+        }
+        if (rows) {
+            /* Constant along y in this strip */
+            if (flip) {
+                rs = s + (ry0 - y0) * dsdx;
+            } else {
+                rt = t + (ry0 - y0) * dtdy;
+            }
+            rStepY = 0.0f;
+        }
+        for (cx0 = x0; cx0 < x1; cx0 = cx1) {
+            float cs = rs, ct = rt, cStepX = stepX;
+
+            cx1 = cols ? floorf(cx0) + 1.0f : x1;
+            if (cx1 > x1) {
+                cx1 = x1;
+            }
+            if (cols) {
+                if (flip) {
+                    ct = rt + (cx0 - x0) * dtdy;
+                } else {
+                    cs = rs + (cx0 - x0) * dsdx;
+                }
+                cStepX = 0.0f;
+            }
+            if (flip) {
+                gfx_gx_texrect(cx0, ry0, cx1, ry1, tile, cs, ct, rStepY, cStepX, true);
+            } else {
+                gfx_gx_texrect(cx0, ry0, cx1, ry1, tile, cs, ct, cStepX, rStepY, false);
+            }
+        }
+    }
+}
+
 /* G_TEXRECT / G_TEXRECTFLIP: w0 = lower right (10.2), w1 = tile and upper left (10.2), half1 = s, t at the
  * upper left (s10.5), half2 = dsdx, dtdy (s5.10). In COPY mode the RDP copies four texels per clock, so the
  * game passes dsdx = 4.0 for one texel per pixel, and the lower right edge is inclusive. */
@@ -302,10 +380,13 @@ void gfx_rdp_texrect(uint32_t w0, uint32_t w1, uint32_t half1, uint32_t half2, b
     float t = (int16_t)(half1 & 0xFFFF) * (1.0f / 32.0f);
     float dsdx = (int16_t)(half2 >> 16) * (1.0f / 1024.0f);
     float dtdy = (int16_t)(half2 & 0xFFFF) * (1.0f / 1024.0f);
+    uint32_t cycle = gGfxRdp.otherModeH & (3u << G_MDSFT_CYCLETYPE);
     float x0, y0, x1, y1;
+    bool rows = false, cols = false;
+    int i;
 
     if (rdp_copy_or_fill()) {
-        if ((gGfxRdp.otherModeH & (3u << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
+        if (cycle == G_CYC_COPY) {
             dsdx *= 0.25f;
         }
         x0 = (float)(ulx >> 2);
@@ -317,8 +398,23 @@ void gfx_rdp_texrect(uint32_t w0, uint32_t w1, uint32_t half1, uint32_t half2, b
         y0 = uly * 0.25f;
         x1 = lrx * 0.25f;
         y1 = lry * 0.25f;
+
+        /* The tiles the combiner can read: TEXEL0, and TEXEL1 (tile + 1) in 2-cycle mode */
+        for (i = 0; i < ((cycle == G_CYC_2CYCLE) ? 2 : 1); i++) {
+            const GfxTile* tl = &gGfxRdp.tiles[(tile + i) & 7];
+
+            rows |= rdp_rect_axis_aliases(tl, flip, flip ? dsdx : dtdy);
+            cols |= rdp_rect_axis_aliases(tl, !flip, flip ? dtdy : dsdx);
+        }
+        if (rows && cols && (x1 - x0) * (y1 - y0) > RDP_RECT_MAX_CELLS) {
+            cols = false; /* not expected in MM: rows only, bounded */
+        }
     }
     if (x1 > x0 && y1 > y0) {
-        gfx_gx_texrect(x0, y0, x1, y1, tile, s, t, dsdx, dtdy, flip);
+        if (rows || cols) {
+            rdp_texrect_strips(x0, y0, x1, y1, tile, s, t, dsdx, dtdy, flip, rows, cols);
+        } else {
+            gfx_gx_texrect(x0, y0, x1, y1, tile, s, t, dsdx, dtdy, flip);
+        }
     }
 }

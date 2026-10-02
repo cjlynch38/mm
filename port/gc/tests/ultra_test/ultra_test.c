@@ -3,8 +3,8 @@
  * mesg.c, event.c, intmask.c, time.c, timer.c) running on the real libogc bridge (port/gc/ogc).
  *
  * Compiled with the game's headers (Makefile.gc's port rule), like the shim itself. It boots
- * through gc_ultra_boot() with stand-ins for the game's bootproc() and the VI shim. Every failed
- * check is logged through gc_log (screen, Dolphin OSReport log); the last line is
+ * through gc_ultra_boot() with stand-ins for the game's bootproc(), the VI shim and the save
+ * flush. Every failed check is logged through gc_log (screen, Dolphin OSReport log); the last line is
  * "ULTRA_TEST DONE: <passed> passed, <failed> failed" or "ULTRA_TEST TIMEOUT ...".
  * The Makefile in this directory says how to build and run it.
  */
@@ -1328,6 +1328,10 @@ static void Runner_Entry(void* arg);
 void __gcViInit(void) {
     sViInitCalls++;
     gc_log("ultra_test: __gcViInit (stand-in, the VI shim is not linked)");
+}
+
+/* event.c flushes the save when Reset is pressed; flash.c and the SD bridge are not linked */
+void __gcFlashFlush(void) {
 }
 
 /* Same sequence as src/boot/boot_main.c, with the test runner in place of the Idle thread */

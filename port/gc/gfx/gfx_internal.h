@@ -215,6 +215,13 @@ void gfx_tex_get_stats(GfxTexStats* out);
 bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height, uint16_t stride,
                         const void* tlut, bool tlutIA, bool linear, int texMap, GfxTexBinding* out);
 
+/**
+ * N64 RAM [addr, addr + bytes) (KSEG0 or physical address) was rewritten in the middle of a task, by the renderer
+ * itself (gfx_fb.c writing EFB pixels back): cached textures and palettes read from that range are hashed again at
+ * their next bind (contents are otherwise checked once per task). Safe while draws are queued: nothing is freed.
+ */
+void gfx_tex_ram_written(uint32_t addr, uint32_t bytes);
+
 /* ================================================================================================ */
 /* Combiner / blender (gfx_tev.c)                                                                   */
 /* ================================================================================================ */
@@ -277,5 +284,139 @@ void gfx_gx_flush(void);
 /** True once gfx_gx_init() has set up GX, the FIFO and the XFBs (false: not enough memory or no video mode;
  *  gfx_task.c then leaves the renderer disabled). */
 bool gfx_gx_ready(void);
+
+/** GX state was changed outside gfx_gx.c/gfx_tev.c (gfx_fb.c's copies and quads: vertex format, channels, TEV,
+ *  projection, viewport, scissor, blend/z modes): re-apply everything before the next draw. */
+void gfx_gx_state_lost(void);
+
+/**
+ * Texture rectangle whose TEXEL0 is an image the caller bound to GX_TEXMAP0 with gfx_tex_bind_image() (`b`), for
+ * S2DEX2 backgrounds and object sprites. Otherwise like gfx_gx_texrect: N64 screen coordinates, (s, t) the texel
+ * coordinates at (ulx, uly), dsdx/dtdy per pixel, the combiner as for GFX_PRIM_TEXRECT, the current color image
+ * as the render target. TEXEL1 reads opaque white. Selecting the render target never touches GX_TEXMAP0/1, so
+ * binding first is safe; call gfx_fb_sync_ram() for the image's pixels before gfx_tex_bind_image().
+ */
+void gfx_gx_image_rect(float ulx, float uly, float lrx, float lry, const GfxTexBinding* b, float s, float t,
+                       float dsdx, float dtdy);
+
+/* ================================================================================================ */
+/* Framebuffer effects (gfx_fb.c): N64 color images in RAM versus the EFB                          */
+/* ================================================================================================ */
+
+/** What gfx_gx.c and gfx_fb.c share about the frame (gfx_fb.c owns it). */
+typedef struct {
+    uint32_t frameKey;         /* the frame's color image (KSEG0 address), 0 until the task's first draw into it */
+    uint16_t frameWidth;       /* its pixels per row */
+    int16_t dirtyY0, dirtyY1;  /* N64 rows [y0, y1) drawn in the EFB since the frame's RAM was last written */
+    bool canvasDirty;          /* the off-screen image being drawn has EFB pixels that are not in RAM yet */
+} GfxFbState;
+
+extern GfxFbState gGfxFb;
+
+/** A draw into the frame may have changed N64 rows [y0, y1). */
+static inline void gfx_fb_frame_drawn(int y0, int y1) {
+    if (y0 < gGfxFb.dirtyY0) {
+        gGfxFb.dirtyY0 = y0;
+    }
+    if (y1 > gGfxFb.dirtyY1) {
+        gGfxFb.dirtyY1 = y1;
+    }
+}
+
+/** True if some N64 image has newer pixels in the EFB than in RAM (gfx_fb_sync_ram would have work to do). */
+static inline bool gfx_fb_pending(void) {
+    return gGfxFb.dirtyY0 < gGfxFb.dirtyY1 || gGfxFb.canvasDirty;
+}
+
+/** Once at boot, after gfx_gx_init(): transfer and save buffers. Without them, off-screen color images are not
+ *  drawn and framebuffers are not read back (as before gfx_fb.c). */
+void gfx_fb_init(void);
+bool gfx_fb_ready(void);
+/** Task start: nothing drawn yet (the frame's RAM keeps what it had, as on the N64). */
+void gfx_fb_task_begin(void);
+/** The task's frame (gfx_gx.c, at its first draw). */
+void gfx_fb_set_frame(uint32_t key, uint16_t width);
+
+/**
+ * N64 RAM [addr, addr + bytes) is about to be read, as a texture or by the CPU: if the renderer holds newer pixels
+ * for it in the EFB (the frame, or the off-screen image being drawn), write them to RAM first (an EFB copy, a GX
+ * sync and a conversion on the CPU; textures cached from that memory are checked again). Batched draws are
+ * submitted first (gfx_gx_flush), so a texture bound right after cannot reach draws queued before. Cheap when
+ * nothing is pending. Anything that reads a framebuffer address bypassing the TMEM model must call it, such as
+ * callers of gfx_tex_bind_image().
+ */
+void gfx_fb_sync_ram(const void* addr, uint32_t bytes);
+
+/**
+ * Off-screen pass (gfx_gx.c): from now on draws go to the N64 color image `key` (fmt/siz, `width` pixels per row)
+ * at 1x in the EFB's top-left corner (the canvas). The first one saves the frame's pixels there (color and depth)
+ * and writes the frame's pending rows to RAM; switching from another off-screen image writes that one to RAM.
+ * Returns false for images it cannot draw (format, width over 320, no buffers): their draws are skipped.
+ */
+bool gfx_fb_canvas_begin(uint32_t key, uint8_t fmt, uint8_t siz, uint16_t width);
+/** Before a draw into the canvas covering canvas pixels [x0, x1) x [y0, y1): `opaque` if it sets every one of
+ *  them without reading the image (a rectangle without memory reads or alpha compare); otherwise the canvas is
+ *  loaded from RAM first. May change GX state (calls gfx_gx_state_lost). */
+void gfx_fb_canvas_draw(int x0, int y0, int x1, int y1, bool opaque);
+/** End of the off-screen pass: the image goes to RAM, the frame's pixels and depth come back. */
+void gfx_fb_canvas_end(void);
+bool gfx_fb_canvas_active(void);
+
+/** A GX texture of the frame as the EFB holds it now, at N64 size (EFB copy, 2x2 box filter, RGB565): GPU work
+ *  only, nothing goes to RAM. Valid until the next call or off-screen pass. False without buffers or during an
+ *  off-screen pass. (VisMono, gfx_gx.c) */
+bool gfx_fb_frame_texture(GXTexObj* out);
+
+/** Task end, before the EFB is copied to the XFB and cleared. `writeDepth`: the task cleared the z-buffer and
+ *  nothing else was written to it since, so its RAM gets the frame's depth (N64 format) for the game's
+ *  SysCfb_GetZBufferPixel readers. */
+void gfx_fb_task_end(const void* zImage, bool writeDepth);
+
+typedef struct {
+    uint32_t readbacks, readbackRows; /* frame rows written to RAM */
+    uint32_t passes;                  /* off-screen passes (canvas begin from the frame) */
+    uint32_t copyOuts, uploads;       /* canvas -> RAM, RAM -> canvas */
+    uint32_t depthWrites;             /* z-buffer written to RAM */
+    uint64_t ticks;                   /* time in gfx_fb.c... */
+    uint64_t waitTicks;               /* ...of which waiting for GX to finish (draws queued before included) */
+} GfxFbStats;
+/** Counters since the last call (gfx_gx.c logs them with its statistics), then reset. */
+void gfx_fb_take_stats(GfxFbStats* out);
+
+/* ================================================================================================ */
+/* S2DEX2 (gfx_s2dex.c): the 2D microcode, run by gfx_rsp.c while it is loaded                      */
+/* ================================================================================================ */
+
+/** Per task (from gfx_rsp_reset). What gfx_s2dex_note_image / _note_tlut recorded is kept across tasks. */
+void gfx_s2dex_reset(void);
+/** G_LOAD_UCODE of S2DEX2: its DMEM data comes back (object render mode, status words, 2D matrix). */
+void gfx_s2dex_load(void);
+/** Execute an S2DEX2-only command (G_BG_*, G_OBJ_*). Backgrounds are drawn from the whole image in RAM
+ *  (gfx_fb_sync_ram, gfx_tex_bind_image, gfx_gx_image_rect); sprites as the microcode draws them, with RDP commands
+ *  (render tile, TMEM loads, texture rectangles) through gfx_rdp_command() / gfx_rdp_texrect(). Returns false if
+ *  the opcode is not one of them (G_SELECT_DL and the commands shared with F3DEX2 are gfx_rsp.c's). */
+bool gfx_s2dex_command(uint32_t w0, uint32_t w1);
+/** G_SELECT_DL with the words of the G_RDPHALF_0 before it: true if the status word changes, in which case the
+ *  display list *dl must be called (*push) or branched to. */
+bool gfx_s2dex_select_dl(uint32_t half0W0, uint32_t half0W1, uint32_t w0, uint32_t w1, uint32_t* dl, bool* push);
+/** G_MOVEWORD G_MW_GENSTAT (gSPSetStatus): `ofs` is the status id (0, 4, 8, 12). */
+void gfx_s2dex_set_status(uint32_t ofs, uint32_t value);
+/** A G_SETCIMG / G_SETZIMG went to the RDP (any microcode): remember the image as an N64 render target. Without
+ *  gfx_fb.c (gfx_fb_ready() false) the RAM of render targets never holds what was drawn there, so backgrounds read
+ *  from one (motion blur, pause background, transitions) are skipped instead of drawing stale memory. */
+void gfx_s2dex_note_image(uint32_t w0, uint32_t w1);
+/** A G_LOADTLUT went to the RDP (any microcode; gGfxRdp already updated): where the TLUT entries came from, for the
+ *  palettes of CI backgrounds (gfx_tex_bind_image takes the palette's RAM address). */
+void gfx_s2dex_note_tlut(uint32_t w0, uint32_t w1);
+
+/** S2DEX2 counters since boot (gfx_rsp_stats_frame logs the activity of each interval). */
+typedef struct {
+    uint32_t bgs;       /* G_BG_COPY / G_BG_1CYC drawn */
+    uint32_t rects;     /* image rectangles they took (wrapped images take several) */
+    uint32_t targetBgs; /* backgrounds read from an N64 render target (synced through gfx_fb.c, or skipped) */
+    uint32_t skipped;   /* backgrounds not drawn: render target without gfx_fb.c, bad image, bind failure */
+    uint32_t objs;      /* sprites drawn (G_OBJ_RECTANGLE, _R, G_OBJ_SPRITE and the G_OBJ_LDTX_* forms) */
+} GfxS2dexStats;
+void gfx_s2dex_get_stats(GfxS2dexStats* out);
 
 #endif

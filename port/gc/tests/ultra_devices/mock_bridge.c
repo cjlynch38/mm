@@ -98,6 +98,14 @@ unsigned int mock_now_ms(void) {
     return (unsigned int)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+/* The GameCube timebase (GC_TB_HZ) from the host's monotonic clock */
+__attribute__((weak)) unsigned long long gc_time_ticks(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * GC_TB_HZ + (unsigned long long)ts.tv_nsec * GC_TB_HZ / 1000000000ull;
+}
+
 /* ---- OS lock --------------------------------------------------------------------------------- */
 
 static pthread_mutex_t sOsMutex = PTHREAD_MUTEX_INITIALIZER;
@@ -467,4 +475,32 @@ void mock_save_fail_next(int count) {
 
 const unsigned char* mock_saved_image(void) {
     return sSaved;
+}
+
+/* ---- Renderer and audio output: weak no-ops (a test may define its own) ---------------------- */
+
+__attribute__((weak)) void gc_gfx_init(void) {
+}
+
+/* Disabled: osSpTaskStartGo skips graphics tasks and only posts their events */
+__attribute__((weak)) int gc_gfx_enabled(void) {
+    return 0;
+}
+
+__attribute__((weak)) void gc_gfx_run_task(unsigned int dlist) {
+}
+
+__attribute__((weak)) void gc_gfx_present(const void* framebuffer) {
+}
+
+__attribute__((weak)) void gc_audio_init(unsigned int rate) {
+}
+
+/* Accepted and dropped; nothing is ever pending */
+__attribute__((weak)) int gc_audio_queue(const void* samples, unsigned int bytes) {
+    return 0;
+}
+
+__attribute__((weak)) unsigned int gc_audio_bytes_pending(void) {
+    return 0;
 }

@@ -22,15 +22,20 @@ vi.c retrace: current buffer changed -> gc_gfx_present(fb) -> VIDEO_SetNextFrame
 
 ## Scope for the first pass
 
-- **F3DZEX2 only.** The game switches to S2DEX2 (`G_LOAD_UCODE`) only for pre-rendered room
-  backgrounds, the pause screen capture, `z_visfbuf.c`, one HUD path and the wipe5 transition. While
-  S2DEX2 is loaded, its commands are skipped (logged once) until F3DZEX2 is loaded again.
-- **One render target, the frame.** The first `G_SETCIMG` of a task is the frame. A later
-  `G_SETCIMG` equal to the z image means fill rectangles clear depth (the N64 clears the z-buffer by
-  filling it as a color image with `0xFFFC`). Any other color image is off-screen: its draws are
-  skipped and logged once. Off-screen targets are framebuffer effects: motion blur, the pause
-  background, the picture box, VisMono, Lens of Truth.
-- **No CPU framebuffer or z-buffer readback.** The game's z-buffer reads return "far", as in M2.
+- **F3DZEX2 and S2DEX2.** The game switches to S2DEX2 (`G_LOAD_UCODE`) for PreRender (motion blur,
+  the pause and picto captures), `z_visfbuf.c`, Grandma's story (z_parameter.c) and the wipe5
+  transition. `gfx_s2dex.c` interprets it: `G_BG_COPY`/`G_BG_1CYC` are drawn from the whole image
+  (`gfx_fb_sync_ram` + `gfx_tex_bind_image` + `gfx_gx_image_rect`) with the microcode's clipping,
+  frame limit, flips and wraps; sprites become RDP texture rectangles. MM never draws pre-rendered
+  room backgrounds (`z_room.c` has `isFixedCamera = false`) and never calls `Jpeg_Decode`;
+  `port/gc/game/njpeg_cpu.c` still runs the RSP JPEG task on the CPU.
+- **Render targets.** The first `G_SETCIMG` of a task is the frame. A FILL into the z image clears
+  depth (the N64 clears the z-buffer by filling it as a color image with `0xFFFC`). Any other color
+  image, including colors drawn into the z-buffer's memory, is an off-screen pass drawn into the EFB
+  and copied to RAM (see "Framebuffer effects").
+- **Framebuffer RAM on demand.** N64 images the renderer drew are written to RAM when something reads
+  them (textures, S2DEX2 backgrounds, the CPU after the task), and the z-buffer's RAM gets the frame's
+  depth for the game's pixel reads (see "Framebuffer effects").
 
 ## Vertex pipeline (gfx_rsp.c)
 
@@ -164,9 +169,10 @@ Use the obvious shortcuts to save stages: B = 0, C = 0, C = 1, A = B, and so on.
 - After gc_halt the console XFB must show again (`gc_ogc_video_show_console`).
 
 As implemented:
-- Render targets: the first color image of a task that is not the z image is the frame; a color
-  image equal to the z image takes depth fills; any other is off-screen and its draws are skipped
-  (first 8 logged). The frame address is normalized to KSEG0 for the XFB slot key.
+- Render targets: the first color image of a task that is not the z image is the frame; FILL-mode
+  rectangles into the z image clear depth; any other color image (other draws into the z image too)
+  is an off-screen pass, drawn as described in "Framebuffer effects". The frame address is normalized
+  to KSEG0 for the XFB slot key.
 - EFB clear policy: every EFB copy also clears the EFB, to the color of the last full-screen FILL
   of the frame and to far depth. gfx_gx.c tracks that the EFB is "clean", so the game's full-screen
   fills that follow (same color; z-buffer fill) are skipped. Any other FILL rectangle, or a fill
@@ -184,6 +190,105 @@ As implemented:
 - The thread that runs the tasks becomes the current GX thread at each task start, because libogc
   suspends that thread (not the writer) when the FIFO fills up.
 
+## Framebuffer effects (gfx_fb.c)
+
+On the N64 every color image lives in RAM: effects copy the frame to another buffer, draw it back
+blended or scaled, load it as a texture, or filter it on the CPU. On the GameCube the frame lives in
+the EFB at 2x and the renderer never writes N64 framebuffer RAM by itself. What reads or draws N64
+images in MM:
+
+| Effect | Code | Needs |
+|---|---|---|
+| Motion blur | z_play.c Play_DrawMotionBlur, PreRender.c | S2DEX2 copy of the frame to gWorkBuffer (off-screen), next frame blends it back |
+| Pause, picto box, transition tile captures | z_play.c, PreRender.c | frame copied to the z-buffer's memory (off-screen), coverage to an I8 image; CPU filters and the picto I8 conversion read them after the task |
+| VisMono | z_vismono.c | the frame loaded as CI8 textures while drawing into it (F3DZEX2) |
+| VisFbuf (screen shrink, wipe4), wipe5 | z_visfbuf.c, ovl_fbdemo_wipe5 | frame copied off-screen, then drawn back scaled/blended, or drawn over itself |
+| Lens of Truth | z_actor.c | the z-buffer copied as an RGBA16 image and back (off-screen) |
+| Sun lens flare, light glows | z_kankyo.c, z_lights.c | SysCfb_GetZBufferPixel: z-buffer RAM after the task |
+
+Design:
+- **Off-screen color images are drawn in the EFB at 1x**, in its top-left 320x240 (the canvas). The
+  EFB (640x528) has no room beside the 640x480 frame, so when a pass starts (gfx_gx.c's target
+  selection, before the draw binds textures) the frame's pixels there are copied to an RGBA8 texture
+  and its depth to a Z24X8 texture (GPU copies, no CPU work). The pass draws with scale 1 (viewport,
+  scissor and screen rectangles follow `sScale` in gfx_gx.c). When the color image switches back to
+  the frame, or at task end, the canvas goes to RAM and the frame's color and depth are drawn back
+  (a Z texture with GX_ZT_REPLACE restores the depth exactly). Drawing at 1x is the N64's own
+  resolution for these images, and the copy back to RAM is 1:1.
+- **Only pixels that were drawn go back to RAM.** The canvas is not loaded from RAM when a pass
+  starts. While every draw is an opaque rectangle (no IM_RD, no alpha compare: BG copies, coverage
+  strips) the dirty rectangle stays exactly what was drawn (a draw that would make it inexact writes
+  the previous one out first). The first draw that reads memory (blending, alpha compare, triangles)
+  writes what was drawn so far, then loads the whole image from RAM into the canvas.
+- **Frame readback is lazy.** gfx_gx.c records which N64 rows of the frame were drawn since its RAM
+  was last written. `gfx_fb_sync_ram(addr, bytes)` writes them (EFB copy at half size with the 2x2
+  box filter to RGB565, converted to RGBA5551 with the alpha bit set) only if the range overlaps them.
+  It is called by gfx_gx.c before binding tiles (the source is estimated from the last G_SETTIMG and
+  the tile's rows; VisMono's 80 strips each read rows not drawn yet, so the frame is read once), by
+  gfx_s2dex.c before binding a background image, and at the start of every off-screen pass (passes
+  nearly always copy the frame, and its pixels under the canvas are about to be replaced). The
+  CPU consumers (PreRender filters, the picto box) read images that off-screen passes wrote; those
+  are in RAM when the task ends. After writing RAM, gfx_tex_ram_written() makes the texture cache
+  hash that memory again.
+- **Depth for the game's pixel reads.** At the end of a task that cleared the z-buffer and drew no
+  colors into its memory afterwards (pause/picto/transition captures and Lens of Truth use it as a
+  color buffer), the EFB depth is copied 1:1 a quarter at a time (a box-filtered depth copy would
+  average the 24-bit values per byte channel) and converted to the N64 format (18-bit z = screen z
+  << 8, compressed to a 3-bit exponent of leading ones and an 11-bit mantissa; never drawn pixels give
+  0xFFFC, the clear value the lens flare test looks for). One value per 4x4 pixels: the readers test
+  single pixels loosely. `-DGFX_FB_DEPTH=0` turns it off.
+- **VisMono is drawn natively.** VisMono_DesaturateDList loads the frame 3 rows at a time as CI8
+  through an IA16 palette and draws it back with `dsdx = 2`: at 2x the EFB samples each N64 pixel at
+  two different bytes (vertical stripes), and every strip would convert two textures (about 44 ms per
+  frame in Dolphin). gfx_gx.c recognizes its rectangles (combiner, IA16 TLUT, CI8 tiles, texture
+  image = the frame row being drawn) and draws them from `gfx_fb_frame_texture()` (an EFB copy of
+  the frame at N64 size, GPU only) with four TEV stages: the channels summed with weights 2/7, 4/7,
+  1/7 through the texture swap tables (the palette's I + A), then lerp(ENV, PRIM), blended by prim
+  alpha. It needs no readback, so it also works where EFB copies do not reach RAM.
+- **EFB copies must reach RAM.** gfx_fb_init probes it (an 8x8 copy cleared to a known color, read
+  back by the CPU). On the GameCube they always do; Dolphin's "Store EFB Copies to Texture Only"
+  (`Graphics.Hacks.EFBToTextureEnable`, on by default) keeps them on the host GPU, so the probe fails
+  and everything but VisMono stays off (off-screen draws skipped, no readback, no depth), as before
+  gfx_fb.c. Test with `-ExtraConfig 'Graphics.Hacks.EFBToTextureEnable=False'`, and preferably
+  `Graphics.Settings.SafeTextureCacheColorSamples=0`: Dolphin's default texture cache hashes 128
+  samples, misses small changes when the same memory is rewritten (as gfx_tex.c's arena is), and
+  showed about 20 stale texels in half of the frames of the copy test.
+- Everything gfx_fb.c draws uses GX_TEXMAP6/7 and GX_VTXFMT1, then calls `gfx_gx_state_lost()`;
+  texture copies use center sampling and the 1-line vertical filter, and the video mode's filter is
+  set again for the display copy.
+- Not emulated: coverage (the EFB has no coverage or destination alpha; G_RM_VISCVG draws full
+  coverage, so PreRender's anti-alias and divot filters find nothing to do and the pause background is
+  the unfiltered frame); the z-buffer as an RGBA16 color image (Lens of Truth's copy of it and back
+  are color copies of RAM; the depth mask it draws into the EFB stays until the end of the frame);
+  hi-res (576x454) frames (the Bombers' Notebook) are not read back.
+
+Memory: 750 KiB from the MEM1 arena (transfer buffer 150 KiB, frame color and depth under the canvas
+300 KiB each, also used for the VisMono frame copy and the depth quarters), allocated only if 1.5 MiB
+stay free for the game; otherwise off-screen draws are skipped as before.
+
+Measured (Dolphin 2609, time in gfx_fb.c per task from the timebase, GX waits included but under
+50 us; real hardware will differ, cache misses on the 150-300 KiB buffers most of all):
+- Depth write, every frame that clears the z-buffer: 0.67 ms.
+- Motion blur (title intro, SPOT00, alpha 180 every frame): one frame readback, one off-screen pass
+  and its copy to RAM, depth: 2.0-3.7 ms. The rest of the effect's cost is in gfx_tex.c, which
+  converts the two 320x240 RGBA16 backgrounds (frame and work buffer) every frame since both change;
+  gfx_rsp's task time goes from 6.5 to 11.3 ms there. The game stays at 20 fps.
+- VisMono over the attract scenes (test build): 80 rectangles per frame, 0.5 ms of gfx_fb.c (the
+  depth write) and 9-13 ms per task, against 44 ms through the texture path.
+- A 320x240 conversion (frame readback or off-screen copy) is about 0.9 ms; conversions work on
+  4-texel tile rows with 32-bit operations.
+
+Tests: `GFX_FB_TEST` (gfx_task.c, compile-time, off by default) appends the game's own effect display
+lists to every frame (VisMono, motion blur with texture rectangles in place of S2DEX2, a VisFbuf-style
+shrink, a coverage-style I8 image, a pause-style capture into the z-buffer's memory) and checks the
+RAM results: the copy of the frame equals the frame read back before the pass, the frame after the
+pass equals it too (800 of 800 frames, with the safe texture cache), the I8 image equals the frame's
+high bytes (400 of 400), and the z-buffer capture equals the frame and is still there at the next
+task, so no depth was written over it (bit 16: 600 of 600). Build it in its own build directory
+(make does not track flags):
+`make -f Makefile.gc BUILD_DIR=build/gc-fbtest GFX_CFLAGS='$(OGC_CFLAGS) -Iport/gc/gfx -Iport/gc/ogc
+-Ibuild/gc-fbtest/generated -DGFX_FB_TEST=2'`.
+
 ## Memory
 
 The GameCube needs 4-5 MiB for the renderer: the GX FIFO (256 KiB), 2-3 XFBs (614,400 bytes each
@@ -198,7 +303,8 @@ Budget (all from gc_mem_alloc, logged as "mem:" lines, plus a "gfx: GX ready" su
 | 3 XFBs, 640x480 YUY2 (NTSC; PAL 574 lines is 735 KiB each) | 1,800 KiB |
 | Texture cache (gfx_tex.c, halves down to 256 KiB if short) | 2,048 KiB |
 | Renderer statics in the image (batch buffer, TEV program cache, texture tables) | ~0.2 MiB |
-| **Total** | **~4.1 MiB** |
+| Framebuffer effects (gfx_fb.c; only if 1.5 MiB stay free) | 750 KiB |
+| **Total** | **~4.8 MiB** |
 
 M2 measurement (Dolphin, US ROM): 3,864 KiB of MEM1 free after boot, 2,655 KiB once the game's
 threads exist (their stacks and buffers take ~1.2 MiB after gc_gfx_init). gc_gfx_init therefore

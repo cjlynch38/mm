@@ -6,6 +6,7 @@
 #define GC_GAME_H
 
 #include "PR/ultratypes.h"
+#include "PR/sptask.h"
 
 /**
  * System heap. On N64 it spans from the end of the `buffers` segment to the framebuffers at the
@@ -40,5 +41,9 @@ void Gc_TraceGameStateEnd(void);
 s32 Gc_AutoStartPressed(void);
 /** Cutscene flag set by a cutscene script (title logo debugging). */
 void Gc_TraceCutsceneFlag(s16 flag);
+
+/** The RSP JPEG task (M_NJPEGTASK, z_jpeg.c's njpgdspMain) on the CPU (port/gc/game/njpeg_cpu.c), run by
+ *  osSpTaskStartGo: the macroblocks of task->t.data_ptr's JpegTaskData become RGBA5551 tiles in place. */
+void Gc_NJpegRunTask(OSTask* task);
 
 #endif

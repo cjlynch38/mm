@@ -13,8 +13,11 @@
  *   - TMEM bookkeeping: LOADBLOCK with dxt, dxt 0 (pre-swapped rows), line skipping, wrong dxt, the _4b
  *     macros, two textures (TEXEL0/TEXEL1), overlapping loads, odd row offsets, partial palettes, mipmaps
  *   - wrap/mirror/clamp/mask/shift/offset: GX sampling of the binding against the RDP's coordinates
- *   - texture and fill rectangle decoding, other modes (F3DEX2 encoding), colors, scissor, images
- *   - texture cache: hits, content changes, LRU eviction and GX syncs under memory pressure
+ *   - texture and fill rectangle decoding (one-pixel strips for textures that repeat within a pixel), other
+ *     modes (F3DEX2 encoding), colors, scissor, images
+ *   - texture cache: hits, content changes, LRU eviction and GX syncs under memory pressure, RAM rewritten
+ *     during a task
+ *   - whole images bound from RAM (gfx_tex_bind_image): every format, palettes, strides, large images
  *
  *   make -C port/gc/tests/gfx_tex_host run
  */
@@ -142,15 +145,32 @@ void gfx_gx_flush(void) {
     gGxFlushes++;
 }
 
-static struct {
+typedef struct {
     int calls;
     float ulx, uly, lrx, lry, s, t, dsdx, dtdy;
     int tile;
     bool flip;
-} gTexRect;
+} TexRectCall;
+
+static TexRectCall gTexRect;          /* the last call, and the number of calls */
+static TexRectCall gTexRectLog[64];   /* the first calls since the count was reset */
 
 void gfx_gx_texrect(float ulx, float uly, float lrx, float lry, int tile, float s, float t, float dsdx, float dtdy,
                     bool flip) {
+    if (gTexRect.calls >= 0 && gTexRect.calls < 64) {
+        TexRectCall* c = &gTexRectLog[gTexRect.calls];
+
+        c->ulx = ulx;
+        c->uly = uly;
+        c->lrx = lrx;
+        c->lry = lry;
+        c->tile = tile;
+        c->s = s;
+        c->t = t;
+        c->dsdx = dsdx;
+        c->dtdy = dtdy;
+        c->flip = flip;
+    }
     gTexRect.calls++;
     gTexRect.ulx = ulx;
     gTexRect.uly = uly;
@@ -374,7 +394,7 @@ static void ref_cmd(uint32_t w0, uint32_t w1) {
             R.timg = ref_phys(w1);
             R.tfmt = (w0 >> 21) & 7;
             R.tsiz = (w0 >> 19) & 3;
-            R.twidth = (w0 & 0xFFF) + 1;
+            R.twidth = (w0 & 0x3FF) + 1;
             break;
         case G_SETTILE:
             t->fmt = (w0 >> 21) & 7;
@@ -520,6 +540,11 @@ static int ref_clamp_mask(int si, int sl, int sh, int mask, int cm) {
         si &= (1 << m) - 1;
     }
     return si;
+}
+
+/* The clamp bit as the RDP applies it: COPY mode only masks (angrylion tc_pipeline_copy) */
+static int ref_cm(int cm, int mask) {
+    return (((R.omh >> G_MDSFT_CYCLETYPE) & 3) == 2 && mask != 0) ? (cm & ~G_TX_CLAMP) : cm;
 }
 
 /* s10.5 vertex coordinate -> texel relative to the tile, through shift and tile offset */
@@ -834,8 +859,8 @@ static bool compare_tile(int tile, int texMap, int expectFmt, GfxTexBinding* out
     for (y = 0; y < st->h; y++) {
         for (x = 0; x < st->w; x++) {
             uint8_t ref[4], q[4], got[4];
-            int s = ref_clamp_mask(x, rt->sl, rt->sh, rt->masks, rt->cms);
-            int t = ref_clamp_mask(y, rt->tl, rt->th, rt->maskt, rt->cmt);
+            int s = ref_clamp_mask(x, rt->sl, rt->sh, rt->masks, ref_cm(rt->cms, rt->masks));
+            int t = ref_clamp_mask(y, rt->tl, rt->th, rt->maskt, ref_cm(rt->cmt, rt->maskt));
 
             ref_fetch(tile, s, t, ref);
             gx_quantize(st->fmt, ref, q);
@@ -872,6 +897,7 @@ static void compare_sampling(int tile, int texMap) {
     }
     st = &gLoaded[texMap];
     CHECK(!b.linear, "point sampling expected");
+    CHECK(b.sShiftScale != 0.0f && b.tShiftScale != 0.0f, "zero shift scale");
     for (T = -3000; T < 3000; T += 37) {
         double tpos = T / 32.0 * ts - rt->tl / 4.0;
 
@@ -888,8 +914,12 @@ static void compare_sampling(int tile, int texMap) {
                 continue;
             }
             /* RDP */
-            ref_fetch(tile, ref_clamp_mask(ref_coord(S, rt->shifts, rt->sl), rt->sl, rt->sh, rt->masks, rt->cms),
-                      ref_clamp_mask(ref_coord(T, rt->shiftt, rt->tl), rt->tl, rt->th, rt->maskt, rt->cmt), ref);
+            ref_fetch(tile,
+                      ref_clamp_mask(ref_coord(S, rt->shifts, rt->sl), rt->sl, rt->sh, rt->masks,
+                                     ref_cm(rt->cms, rt->masks)),
+                      ref_clamp_mask(ref_coord(T, rt->shiftt, rt->tl), rt->tl, rt->th, rt->maskt,
+                                     ref_cm(rt->cmt, rt->maskt)),
+                      ref);
             gx_quantize(st->fmt, ref, q);
             /* GX */
             gfx_tex_uv(&b, S / 32.0f, T / 32.0f, &u, &v);
@@ -1269,7 +1299,26 @@ static void test_tmem(void) {
     dp_set_tlut(G_TT_RGBA16);
     load_tlut(64, 256, K0(pal));
     load_texture_block(K0(a), G_IM_FMT_CI, G_IM_SIZ_8b, 32, 16, 0, 0, 0, 5, 4, 0, 0);
+    slow0 = slow_binds();
     compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+    CHECK(slow_binds() == slow0, "partial palette took the slow path");
+    /* the same palette address with more entries is another texture */
+    task_begin();
+    b = ram_random(64 * 2);
+    memcpy(gRam + pal + 64 * 2, gRam + b, 64 * 2);
+    dp_set_tlut(G_TT_RGBA16);
+    load_tlut(128, 256, K0(pal));
+    load_texture_block(K0(a), G_IM_FMT_CI, G_IM_SIZ_8b, 32, 16, 0, 0, 0, 5, 4, 0, 0);
+    compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+    /* the rest of the palette from an older load: slow path, still exact */
+    task_begin();
+    dp_set_tlut(G_TT_RGBA16);
+    load_tlut(256, 256, K0(ram_random(256 * 2)));
+    load_tlut(32, 256, K0(pal));
+    load_texture_block(K0(a), G_IM_FMT_CI, G_IM_SIZ_8b, 32, 16, 0, 0, 0, 5, 4, 0, 0);
+    slow0 = slow_binds();
+    compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+    CHECK(slow_binds() == slow0, "texels took the slow path");
     test_end();
 
     test_begin("CI4 palette 2 of a 256-entry TLUT");
@@ -1567,6 +1616,11 @@ static void test_state(void) {
     CHECK(gGxFlushes == flushes + 2, "color image change not flushed");
     emit(SHIFTL(G_SETZIMG, 24, 8), 0x80300000);
     CHECK(gGfxRdp.zImageAddr == 0x80300000, "setzimg");
+    /* gbi.h packs 12 bits of width, the RDP reads 10 */
+    dp_set_timg(G_IM_FMT_RGBA, G_IM_SIZ_16b, 0x501, 0x80200000);
+    CHECK(gGfxRdp.texImageWidth == 0x101, "settimg width %u", gGfxRdp.texImageWidth);
+    emit(SHIFTL(G_SETCIMG, 24, 8) | SHIFTL(G_IM_FMT_RGBA, 21, 3) | SHIFTL(G_IM_SIZ_16b, 19, 2) | 0x53F, 0x80300000);
+    CHECK(gGfxRdp.colorImageWidth == 0x140, "setcimg width %u", gGfxRdp.colorImageWidth);
     test_end();
 
     test_begin("syncs, convert, key, unknown commands");
@@ -1756,6 +1810,395 @@ static void test_cache_pinning(void) {
 }
 
 /* ================================================================================================ */
+/* Tests: texture rectangles in one-pixel strips, COPY mode wrapping                                */
+/* ================================================================================================ */
+
+static bool rect_call_is(int i, float ulx, float uly, float lrx, float lry, float s, float t, float dsdx, float dtdy,
+                         bool flip) {
+    const TexRectCall* c = &gTexRectLog[i];
+
+    return FEQ(c->ulx, ulx) && FEQ(c->uly, uly) && FEQ(c->lrx, lrx) && FEQ(c->lry, lry) && FEQ(c->s, s) &&
+           FEQ(c->t, t) && FEQ(c->dsdx, dsdx) && FEQ(c->dtdy, dtdy) && c->flip == flip && c->tile == 0;
+}
+
+static void test_rect_strips(void) {
+    int i;
+
+    test_begin("texrect strips: N64 logo shine");
+    task_begin();
+    dp_set_cycle(G_CYC_2CYCLE);
+    /* ConsoleLogo_Draw: text in tile 0 (no mask), shine in tile 1 (mask 5, t << 5, s >> 2) */
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x100, 1, 0, 0, 5, 11, 0, 5, 2);
+    gTexRect.calls = 0;
+    texrect(97 << 2, 94 << 2, (97 + 192) << 2, 96 << 2, 0, 0, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 2, "%d rectangles", gTexRect.calls);
+    CHECK(rect_call_is(0, 97, 94, 289, 95, 0, 0, 1, 0, false) && rect_call_is(1, 97, 95, 289, 96, 0, 1, 1, 0, false),
+          "rows: t %g %g, dtdy %g", gTexRectLog[0].t, gTexRectLog[1].t, gTexRectLog[0].dtdy);
+    /* 1-cycle mode reads tile 0 only */
+    dp_set_cycle(G_CYC_1CYCLE);
+    gTexRect.calls = 0;
+    texrect(97 << 2, 94 << 2, (97 + 192) << 2, 96 << 2, 0, 0, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 1 && rect_call_is(0, 97, 94, 289, 96, 0, 0, 1, 1, false), "1-cycle: %d rectangles",
+          gTexRect.calls);
+    /* a clamped shine, or one that repeats slower than every two pixels, is drawn whole */
+    dp_set_cycle(G_CYC_2CYCLE);
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x100, 1, 0, G_TX_CLAMP, 5, 11, 0, 5, 2);
+    gTexRect.calls = 0;
+    texrect(97 << 2, 94 << 2, (97 + 192) << 2, 96 << 2, 0, 0, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 1, "clamped: %d rectangles", gTexRect.calls);
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x100, 1, 0, 0, 5, 12, 0, 5, 2); /* 16 per row: half the period */
+    gTexRect.calls = 0;
+    texrect(97 << 2, 94 << 2, (97 + 192) << 2, 96 << 2, 0, 0, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 2, "t << 4: %d rectangles", gTexRect.calls);
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x100, 1, 0, 0, 5, 13, 0, 5, 2); /* 8 per row */
+    gTexRect.calls = 0;
+    texrect(97 << 2, 94 << 2, (97 + 192) << 2, 96 << 2, 0, 0, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 1, "t << 3: %d rectangles", gTexRect.calls);
+    /* columns, and fractional rectangle edges */
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x100, 1, 0, 0, 0, 0, G_TX_MIRROR, 4, 11);
+    gTexRect.calls = 0;
+    texrect((10 << 2) | 2, 20 << 2, 13 << 2, 22 << 2, 0, 3 << 5, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 3 && rect_call_is(0, 10.5f, 20, 11, 22, 3, 0, 0, 1, false) &&
+              rect_call_is(1, 11, 20, 12, 22, 3.5f, 0, 0, 1, false) &&
+              rect_call_is(2, 12, 20, 13, 22, 4.5f, 0, 0, 1, false),
+          "columns: %d rectangles, s %g %g %g", gTexRect.calls, gTexRectLog[0].s, gTexRectLog[1].s, gTexRectLog[2].s);
+    /* G_TEXRECTFLIP: s runs down the rectangle, so a fast s splits rows */
+    gTexRect.calls = 0;
+    texrect(10 << 2, 20 << 2, 14 << 2, 23 << 2, 0, 1 << 5, 2 << 5, 1 << 10, 1 << 10, true);
+    CHECK(gTexRect.calls == 3, "flip: %d rectangles", gTexRect.calls);
+    for (i = 0; i < 3 && gTexRect.calls == 3; i++) {
+        CHECK(rect_call_is(i, 10, 20 + i, 14, 21 + i, 1 + i, 2, 0, 1, true), "flip row %d: s %g dsdx %g dtdy %g", i,
+              gTexRectLog[i].s, gTexRectLog[i].dsdx, gTexRectLog[i].dtdy);
+    }
+    /* both axes */
+    dp_set_tile(G_IM_FMT_I, G_IM_SIZ_8b, 4, 0x100, 1, 0, 0, 5, 11, 0, 5, 11);
+    gTexRect.calls = 0;
+    texrect(0, 0, 3 << 2, 2 << 2, 0, 0, 0, 1 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 6 && rect_call_is(4, 1, 1, 2, 2, 1, 1, 0, 0, false), "cells: %d rectangles",
+          gTexRect.calls);
+    /* COPY mode is never split */
+    dp_set_cycle(G_CYC_COPY);
+    gTexRect.calls = 0;
+    texrect(0, 0, 3 << 2, 2 << 2, 0, 0, 0, 4 << 10, 1 << 10, false);
+    CHECK(gTexRect.calls == 1, "COPY: %d rectangles", gTexRect.calls);
+    test_end();
+
+    test_begin("COPY mode masks without clamping");
+    {
+        uint32_t a = ram_random(16 * 16 * 2);
+
+        task_begin();
+        load_texture_block(K0(a), G_IM_FMT_RGBA, G_IM_SIZ_16b, 16, 16, 0, G_TX_CLAMP, G_TX_CLAMP | G_TX_MIRROR, 3, 3,
+                           0, 0);
+        dp_set_tile_size(0, 0, 0, 31 << 2, 31 << 2);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        CHECK(gLoaded[0].w == 32 && gLoaded[0].wrapS == GX_CLAMP, "1-cycle: %dx%d wrap %d", gLoaded[0].w,
+              gLoaded[0].h, gLoaded[0].wrapS);
+        dp_set_cycle(G_CYC_COPY);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        CHECK(gLoaded[0].w == 8 && gLoaded[0].h == 8 && gLoaded[0].wrapS == GX_REPEAT && gLoaded[0].wrapT == GX_MIRROR,
+              "COPY: %dx%d wrap %d %d", gLoaded[0].w, gLoaded[0].h, gLoaded[0].wrapS, gLoaded[0].wrapT);
+        compare_sampling(0, GX_TEXMAP0);
+        /* no mask: the tile size still bounds it */
+        dp_set_tile(G_IM_FMT_RGBA, G_IM_SIZ_16b, 4, 0, 0, 0, G_TX_CLAMP, G_TX_CLAMP, 0, 0, 0, 0);
+        dp_set_tile_size(0, 0, 0, 15 << 2, 15 << 2);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        CHECK(gLoaded[0].w == 16 && gLoaded[0].wrapS == GX_CLAMP, "COPY without mask");
+    }
+    test_end();
+}
+
+/* ================================================================================================ */
+/* Tests: images bound straight from RAM                                                            */
+/* ================================================================================================ */
+
+/* Texel (x, y) of an image in RAM, decoded as the RDP does, as RGBA8 */
+static void ref_image_texel(const uint8_t* img, int fmt, int siz, int stride, int x, int y, const uint8_t* pal,
+                            bool palIA, uint8_t o[4]) {
+    const uint8_t* row;
+    int v;
+
+    switch (siz) {
+        case G_IM_SIZ_4b:
+            row = img + y * ((stride + 1) / 2);
+            v = (x & 1) ? (row[x / 2] & 0xF) : (row[x / 2] >> 4);
+            break;
+        case G_IM_SIZ_8b:
+            row = img + y * stride;
+            v = row[x];
+            break;
+        case G_IM_SIZ_16b:
+            row = img + y * stride * 2;
+            if (fmt == G_IM_FMT_YUV) {
+                const uint8_t* p = row + (x & ~1) * 2;
+                double yy = p[(x & 1) ? 3 : 1], u = p[0] - 128.0, vv = p[2] - 128.0;
+                double c[3] = { yy + floor(175.0 * vv / 128.0 + 0.5), yy + floor((-43.0 * u - 89.0 * vv) / 128.0 + 0.5),
+                                yy + floor(222.0 * u / 128.0 + 0.5) };
+                int k;
+
+                for (k = 0; k < 3; k++) {
+                    o[k] = c[k] < 0 ? 0 : c[k] > 255 ? 255 : (uint8_t)c[k];
+                }
+                o[3] = 255;
+                return;
+            }
+            v = (row[x * 2] << 8) | row[x * 2 + 1];
+            if (fmt == G_IM_FMT_RGBA) {
+                decode_rgba16(v, o);
+            } else {
+                decode_ia16(v, o);
+            }
+            return;
+        default:
+            row = img + y * stride * 4;
+            memcpy(o, row + x * 4, 4);
+            return;
+    }
+    if (pal != NULL) {
+        uint16_t c = (pal[v * 2] << 8) | pal[v * 2 + 1];
+
+        if (palIA) {
+            decode_ia16(c, o);
+        } else {
+            decode_rgba16(c, o);
+        }
+    } else if (siz == G_IM_SIZ_4b && fmt == G_IM_FMT_IA) {
+        int i = v >> 1;
+
+        o[0] = o[1] = o[2] = (i << 5) | (i << 2) | (i >> 1);
+        o[3] = (v & 1) ? 255 : 0;
+    } else if (siz == G_IM_SIZ_4b && fmt != G_IM_FMT_CI) {
+        o[0] = o[1] = o[2] = o[3] = v * 17;
+    } else if (siz == G_IM_SIZ_8b && fmt == G_IM_FMT_IA) {
+        o[0] = o[1] = o[2] = (v >> 4) * 17;
+        o[3] = (v & 0xF) * 17;
+    } else {
+        o[0] = o[1] = o[2] = o[3] = v; /* I8, and CI without a palette (palette 0) */
+    }
+}
+
+static bool compare_image(const char* what, const uint8_t* img, int fmt, int siz, int w, int h, int stride,
+                          const uint8_t* pal, bool palIA, bool linear, int texMap, int expectFmt) {
+    GfxTexBinding b;
+    const StubTex* st;
+    float u, v;
+    int x, y, errors = 0;
+
+    memset(&b, 0xA5, sizeof(b));
+    if (!gfx_tex_bind_image(img, fmt, siz, w, h, stride, pal, palIA, linear, texMap, &b) || !b.valid) {
+        CHECK(false, "%s: bind failed", what);
+        return false;
+    }
+    st = &gLoaded[texMap];
+    CHECK(st->w == w && st->h == h && st->fmt == expectFmt && st->wrapS == GX_CLAMP && st->wrapT == GX_CLAMP &&
+              st->magf == (linear ? GX_LINEAR : GX_NEAR) && st->minf == st->magf,
+          "%s: GX %dx%d fmt %d wrap %d %d filter %d", what, st->w, st->h, st->fmt, st->wrapS, st->wrapT, st->magf);
+    CHECK(b.width == w && b.height == h && b.linear == linear && b.sOffset == 0.0f && b.tOffset == 0.0f &&
+              b.sShiftScale == 1.0f && b.tShiftScale == 1.0f,
+          "%s: binding %ux%u offsets %g %g scales %g %g", what, b.width, b.height, b.sOffset, b.tOffset, b.sShiftScale,
+          b.tShiftScale);
+    gfx_tex_uv(&b, 3.0f, 5.0f, &u, &v);
+    CHECK(FEQ(u, 3.0f / w) && FEQ(v, 5.0f / h), "%s: uv %g %g", what, u, v);
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            uint8_t ref[4], q[4], got[4];
+
+            ref_image_texel(img, fmt, siz, stride, x, y, pal, palIA, ref);
+            gx_quantize(st->fmt, ref, q);
+            gx_texel(st, x, y, got);
+            if (memcmp(q, got, 4) != 0 && errors++ < 4) {
+                CHECK(false, "%s texel (%d,%d): got %02X%02X%02X%02X expected %02X%02X%02X%02X", what, x, y, got[0],
+                      got[1], got[2], got[3], q[0], q[1], q[2], q[3]);
+            }
+        }
+    }
+    CHECK(errors == 0, "%s: %d texels differ", what, errors);
+    return errors == 0;
+}
+
+static uint8_t* ram_image(uint32_t bytes) {
+    return gRam + ram_random(bytes);
+}
+
+static void test_images(void) {
+    GfxTexStats s0, s1;
+    GfxTexBinding b;
+    uint8_t *img, *pal;
+    int drawDones;
+
+    test_begin("images: every format");
+    task_begin();
+    compare_image("RGBA16", ram_image(64 * 32 * 2), G_IM_FMT_RGBA, G_IM_SIZ_16b, 64, 32, 64, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_RGB5A3);
+    compare_image("RGBA16 37x19, stride 40", ram_image(40 * 19 * 2), G_IM_FMT_RGBA, G_IM_SIZ_16b, 37, 19, 40, NULL,
+                  false, true, GX_TEXMAP1, GX_TF_RGB5A3);
+    compare_image("RGBA32", ram_image(24 * 10 * 4), G_IM_FMT_RGBA, G_IM_SIZ_32b, 20, 10, 24, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_RGBA8);
+    compare_image("I4 33x17", ram_image(34 * 17 / 2), G_IM_FMT_I, G_IM_SIZ_4b, 33, 17, 34, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_I4);
+    compare_image("I8", ram_image(30 * 9), G_IM_FMT_I, G_IM_SIZ_8b, 30, 9, 30, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_I8);
+    compare_image("IA4", ram_image(16 * 8 / 2), G_IM_FMT_IA, G_IM_SIZ_4b, 16, 8, 16, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_IA4);
+    compare_image("IA8", ram_image(17 * 5), G_IM_FMT_IA, G_IM_SIZ_8b, 17, 5, 17, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_IA4);
+    compare_image("IA16", ram_image(12 * 12 * 2), G_IM_FMT_IA, G_IM_SIZ_16b, 12, 12, 12, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_IA8);
+    pal = ram_image(16 * 2);
+    compare_image("CI4 + RGBA16 TLUT", ram_image(16 * 16 / 2), G_IM_FMT_CI, G_IM_SIZ_4b, 16, 16, 16, pal, false, false,
+                  GX_TEXMAP0, GX_TF_RGB5A3);
+    pal = ram_image(256 * 2);
+    compare_image("CI8 + IA16 TLUT", ram_image(40 * 20), G_IM_FMT_CI, G_IM_SIZ_8b, 40, 20, 40, pal, true, false,
+                  GX_TEXMAP0, GX_TF_IA8);
+    compare_image("CI8 without TLUT", ram_image(8 * 8), G_IM_FMT_CI, G_IM_SIZ_8b, 8, 8, 8, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_I8);
+    compare_image("CI4 without TLUT", ram_image(8 * 8 / 2), G_IM_FMT_CI, G_IM_SIZ_4b, 8, 8, 8, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_I8);
+    compare_image("YUV16", ram_image(16 * 8 * 2), G_IM_FMT_YUV, G_IM_SIZ_16b, 16, 8, 16, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_RGBA8);
+    compare_image("YUV16 odd width", ram_image(16 * 8 * 2), G_IM_FMT_YUV, G_IM_SIZ_16b, 15, 8, 16, NULL, false, false,
+                  GX_TEXMAP0, GX_TF_RGBA8);
+    test_end();
+
+    test_begin("images: 320x240 backgrounds");
+    task_begin();
+    /* Grandma's story: CI8 320x240 with a 256-entry RGBA16 TLUT; a framebuffer: RGBA16 320x240 */
+    pal = ram_image(256 * 2);
+    compare_image("CI8 320x240", ram_image(320 * 240), G_IM_FMT_CI, G_IM_SIZ_8b, 320, 240, 320, pal, false, true,
+                  GX_TEXMAP0, GX_TF_RGB5A3);
+    task_begin();
+    compare_image("RGBA16 320x240", ram_image(320 * 240 * 2), G_IM_FMT_RGBA, G_IM_SIZ_16b, 320, 240, 320, NULL, false,
+                  false, GX_TEXMAP0, GX_TF_RGB5A3);
+    test_end();
+
+    test_begin("images: limits");
+    task_begin();
+    img = ram_image(64 * 64 * 2);
+    gfx_tex_get_stats(&s0);
+    CHECK(!gfx_tex_bind_image(img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1025, 1, 1025, NULL, false, false, GX_TEXMAP0, &b) &&
+              !b.valid,
+          "1025 texels wide bound");
+    CHECK(!gfx_tex_bind_image(img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 64, 64, 32, NULL, false, false, GX_TEXMAP0, &b),
+          "stride below the width bound");
+    CHECK(!gfx_tex_bind_image(NULL, G_IM_FMT_RGBA, G_IM_SIZ_16b, 8, 8, 8, NULL, false, false, GX_TEXMAP0, &b),
+          "NULL image bound");
+    CHECK(!gfx_tex_bind_image(img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 0, 8, 8, NULL, false, false, GX_TEXMAP0, &b),
+          "empty image bound");
+    /* 1024x256 RGBA16 is 512 KB: more than the 256 KB test cache */
+    CHECK(!gfx_tex_bind_image(gRam + 0x200000, G_IM_FMT_RGBA, G_IM_SIZ_16b, 1024, 256, 1024, NULL, false, false,
+                              GX_TEXMAP0, &b),
+          "image larger than the cache bound");
+    gfx_tex_get_stats(&s1);
+    CHECK(s1.failures == s0.failures + 5, "%u failures", s1.failures - s0.failures);
+    test_end();
+
+    test_begin("images: cache and tile memo");
+    task_begin();
+    img = ram_image(32 * 32 * 2);
+    compare_image("first", img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 32, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_RGB5A3);
+    gfx_tex_get_stats(&s0);
+    compare_image("again", img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 32, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_RGB5A3);
+    gfx_tex_get_stats(&s1);
+    CHECK(s1.hits == s0.hits + 1 && s1.misses == s0.misses, "second bind not a hit");
+    /* the same pixels with another filter share the texture */
+    compare_image("bilinear", img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 32, NULL, false, true, GX_TEXMAP0,
+                  GX_TF_RGB5A3);
+    /* rewritten during the task: noticed only when the renderer says so */
+    img[7] ^= 0x42;
+    gfx_tex_get_stats(&s0);
+    gfx_tex_bind_image(img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 32, NULL, false, false, GX_TEXMAP0, &b);
+    gfx_tex_get_stats(&s1);
+    CHECK(s1.reconverts == s0.reconverts, "converted again without gfx_tex_ram_written");
+    gfx_tex_ram_written((uint32_t)(uintptr_t)(img + 6), 2);
+    drawDones = gDrawDones;
+    gfx_tex_get_stats(&s0);
+    compare_image("rewritten", img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 32, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_RGB5A3);
+    gfx_tex_get_stats(&s1);
+    CHECK(s1.reconverts == s0.reconverts + 1 && s1.syncs == s0.syncs + 1 && gDrawDones == drawDones + 1,
+          "ram written: %u reconverts, %u syncs", s1.reconverts - s0.reconverts, s1.syncs - s0.syncs);
+    /* next task: checked again, unchanged */
+    task_begin();
+    gfx_tex_get_stats(&s0);
+    compare_image("next task", img, G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 32, NULL, false, false, GX_TEXMAP0,
+                  GX_TF_RGB5A3);
+    gfx_tex_get_stats(&s1);
+    CHECK(s1.hits == s0.hits + 1 && s1.reconverts == s0.reconverts, "next task not a hit");
+    /* a palette change */
+    pal = ram_image(16 * 2);
+    img = ram_image(8 * 8 / 2);
+    compare_image("CI4", img, G_IM_FMT_CI, G_IM_SIZ_4b, 8, 8, 8, pal, false, false, GX_TEXMAP0, GX_TF_RGB5A3);
+    pal[3] ^= 0x81;
+    task_begin();
+    gfx_tex_get_stats(&s0);
+    compare_image("CI4, palette changed", img, G_IM_FMT_CI, G_IM_SIZ_4b, 8, 8, 8, pal, false, false, GX_TEXMAP0,
+                  GX_TF_RGB5A3);
+    gfx_tex_get_stats(&s1);
+    CHECK(s1.reconverts == s0.reconverts + 1, "palette change not noticed");
+    /* a tile bound to the same map before and after an image */
+    {
+        uint32_t a = ram_random(16 * 16 * 2);
+        void* tileImg;
+
+        load_texture_block(K0(a), G_IM_FMT_RGBA, G_IM_SIZ_16b, 16, 16, 0, 0, 0, 4, 4, 0, 0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        tileImg = gLoaded[0].img;
+        compare_image("between tiles", img, G_IM_FMT_CI, G_IM_SIZ_4b, 8, 8, 8, pal, false, false, GX_TEXMAP0,
+                      GX_TF_RGB5A3);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        CHECK(gLoaded[0].img == tileImg, "tile texture not reloaded after the image");
+    }
+    test_end();
+
+    test_begin("cache: RAM rewritten during a task");
+    {
+        uint32_t a = ram_random(32 * 32 * 2), palA;
+        int logs;
+
+        task_begin();
+        load_texture_block(K0(a), G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 0, 0, 0, 5, 5, 0, 0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        /* elsewhere: nothing to do */
+        gfx_tex_ram_written(K0(a) + 32 * 32 * 2 + 64, 64);
+        gfx_tex_get_stats(&s0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        gfx_tex_get_stats(&s1);
+        CHECK(s1.reconverts == s0.reconverts && s1.hits == s0.hits + 1, "unrelated range: %u reconverts",
+              s1.reconverts - s0.reconverts);
+        /* the texture's last row, written by the renderer, then loaded again (physical addresses are GameCube-only) */
+        gRam[a + 31 * 64 + 10] ^= 0x3C;
+        gfx_tex_ram_written(K0(a) + 31 * 64 + 8, 8);
+        load_texture_block(K0(a), G_IM_FMT_RGBA, G_IM_SIZ_16b, 32, 32, 0, 0, 0, 5, 5, 0, 0);
+        drawDones = gDrawDones;
+        gfx_tex_get_stats(&s0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        gfx_tex_get_stats(&s1);
+        CHECK(s1.reconverts == s0.reconverts + 1 && gDrawDones == drawDones + 1, "rewrite: %u reconverts",
+              s1.reconverts - s0.reconverts);
+        /* a palette */
+        palA = ram_random(16 * 2);
+        a = ram_random(16 * 16 / 2);
+        dp_set_tlut(G_TT_RGBA16);
+        load_tlut(16, 256, K0(palA));
+        load_multi_block_4b(K0(a), 0, 0, G_IM_FMT_CI, 16, 16, 0, 0, 0, 4, 4, 0, 0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        gRam[palA + 30] ^= 0x18;
+        gfx_tex_ram_written(K0(palA) + 30, 2);
+        load_tlut(16, 256, K0(palA));
+        logs = gLogs;
+        gfx_tex_get_stats(&s0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        gfx_tex_get_stats(&s1);
+        CHECK(s1.reconverts == s0.reconverts + 1 && gLogs == logs, "palette rewrite: %u reconverts",
+              s1.reconverts - s0.reconverts);
+    }
+    test_end();
+}
+
+/* ================================================================================================ */
 /* Tests: randomized loads and tiles against the model                                              */
 /* ================================================================================================ */
 
@@ -1937,14 +2380,15 @@ static void test_fuzz_macros(void) {
         }
         for (k = 0; k < n; k++) {
             int siz = (int)(rnd() % 4), fmt = kFmt[rnd() % 5];
-            int lw = 2 + (int)(rnd() % 6), lh = (int)(rnd() % 7);
+            /* (up to 64x64 texels of 32 bits, or 128x64 smaller ones, so that the slow path's scratch holds them) */
+            int lw = 2 + (int)(rnd() % ((siz == G_IM_SIZ_32b) ? 5 : 6)), lh = (int)(rnd() % 7);
             int w = 1 << lw, h = 1 << lh;
             int tmemMax = (tlut != G_TT_NONE || siz == G_IM_SIZ_32b) ? 256 : 512;
             int bytes = siz == 0 ? w * h / 2 : w * h * ref_bytes(siz);
             int tmemBytes = siz == G_IM_SIZ_32b ? bytes / 2 : bytes;
             int tmem, pal = (int)(rnd() % 16), tile = k ? 1 + (int)(rnd() % 6) : 0;
             int cms = (int)(rnd() % 4), cmt = (int)(rnd() % 4);
-            /* (masks past the data read TMEM wrapped; up to 64x64 so that the slow path's scratch holds them) */
+            /* (masks past the data read TMEM wrapped) */
             int masks = (rnd() % 4) ? lw : (int)(rnd() % 7), maskt = (rnd() % 4) ? lh : (int)(rnd() % 7);
             int shifts = (rnd() % 4) ? 0 : (int)(rnd() % 16), shiftt = (rnd() % 4) ? 0 : (int)(rnd() % 16);
             uint32_t a = pool + (rnd() % 400000) * 2;
@@ -2060,6 +2504,8 @@ int main(void) {
     test_cache_basic();
     test_cache_pressure();
     test_cache_pinning();
+    test_rect_strips();
+    test_images();
     test_fuzz();
     test_fuzz_macros();
 

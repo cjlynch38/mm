@@ -21,6 +21,11 @@ typedef struct _gx_color {
     u8 r, g, b, a;
 } GXColor;
 
+/* Opaque in libogc; only passed by pointer through gfx_internal.h */
+typedef struct _gx_texobj {
+    u32 val[8];
+} GXTexObj;
+
 #define GX_FALSE 0
 #define GX_TRUE 1
 #define GX_DISABLE 0

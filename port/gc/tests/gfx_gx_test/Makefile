@@ -21,7 +21,7 @@ include $(DEVKITPPC)/gamecube_rules
 TOP   := $(abspath $(CURDIR)/../../../..)
 BUILD := build
 
-OBJS := $(BUILD)/gfx_gx.o $(BUILD)/bridge_video.o $(BUILD)/gfx_gx_test.o
+OBJS := $(BUILD)/gfx_gx.o $(BUILD)/gfx_fb.o $(BUILD)/bridge_video.o $(BUILD)/gfx_gx_test.o
 
 CFLAGS  := $(MACHDEP) -O2 -std=gnu17 -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing \
            -I$(LIBOGC_INC) -I$(TOP)/port/gc/include -I$(TOP)/port/gc/gfx -I$(TOP)/port/gc/ogc
@@ -39,6 +39,10 @@ $(BUILD)/gfx_gx_test.elf: $(OBJS)
 	$(CC) $(LDFLAGS) -Wl,-Map,$(@:.elf=.map) $^ $(LIBS) -o $@
 
 $(BUILD)/gfx_gx.o: $(TOP)/port/gc/gfx/gfx_gx.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+$(BUILD)/gfx_fb.o: $(TOP)/port/gc/gfx/gfx_fb.c
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 

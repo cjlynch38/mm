@@ -1020,7 +1020,9 @@ static void compile(TevProgram* p, const TevKey* k) {
     bool thr = ((L & 3) == 1) && !selCvg; /* G_AC_THRESHOLD; coverage alpha always passes */
     bool dither = ((L & 3) == 3) && !selCvg;
     bool cutout = (L & AA_EN) && (L & CVG_X_ALPHA);
-    bool zAvail = (k->flags & KF_ZBUF) || (L & G_ZS_PRIM);
+    /* Texture and fill rectangles have z 0 (no z coefficients, angrylion rdp_tex_rect / rdp_fill_rect) unless
+     * G_ZS_PRIM; triangles without G_ZBUFFER have no z from the RSP */
+    bool zAvail = (k->flags & (KF_ZBUF | KF_RECT)) || (L & G_ZS_PRIM);
     int out;
     Formula fcol[2], falp[2];
     ChanCode ccol[2], calp[2];
@@ -1240,12 +1242,16 @@ static void compile(TevProgram* p, const TevKey* k) {
         p->acRef1 = 32;
     }
 
-    /* Depth: rectangles have no z unless G_ZS_PRIM; ZMODE_XLU compares strictly nearer (RDP "infront") */
+    /* Depth (angrylion z_compare): ZMODE_XLU passes strictly nearer ("infront"); ZMODE_OPA/INTER do too for a
+     * fully covered pixel (coverage overflow), which every GX pixel is, and pass nearer or equal within the z slope
+     * only at partially covered edges; ZMODE_DEC passes within the slope, here nearer or equal after the bias. The
+     * RDP passes every mode but decal over a cleared z-buffer; GX does too, as only a primitive depth of 0x7FFF
+     * reaches the cleared value (MM never compares with it). Rectangles test and write their z 0 (gfx_gx.c). */
     p->info.depthTest = (L & Z_CMP) && zAvail;
     p->info.depthWrite = (L & Z_UPD) && zAvail;
     p->info.decal = (L & ZMODE_MASK) == ZMODE_DEC;
     p->zEnable = (p->info.depthTest || p->info.depthWrite) ? GX_TRUE : GX_FALSE;
-    p->zFunc = !p->info.depthTest ? GX_ALWAYS : ((L & ZMODE_MASK) == ZMODE_XLU) ? GX_LESS : GX_LEQUAL;
+    p->zFunc = !p->info.depthTest ? GX_ALWAYS : p->info.decal ? GX_LEQUAL : GX_LESS;
     p->zUpdate = p->info.depthWrite ? GX_TRUE : GX_FALSE;
 }
 

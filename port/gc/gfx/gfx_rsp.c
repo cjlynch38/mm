@@ -26,6 +26,11 @@
  *   - G_MW_FORCEMTX only marks the MVP as valid. G_MV_MATRIX writes the MVP directly; it stays in use
  *     until a G_MTX or G_POPMTX makes the microcode recompute MV * P.
  *
+ * While S2DEX2 is loaded (G_LOAD_UCODE), the commands it shares with F3DEX2 run here (display lists, other modes,
+ * segments, G_RDPHALF_*, RDP commands) as well as G_SELECT_DL and its status words; its own commands go to
+ * gfx_s2dex.c. Its G_RDPHALF_0 is F3DEX2's G_TEXRECT opcode and works as one: the first half of a texture
+ * rectangle, and the parameters of a G_SELECT_DL.
+ *
  * Unlike the RSP, G_DL / G_BRANCH_Z to an address outside RAM is skipped (logged once) instead of running
  * garbage, so the rest of the frame still draws.
  *
@@ -101,7 +106,7 @@ typedef struct {
     uint32_t texrectW0, texrectW1;
     bool texrectSet;
     uint16_t perspNorm;
-    bool s2dex;  // S2DEX2 is loaded: skip its commands until F3DZEX2 comes back
+    bool s2dex;  // S2DEX2 is loaded (until F3DZEX2 comes back)
     bool vpFlip; // viewport mirrors one axis: screen space winding is reversed
 } RspState;
 
@@ -1049,11 +1054,20 @@ static void rsp_load_ucode(uint32_t w1) {
 
     if (text == symbol_phys(gspS2DEX2_fifoTextStart)) {
         sRsp.s2dex = true;
+        gfx_s2dex_load();
+        // S2DEX2 has no geometry mode or G_TEXTURE: its triangles (rotated sprites) are unshaded, without z, tile 0
+        gGfxRsp.geometryMode = 0;
+        gGfxRsp.textureTile = G_TX_RENDERTILE;
+        gGfxRdp.dirty |= GFX_DIRTY_GEOMETRY | GFX_DIRTY_TEXTURES;
         return;
     }
     if (text != symbol_phys(gspF3DZEX2_NoN_PosLight_fifoTextStart)) {
         LOG_ONCE(LOG_UCODE, "gfx_rsp: G_LOAD_UCODE of unknown microcode %08X, treated as F3DZEX2 (logged once)",
                  (unsigned int)w1);
+    }
+    if (sRsp.s2dex) {
+        // S2DEX2's sprite triangles set their own projection on GX: send this one again with the next vertices
+        sRsp.gxProjSent = false;
     }
     sRsp.s2dex = false;
     rsp_reload_f3dzex2();
@@ -1073,6 +1087,76 @@ static void log_unknown(uint32_t* bitmap, const char* what, uint32_t w0, uint32_
     }
 }
 
+/* G_DL, and S2DEX2's G_SELECT_DL: call (push the return address) or branch to a display list */
+static void rsp_call_dl(uint32_t* stack, int* sp, uint32_t* pc, uint32_t addr, bool push) {
+    // A bad pointer would make the RSP run garbage; skip the call so the rest of the frame draws
+    if (rsp_ptr(addr, 8) == NULL) {
+        LOG_ONCE(LOG_BAD_DL, "gfx_rsp: DL call/branch to bad address %08X skipped (logged once)", (unsigned int)addr);
+        return;
+    }
+    if (push) {
+        if (*sp == DL_STACK_N64) {
+            LOG_ONCE(LOG_DL_N64_DEPTH, "gfx_rsp: display lists nested deeper than %d (overflows on N64; logged once)",
+                     DL_STACK_N64);
+        }
+        if (*sp < DL_STACK_MAX) {
+            stack[(*sp)++] = *pc;
+        } else {
+            LOG_ONCE(LOG_DL_OVERFLOW, "gfx_rsp: display list stack overflow, call made a branch (logged once)");
+        }
+    }
+    *pc = rsp_resolve(addr);
+}
+
+/* A command while S2DEX2 is loaded. Returns true if it was handled here; false sends it on to the F3DEX2
+ * interpreter, which runs the commands both microcodes share. */
+static bool rsp_s2dex_command(uint32_t* stack, int* sp, uint32_t* pc, uint32_t w0, uint32_t w1) {
+    uint32_t op = w0 >> 24;
+    uint32_t dl;
+    bool push;
+
+    switch (op) {
+        case G_DL:
+        case G_ENDDL:
+        case G_LOAD_UCODE:
+        case G_RDPHALF_1:
+        case G_RDPHALF_2:
+        case G_TEXRECT: // G_RDPHALF_0
+        case G_TEXRECTFLIP:
+        case G_SPNOOP:
+        case G_NOOP:
+        case G_SETOTHERMODE_H:
+        case G_SETOTHERMODE_L:
+            return false;
+        case G_MOVEWORD:
+            switch ((w0 >> 16) & 0xFF) {
+                case G_MW_SEGMENT:
+                    return false;
+                case G_MW_FOG: // G_MW_GENSTAT in S2DEX2
+                    gfx_s2dex_set_status(w0 & 0xFFFF, w1);
+                    return true;
+                default:
+                    log_unknown(sLoggedS2dexOp, "S2DEX2 moveword", w0, w1);
+                    return true;
+            }
+        case 0x04: // G_SELECT_DL, after the G_RDPHALF_0 that holds its address, status id and flag
+            if (gfx_s2dex_select_dl(sRsp.texrectW0, sRsp.texrectW1, w0, w1, &dl, &push)) {
+                rsp_call_dl(stack, sp, pc, dl, push);
+            }
+            sRsp.texrectSet = false;
+            return true;
+        default:
+            if (op >= G_RDPLOADSYNC) {
+                return false;
+            }
+            if (!gfx_s2dex_command(w0, w1)) {
+                LOG_ONCE(LOG_S2DEX, "gfx_rsp: unknown S2DEX2 commands are skipped (logged once)");
+                log_unknown(sLoggedS2dexOp, "S2DEX2 command", w0, w1);
+            }
+            return true;
+    }
+}
+
 void gfx_rsp_reset(void) {
     // DMEM as the microcode's data image initializes it at task start
     memset(&sRsp, 0, sizeof(sRsp));
@@ -1083,6 +1167,7 @@ void gfx_rsp_reset(void) {
     memset(&gGfxRsp, 0, sizeof(gGfxRsp));
     gGfxRsp.geometryMode = G_CLIPPING;
     memset(sVtx, 0, sizeof(sVtx));
+    gfx_s2dex_reset();
 }
 
 void gfx_rsp_run(uint32_t dlAddr) {
@@ -1112,33 +1197,8 @@ void gfx_rsp_run(uint32_t dlAddr) {
         pc += 8;
         op = w0 >> 24;
 
-        if (sRsp.s2dex) {
-            // S2DEX2 shares F3DEX2's DL, ucode, othermode, half 1 and segment commands and passes RDP commands
-            // through. Its own commands (backgrounds, objects) are not drawn yet.
-            switch (op) {
-                case G_DL:
-                case G_ENDDL:
-                case G_LOAD_UCODE:
-                case G_RDPHALF_1:
-                case G_SPNOOP:
-                case G_NOOP:
-                case G_SETOTHERMODE_H:
-                case G_SETOTHERMODE_L:
-                    break;
-                case G_MOVEWORD:
-                    if (((w0 >> 16) & 0xFF) == G_MW_SEGMENT) {
-                        break;
-                    }
-                    log_unknown(sLoggedS2dexOp, "S2DEX2 moveword", w0, w1);
-                    continue;
-                default:
-                    if (op >= G_RDPLOADSYNC && op != G_RDPHALF_2) {
-                        break;
-                    }
-                    LOG_ONCE(LOG_S2DEX, "gfx_rsp: S2DEX2 commands are skipped (logged once)");
-                    log_unknown(sLoggedS2dexOp, "S2DEX2 command", w0, w1);
-                    continue;
-            }
+        if (sRsp.s2dex && rsp_s2dex_command(stack, &sp, &pc, w0, w1)) {
+            continue;
         }
 
         switch (op) {
@@ -1252,29 +1312,9 @@ void gfx_rsp_run(uint32_t dlAddr) {
                 rsp_load_ucode(w1);
                 break;
 
-            case G_DL: {
-                uint32_t target = rsp_resolve(w1);
-
-                // A bad pointer would make the RSP run garbage; skip the call so the rest of the frame draws
-                if (rsp_ptr(w1, 8) == NULL) {
-                    LOG_ONCE(LOG_BAD_DL, "gfx_rsp: DL call/branch to bad address %08X skipped (logged once)",
-                             (unsigned int)w1);
-                    break;
-                }
-                if (!((w0 >> 16) & G_DL_NOPUSH)) {
-                    if (sp == DL_STACK_N64) {
-                        LOG_ONCE(LOG_DL_N64_DEPTH, "gfx_rsp: display lists nested deeper than %d (overflows on N64; logged once)",
-                                 DL_STACK_N64);
-                    }
-                    if (sp < DL_STACK_MAX) {
-                        stack[sp++] = pc;
-                    } else {
-                        LOG_ONCE(LOG_DL_OVERFLOW, "gfx_rsp: display list stack overflow, call made a branch (logged once)");
-                    }
-                }
-                pc = target;
+            case G_DL:
+                rsp_call_dl(stack, &sp, &pc, w1, !((w0 >> 16) & G_DL_NOPUSH));
                 break;
-            }
 
             case G_ENDDL:
                 pc = (sp > 0) ? stack[--sp] : 0;
@@ -1312,6 +1352,10 @@ void gfx_rsp_run(uint32_t dlAddr) {
                     gfx_rdp_command(w0, w1);
                     if (op == G_FILLRECT) {
                         sStats.rects++;
+                    } else if (op == G_SETCIMG || op == G_SETZIMG) {
+                        gfx_s2dex_note_image(w0, w1);
+                    } else if (op == G_LOADTLUT) {
+                        gfx_s2dex_note_tlut(w0, w1);
                     }
                 } else {
                     log_unknown(sLoggedOp, "unknown opcode", w0, w1);
@@ -1345,6 +1389,21 @@ static void rsp_log_tex_stats(void) {
     sPrev = s;
 }
 
+/* S2DEX2 activity since the last line, if there was any */
+static void rsp_log_s2dex_stats(void) {
+    static GfxS2dexStats sPrev;
+    GfxS2dexStats s;
+
+    gfx_s2dex_get_stats(&s);
+    if (memcmp(&s, &sPrev, sizeof(s)) != 0) {
+        gc_log("gfx_s2dex: %u backgrounds in %u rects (%u from render targets), %u not drawn, %u sprites",
+               (unsigned int)(s.bgs - sPrev.bgs), (unsigned int)(s.rects - sPrev.rects),
+               (unsigned int)(s.targetBgs - sPrev.targetBgs), (unsigned int)(s.skipped - sPrev.skipped),
+               (unsigned int)(s.objs - sPrev.objs));
+        sPrev = s;
+    }
+}
+
 void gfx_rsp_stats_frame(void) {
     uint64_t now = gc_time_ticks();
     uint32_t n;
@@ -1366,6 +1425,7 @@ void gfx_rsp_stats_frame(void) {
                (unsigned int)(sStats.ticks * 1000000 / GC_TB_HZ / n),
                (unsigned int)(sStats.maxTicks * 1000000 / GC_TB_HZ));
         rsp_log_tex_stats();
+        rsp_log_s2dex_stats();
     }
     memset(&sStats, 0, sizeof(sStats));
     sStats.lastLog = now;
