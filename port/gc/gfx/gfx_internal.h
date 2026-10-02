@@ -204,6 +204,17 @@ typedef struct {
 } GfxTexStats;
 void gfx_tex_get_stats(GfxTexStats* out);
 
+/**
+ * Bind a whole image straight from RAM, bypassing the TMEM model (S2DEX2 backgrounds and object
+ * sprites, framebuffer-sourced textures). `addr` is a CPU pointer; fmt/siz are G_IM_FMT_* /
+ * G_IM_SIZ_*; `stride` is the row stride in texels; `tlut` is the palette in RAM for CI formats
+ * (RGBA16 entries, or IA16 when tlutIA), NULL otherwise. The texture uses clamp wrapping; `linear`
+ * selects bilinear filtering. Cached like other textures (content-hashed once per task).
+ * The binding's UVs map texel (s, t) of the image as gfx_tex_uv does (offsets 0, shift scale 1).
+ */
+bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height, uint16_t stride,
+                        const void* tlut, bool tlutIA, bool linear, int texMap, GfxTexBinding* out);
+
 /* ================================================================================================ */
 /* Combiner / blender (gfx_tev.c)                                                                   */
 /* ================================================================================================ */

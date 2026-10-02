@@ -167,6 +167,18 @@ void* gc_mem_alloc(unsigned int size, unsigned int align);
 void gc_set_reset_callback(void (*callback)(void));
 
 /* ------------------------------------------------------------------------------------------ */
+/* Audio output (port/gc/ogc/bridge_audio.c): the GameCube audio interface (AI DMA)            */
+/* ------------------------------------------------------------------------------------------ */
+
+/** Start the AI at `rate` Hz (32000 or 48000). Called once, before any gc_audio_queue. */
+void gc_audio_init(unsigned int rate);
+/** Queue `bytes` of 16-bit big-endian interleaved stereo PCM for playback (copied; the caller's
+ *  buffer may be reused immediately). Returns 0 on success, -1 if the queue is full (dropped). */
+int gc_audio_queue(const void* samples, unsigned int bytes);
+/** Bytes queued but not yet played (osAiGetLength semantics: what the DAC still has to play). */
+unsigned int gc_audio_bytes_pending(void);
+
+/* ------------------------------------------------------------------------------------------ */
 /* Renderer (port/gc/gfx): runs the game's graphics tasks through GX                           */
 /* ------------------------------------------------------------------------------------------ */
 
