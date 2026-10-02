@@ -9,12 +9,16 @@
 #   GFX_FUZZ_SEED=7 make -C port/gc/tests/gfx_host run    (another seed for the random display list test)
 #   GFX_TEST_VERBOSE=1 make -C port/gc/tests/gfx_host run (print the module's log lines)
 #
+# test_gfx_rsp_chk is the same test with gfx_rsp.c built with -DGFX_VTX_CHECK=1: the original eager vertex
+# pipeline runs next to the lazy one, and any vertex attribute that differs fails the test.
+#
 # test_njpeg checks the CPU JPEG task (port/gc/game/njpeg_cpu.c), compiled with the game's headers like the
 # shim that builds its OSTask (njpeg_shim.c); the test itself uses the host's.
 
 ROOT  := $(abspath $(CURDIR)/../../../..)
 BUILD := $(ROOT)/build/gc-host-tests/gfx_host
 TEST  := $(BUILD)/test_gfx_rsp
+TEST_CHK := $(BUILD)/test_gfx_rsp_chk
 NJPEG := $(BUILD)/test_njpeg
 
 CC       := gcc
@@ -22,24 +26,29 @@ SANITIZE := -fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recov
 CFLAGS   := -std=gnu17 -O1 -g $(SANITIZE) -Wall -Wextra -Werror -DGFX_HOST_TEST
 CPPFLAGS := -I$(CURDIR)/include -I$(ROOT)/port/gc/gfx -I$(ROOT)/port/gc/include
 
-HEADERS := $(ROOT)/port/gc/gfx/gfx_internal.h $(ROOT)/port/gc/gfx/gfx_gbi.h $(ROOT)/port/gc/include/gc_bridge.h \
-           $(CURDIR)/include/gccore.h $(CURDIR)/test.h
+HEADERS := $(ROOT)/port/gc/gfx/gfx_internal.h $(ROOT)/port/gc/gfx/gfx_gbi.h $(ROOT)/port/gc/gfx/gfx_prof.h \
+           $(ROOT)/port/gc/include/gc_bridge.h $(CURDIR)/include/gccore.h $(CURDIR)/test.h
 OBJS    := $(BUILD)/gfx_rsp.o $(BUILD)/gfx_s2dex.o $(BUILD)/mock.o $(BUILD)/test_rsp.o $(BUILD)/test_s2dex.o
+OBJS_CHK := $(BUILD)/chk/gfx_rsp.o $(BUILD)/gfx_s2dex.o $(BUILD)/mock.o $(BUILD)/chk/test_rsp.o $(BUILD)/test_s2dex.o
 
 GAME_FLAGS := -funsigned-char -Wno-builtin-declaration-mismatch -I$(ROOT)/include -I$(ROOT)/include/libc               -I$(ROOT)/src -I$(ROOT)/port/gc/include -D_LANGUAGE_C -DF3DEX_GBI_2 -DTARGET_GC -DNON_MATCHING -DAVOID_UB
 NJPEG_OBJS := $(BUILD)/njpeg_cpu.o $(BUILD)/njpeg_shim.o $(BUILD)/test_njpeg.o
 
 .PHONY: all run clean
-all: $(TEST) $(NJPEG)
+all: $(TEST) $(TEST_CHK) $(NJPEG)
 
-run: $(TEST) $(NJPEG)
+run: $(TEST) $(TEST_CHK) $(NJPEG)
 	$(TEST)
+	$(TEST_CHK)
 	$(NJPEG)
 
 clean:
 	rm -rf $(BUILD)
 
 $(TEST): $(OBJS)
+	$(CC) $(SANITIZE) -o $@ $^ -lm
+
+$(TEST_CHK): $(OBJS_CHK)
 	$(CC) $(SANITIZE) -o $@ $^ -lm
 
 $(NJPEG): $(NJPEG_OBJS)
@@ -54,11 +63,17 @@ $(BUILD)/njpeg_shim.o: njpeg_shim.c | $(BUILD)
 $(BUILD)/test_njpeg.o: test_njpeg.c | $(BUILD)
 	$(CC) -c $(CFLAGS) -o $@ $<
 
+$(BUILD)/chk/gfx_rsp.o: $(ROOT)/port/gc/gfx/gfx_rsp.c $(HEADERS) | $(BUILD)/chk
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) -DGFX_VTX_CHECK=1 -o $@ $<
+
+$(BUILD)/chk/test_rsp.o: test_rsp.c $(HEADERS) | $(BUILD)/chk
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) -DGFX_VTX_CHECK=1 -o $@ $<
+
 $(BUILD)/gfx_%.o: $(ROOT)/port/gc/gfx/gfx_%.c $(HEADERS) | $(BUILD)
 	$(CC) -c $(CPPFLAGS) $(CFLAGS) -o $@ $<
 
 $(BUILD)/%.o: %.c $(HEADERS) | $(BUILD)
 	$(CC) -c $(CPPFLAGS) $(CFLAGS) -o $@ $<
 
-$(BUILD):
+$(BUILD) $(BUILD)/chk:
 	mkdir -p $@

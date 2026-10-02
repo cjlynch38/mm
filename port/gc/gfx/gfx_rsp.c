@@ -40,10 +40,25 @@
  *
  * Lighting, texgen and fog use the microcode's fixed point steps where that is cheap (integer dot
  * products of s8 normals and s8 model space light directions); positions and matrices are float.
+ *
+ * Speed (results are bit-identical to the plain C code, which the host test and other CPUs still run):
+ *   - On the GameCube, vertex positions, clip codes and matrices use the Gekko's paired singles: psq_l converts the
+ *     s16 positions and the halves of s15.16 matrices to floats through the GQRs, and ps_madd evaluates the products
+ *     in the order and with the fusing that GCC gives the C expressions.
+ *   - G_VTX computes positions and clip codes only. A vertex's color (lighting), alpha (fog) and texture coordinates
+ *     are computed when a triangle that uses it passes rejection and culling: most vertices belong only to rejected
+ *     or culled triangles. G_VTX records the geometry mode bits, G_TEXTURE scale and fog they use (sAttr); before
+ *     anything else they use changes, the vertices still waiting get their attributes (rsp_attrs_flush): a G_VTX
+ *     with other recorded state or that rebuilds the lights, the modelview under point lights, G_MODIFYVTX of the
+ *     vertex, microcode switches.
+ *   - -DGFX_VTX_CHECK=1 runs the original eager pipeline next to it and logs every difference.
  */
 #include <math.h>
+#include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include "gfx_internal.h"
+#include "gfx_prof.h"
 
 // Dummy microcode symbols (port/gc/game/ucode_dummies.c). G_LOAD_UCODE is identified by its text address.
 extern unsigned char gspS2DEX2_fifoTextStart[], gspF3DZEX2_NoN_PosLight_fifoTextStart[];
@@ -58,6 +73,25 @@ extern uintptr_t gGfxHostRamBias;
 
 #define RAM_BASE 0x80000000u
 #define RAM_SIZE 0x01800000u // GameCube MEM1
+
+/* Paired-single code paths (Gekko) */
+#if defined(__PPC__) && defined(GEKKO) && !defined(GFX_HOST_TEST)
+#define RSP_PAIRED 1
+#else
+#define RSP_PAIRED 0
+#endif
+/* GQR values (load and store halves alike): type in bits 0-2 of each half, scale in bits 8-13. The GQRs are global:
+ * libogc's thread switches keep each thread's paired-single halves but not its GQRs (it only relies on GQR0 = 0,
+ * float, which nothing here changes). The asm below sets the GQRs it uses right before using them, and always to
+ * these values, so other code that uses GQR2-GQR5 must use the same values (or switch to GQR6-GQR7):
+ * GQR2 = s16, GQR3 = u16 / 65536, GQR4 = s16 / 32 (texture coordinates), GQR5 = float. */
+#define RSP_GQR_S16 0x00070007u
+#define RSP_GQR_U16_FRAC 0x10051005u
+#define RSP_GQR_S16_ST 0x05070507u
+
+#ifndef GFX_VTX_CHECK
+#define GFX_VTX_CHECK 0
+#endif
 
 #define VTX_COUNT 32
 #define MTX_STACK_MAX 32
@@ -148,7 +182,7 @@ uint32_t gGfxSegments[16];
 GfxRspState gGfxRsp;
 
 static RspState sRsp;
-static GfxVtx sVtx[VTX_COUNT];
+static GfxVtx sVtx[VTX_COUNT] __attribute__((aligned(32)));
 static RspStats sStats;
 static uint8_t sLogged[LOG_COUNT];
 static uint32_t sLoggedOp[8];
@@ -161,6 +195,157 @@ static uint32_t sLoggedS2dexOp[8];
             gc_log(__VA_ARGS__);   \
         }                          \
     } while (0)
+
+/* ============================================================================================== */
+/* Optional per-phase profile (gfx_prof.h, -DGFX_PROF=1)                                          */
+/* ============================================================================================== */
+
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+static const char* const sProfNames[GFX_PROF_COUNT] = {
+    "other", "dl", "vtx", "tri", "gxtri", "prep", "tev", "bind", "flush", "rdp", "rect", "fb", "end", "wait", "s2d",
+    "attr", "vsetup",
+};
+static uint32_t sProfTicks[GFX_PROF_COUNT];
+static uint32_t sProfCalls[GFX_PROF_COUNT];
+static uint8_t sProfStack[32];
+static int sProfDepth;
+static uint8_t sProfCur;
+static uint32_t sProfLast;
+static uint32_t sProfTasks;
+/* Vertex work: lit vertices (directional, positional), light evaluations (directional, point), fog, texgen */
+static uint32_t sProfVtxLit, sProfVtxPos, sProfDirEvals, sProfPointEvals, sProfVtxFog, sProfVtxTexgen;
+#define PROF_COUNT(var, n) ((var) += (n))
+/* Texture command sequences (image, tiles, loads) between triangles, and how many repeat the previous one exactly
+ * (from the same texture image state): those draws could keep the textures already bound */
+static uint32_t sProfTexHash, sProfTexPrevHash, sProfTexSeqs, sProfTexSame;
+static bool sProfTexOpen;
+static uint32_t sProfOps[256]; /* display list commands by opcode */
+
+static inline void prof_tex_cmd(uint32_t w0, uint32_t w1) {
+    if (!sProfTexOpen) {
+        sProfTexOpen = true;
+        sProfTexHash = 0x811C9DC5u ^ gGfxRdp.texImageAddr ^ ((uint32_t)gGfxRdp.texImageWidth << 16) ^
+                       ((uint32_t)gGfxRdp.texImageFmt << 8) ^ gGfxRdp.texImageSiz;
+    }
+    sProfTexHash = ((sProfTexHash ^ w0) * 0x9E3779B1u) ^ w1;
+    sProfTexHash *= 0x85EBCA6Bu;
+}
+
+static inline void prof_tex_draw(void) {
+    if (sProfTexOpen) {
+        sProfTexOpen = false;
+        sProfTexSeqs++;
+        sProfTexSame += (sProfTexHash == sProfTexPrevHash);
+        sProfTexPrevHash = sProfTexHash;
+    }
+}
+
+static inline uint32_t prof_now(void) {
+    uint32_t t;
+
+    __asm__ volatile("mftb %0" : "=r"(t));
+    return t;
+}
+
+void gfx_prof_enter(int phase) {
+    uint32_t now = prof_now();
+
+    sProfTicks[sProfCur] += now - sProfLast;
+    sProfLast = now;
+    if (sProfDepth < (int)sizeof(sProfStack)) {
+        sProfStack[sProfDepth] = sProfCur;
+    }
+    sProfDepth++;
+    sProfCur = (uint8_t)phase;
+    sProfCalls[phase]++;
+}
+
+void gfx_prof_leave(void) {
+    uint32_t now = prof_now();
+
+    sProfTicks[sProfCur] += now - sProfLast;
+    sProfLast = now;
+    if (sProfDepth > 0) {
+        sProfDepth--;
+        sProfCur = (sProfDepth < (int)sizeof(sProfStack)) ? sProfStack[sProfDepth] : GFX_PROF_OTHER;
+    }
+}
+
+void gfx_prof_task_begin(void) {
+    sProfLast = prof_now();
+    sProfCur = GFX_PROF_OTHER;
+    sProfDepth = 0;
+}
+
+void gfx_prof_task_end(void) {
+    uint32_t now = prof_now();
+
+    sProfTicks[sProfCur] += now - sProfLast;
+    sProfLast = now;
+    sProfTasks++;
+}
+
+static void prof_log(uint32_t ms) {
+    char line[512];
+    char calls[512];
+    int len = 0, clen = 0;
+    int i;
+
+    if (sProfTasks == 0) {
+        return;
+    }
+    for (i = 0; i < GFX_PROF_COUNT; i++) {
+        len += snprintf(line + len, sizeof(line) - len, "%s%s %u", (i == 0) ? "" : ", ", sProfNames[i],
+                        (unsigned int)((uint64_t)sProfTicks[i] * 1000000 / GC_TB_HZ / sProfTasks));
+        clen += snprintf(calls + clen, sizeof(calls) - clen, "%s%s %u", (i == 0) ? "" : ", ", sProfNames[i],
+                         (unsigned int)(sProfCalls[i] / sProfTasks));
+        if (len >= (int)sizeof(line) || clen >= (int)sizeof(calls)) {
+            break;
+        }
+    }
+    gc_log("gfx_prof: %u tasks in %u ms; per task us: %s", (unsigned int)sProfTasks, (unsigned int)ms, line);
+    gc_log("gfx_prof: calls per task: %s", calls);
+    gc_log("gfx_prof: per task: %u lit vtx (%u positional), %u directional and %u point light evaluations, %u fog vtx, "
+           "%u texgen vtx", (unsigned int)(sProfVtxLit / sProfTasks), (unsigned int)(sProfVtxPos / sProfTasks),
+           (unsigned int)(sProfDirEvals / sProfTasks), (unsigned int)(sProfPointEvals / sProfTasks),
+           (unsigned int)(sProfVtxFog / sProfTasks), (unsigned int)(sProfVtxTexgen / sProfTasks));
+    gc_log("gfx_prof: per task: %u texture command sequences before triangles, %u repeat the previous one",
+           (unsigned int)(sProfTexSeqs / sProfTasks), (unsigned int)(sProfTexSame / sProfTasks));
+    sProfTexSeqs = sProfTexSame = 0;
+    {
+        // The most frequent display list commands
+        int k;
+
+        clen = 0;
+        for (k = 0; k < 12; k++) {
+            int best = -1, op;
+
+            for (op = 0; op < 256; op++) {
+                if (sProfOps[op] != 0 && (best < 0 || sProfOps[op] > sProfOps[best])) {
+                    best = op;
+                }
+            }
+            if (best < 0) {
+                break;
+            }
+            clen += snprintf(calls + clen, sizeof(calls) - clen, "%s%02X %u", (k == 0) ? "" : ", ", best,
+                             (unsigned int)(sProfOps[best] / sProfTasks));
+            sProfOps[best] = 0;
+            if (clen >= (int)sizeof(calls)) {
+                break;
+            }
+        }
+        gc_log("gfx_prof: commands per task by opcode: %s", calls);
+        memset(sProfOps, 0, sizeof(sProfOps));
+    }
+    memset(sProfTicks, 0, sizeof(sProfTicks));
+    memset(sProfCalls, 0, sizeof(sProfCalls));
+    sProfTasks = 0;
+    sProfVtxLit = sProfVtxPos = sProfDirEvals = sProfPointEvals = sProfVtxFog = sProfVtxTexgen = 0;
+}
+#else
+#define PROF_COUNT(var, n) ((void)0)
+#endif
 
 /* ============================================================================================== */
 /* Helpers                                                                                        */
@@ -206,6 +391,22 @@ static inline float floorf_fast(float x) {
     return (t > x) ? t - 1.0f : t;
 }
 
+/* clampf(floorf_fast(x), -32768, 32767) without integer conversions (they go through memory on the Gekko). Below
+ * 2^22, (x + 1.5 * 2^23) - 1.5 * 2^23 is x rounded to an integer (to nearest); floor is one less if that is above
+ * x. NaN stays NaN, as through floorf_fast and clampf. */
+static inline float floor_clamp16(float x) {
+    float r;
+
+    if (x >= 32767.0f) {
+        return 32767.0f;
+    }
+    if (x < -32768.0f) {
+        return -32768.0f;
+    }
+    r = (x + 12582912.0f) - 12582912.0f;
+    return (r > x) ? r - 1.0f : r;
+}
+
 static inline float rsqrtf_fast(float x) {
 #if defined(__PPC__)
     float e;
@@ -221,13 +422,20 @@ static inline float rsqrtf_fast(float x) {
 /* A normalized direction component (|v| <= 128) as the microcode stores it: the top byte of a s0.15 value,
  * i.e. floor(v), saturated to the s8 range (an axis gives 127, its opposite -128) */
 static inline int8_t to_s8_floor(float v) {
+    float r;
+
     if (!(v > -128.0f)) {
         return -128; // also NaN
     }
     if (v >= 127.0f) {
         return 127;
     }
-    return (int8_t)(int32_t)floorf_fast(v);
+    // floor(v) as floor_clamp16 computes it (one float to integer conversion instead of three)
+    r = (v + 12582912.0f) - 12582912.0f;
+    if (r > v) {
+        r -= 1.0f;
+    }
+    return (int8_t)(int32_t)r;
 }
 
 /* ============================================================================================== */
@@ -266,13 +474,31 @@ static inline uint32_t symbol_phys(const void* sym) {
     return (uint32_t)((uintptr_t)sym - RAM_BIAS) & 0x1FFFFFFF;
 }
 
+/* Vertex attributes still to compute (see "Vertices") */
+static void rsp_attrs_flush(void);
+static void rsp_attrs_before_mv_change(void);
+
+#if GFX_VTX_CHECK
+/* Check build: comparisons with the original code and the differences found */
+static uint32_t sChkPos, sChkAttr, sChkBad;
+static uint32_t sChkMtx __attribute__((unused)); /* paired-single matrices (GameCube only) */
+static int sChkLogged;
+
+/* For the host test's check build (port/gc/tests/gfx_host) */
+uint32_t gfx_rsp_vtx_check_failures(void);
+uint32_t gfx_rsp_vtx_check_failures(void) {
+    return sChkBad;
+}
+#endif
+
 /* ============================================================================================== */
 /* Matrices                                                                                       */
 /* ============================================================================================== */
 
+#if !RSP_PAIRED || GFX_VTX_CHECK
 /* out = a * b (row vectors: v * a * b). Like the microcode's mtx_multiply, elements saturate to the s15.16
  * range, which also keeps repeated G_MTX_MUL products finite. */
-static void mtx_mul(float out[4][4], const float a[4][4], const float b[4][4]) {
+static void mtx_mul_c(float out[4][4], const float a[4][4], const float b[4][4]) {
     float t[4][4];
     int i, j;
 
@@ -287,9 +513,10 @@ static void mtx_mul(float out[4][4], const float a[4][4], const float b[4][4]) {
     }
     memcpy(out, t, sizeof(t));
 }
+#endif
 
 /* N64 Mtx: 16 integer halves, then 16 fraction halves, row major; element = (int << 16 | frac) / 65536 */
-static void mtx_from_raw(float m[4][4], const uint8_t* raw) {
+static void mtx_from_raw_c(float m[4][4], const uint8_t* raw) {
     int i;
 
     for (i = 0; i < 16; i++) {
@@ -298,6 +525,149 @@ static void mtx_from_raw(float m[4][4], const uint8_t* raw) {
         m[i >> 2][i & 3] = (float)v * (1.0f / 65536.0f);
     }
 }
+
+#if RSP_PAIRED
+static const float sSatPair[2][2] ATTRIBUTE_ALIGN(8) = { { -32768.0f, -32768.0f }, { 32767.998f, 32767.998f } };
+
+/* mtx_mul_c with paired singles. GCC evaluates each element as fma(a3, b3j, fma(a2, b2j, fma(a0, b0j, a1 * b1j)))
+ * (the product a1 * b1j rounded, the others fused), and so does this, two columns at a time. The saturation selects
+ * with ps_sel on v - lo and hi - v: products of saturated elements are always finite. b is read whole first and
+ * each row of a before that row is written, so out may be a or b. */
+static void mtx_mul_ps(float out[4][4], const float a[4][4], const float b[4][4]) {
+    const float* pa = &a[0][0];
+    float* po = &out[0][0];
+    uint32_t i;
+
+    __asm__ volatile("mtspr 917, %[f32]\n\t"
+                     "psq_l 0, 0(%[b]), 0, 5\n\t"
+                     "psq_l 1, 8(%[b]), 0, 5\n\t"
+                     "psq_l 2, 16(%[b]), 0, 5\n\t"
+                     "psq_l 3, 24(%[b]), 0, 5\n\t"
+                     "psq_l 4, 32(%[b]), 0, 5\n\t"
+                     "psq_l 5, 40(%[b]), 0, 5\n\t"
+                     "psq_l 6, 48(%[b]), 0, 5\n\t"
+                     "psq_l 7, 56(%[b]), 0, 5\n\t"
+                     "psq_l 8, 0(%[sat]), 0, 5\n\t"
+                     "psq_l 9, 8(%[sat]), 0, 5\n\t"
+                     "li %[i], 4\n\t"
+                     "mtctr %[i]\n"
+                     "1:\n\t"
+                     "psq_l 10, 0(%[a]), 0, 5\n\t"
+                     "psq_l 11, 8(%[a]), 0, 5\n\t"
+                     "ps_muls1 12, 2, 10\n\t"
+                     "ps_muls1 13, 3, 10\n\t"
+                     "ps_madds0 12, 0, 10, 12\n\t"
+                     "ps_madds0 13, 1, 10, 13\n\t"
+                     "ps_madds0 12, 4, 11, 12\n\t"
+                     "ps_madds0 13, 5, 11, 13\n\t"
+                     "ps_madds1 12, 6, 11, 12\n\t"
+                     "ps_madds1 13, 7, 11, 13\n\t"
+                     "ps_sub 10, 12, 8\n\t"
+                     "ps_sub 11, 13, 8\n\t"
+                     "ps_sel 12, 10, 12, 8\n\t"
+                     "ps_sel 13, 11, 13, 8\n\t"
+                     "ps_sub 10, 9, 12\n\t"
+                     "ps_sub 11, 9, 13\n\t"
+                     "ps_sel 12, 10, 12, 9\n\t"
+                     "ps_sel 13, 11, 13, 9\n\t"
+                     "psq_st 12, 0(%[o]), 0, 5\n\t"
+                     "psq_st 13, 8(%[o]), 0, 5\n\t"
+                     "addi %[a], %[a], 16\n\t"
+                     "addi %[o], %[o], 16\n\t"
+                     "bdnz 1b"
+                     : [a] "+b"(pa), [o] "+b"(po), [i] "=&r"(i)
+                     : [b] "b"(&b[0][0]), [sat] "b"(&sSatPair[0][0]), [f32] "r"(0)
+                     : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+                       "fr13", "ctr", "memory");
+}
+
+/* mtx_from_raw_c with paired singles: the integer halves load as s16, the fractions as u16 / 65536, and their sum
+ * rounds once, to the same float as the s15.16 value converted whole. (Matrices are 8-byte aligned: the RSP's DMA
+ * needs that. Anything else takes the C path.) */
+static void mtx_from_raw_ps(float m[4][4], const uint8_t* raw) {
+    if ((uintptr_t)raw & 3) {
+        mtx_from_raw_c(m, raw);
+        return;
+    }
+    __asm__ volatile("mtspr 914, %[s16]\n\t"
+                     "mtspr 915, %[u16]\n\t"
+                     "mtspr 917, %[f32]\n\t"
+                     "psq_l 0, 0(%[r]), 0, 2\n\t"
+                     "psq_l 1, 32(%[r]), 0, 3\n\t"
+                     "psq_l 2, 4(%[r]), 0, 2\n\t"
+                     "psq_l 3, 36(%[r]), 0, 3\n\t"
+                     "psq_l 4, 8(%[r]), 0, 2\n\t"
+                     "psq_l 5, 40(%[r]), 0, 3\n\t"
+                     "psq_l 6, 12(%[r]), 0, 2\n\t"
+                     "psq_l 7, 44(%[r]), 0, 3\n\t"
+                     "ps_add 0, 0, 1\n\t"
+                     "ps_add 2, 2, 3\n\t"
+                     "ps_add 4, 4, 5\n\t"
+                     "ps_add 6, 6, 7\n\t"
+                     "psq_st 0, 0(%[m]), 0, 5\n\t"
+                     "psq_st 2, 8(%[m]), 0, 5\n\t"
+                     "psq_st 4, 16(%[m]), 0, 5\n\t"
+                     "psq_st 6, 24(%[m]), 0, 5\n\t"
+                     "psq_l 0, 16(%[r]), 0, 2\n\t"
+                     "psq_l 1, 48(%[r]), 0, 3\n\t"
+                     "psq_l 2, 20(%[r]), 0, 2\n\t"
+                     "psq_l 3, 52(%[r]), 0, 3\n\t"
+                     "psq_l 4, 24(%[r]), 0, 2\n\t"
+                     "psq_l 5, 56(%[r]), 0, 3\n\t"
+                     "psq_l 6, 28(%[r]), 0, 2\n\t"
+                     "psq_l 7, 60(%[r]), 0, 3\n\t"
+                     "ps_add 0, 0, 1\n\t"
+                     "ps_add 2, 2, 3\n\t"
+                     "ps_add 4, 4, 5\n\t"
+                     "ps_add 6, 6, 7\n\t"
+                     "psq_st 0, 32(%[m]), 0, 5\n\t"
+                     "psq_st 2, 40(%[m]), 0, 5\n\t"
+                     "psq_st 4, 48(%[m]), 0, 5\n\t"
+                     "psq_st 6, 56(%[m]), 0, 5"
+                     :
+                     : [r] "b"(raw), [m] "b"(&m[0][0]), [s16] "r"(RSP_GQR_S16), [u16] "r"(RSP_GQR_U16_FRAC),
+                       [f32] "r"(0)
+                     : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "memory");
+}
+
+#if GFX_VTX_CHECK
+static void mtx_chk_report(const char* what, const float got[4][4], const float want[4][4]) {
+    sChkMtx++;
+    if (memcmp(got, want, 64) != 0) {
+        sChkBad++;
+        if (sChkLogged < 16) {
+            sChkLogged++;
+            gc_log("gfx_rsp: vtx check: %s differs (first row %08X %08X %08X %08X, want %08X %08X %08X %08X)", what,
+                   *(const uint32_t*)&got[0][0], *(const uint32_t*)&got[0][1], *(const uint32_t*)&got[0][2],
+                   *(const uint32_t*)&got[0][3], *(const uint32_t*)&want[0][0], *(const uint32_t*)&want[0][1],
+                   *(const uint32_t*)&want[0][2], *(const uint32_t*)&want[0][3]);
+        }
+    }
+}
+
+static void mtx_mul(float out[4][4], const float a[4][4], const float b[4][4]) {
+    float want[4][4];
+
+    mtx_mul_c(want, a, b);
+    mtx_mul_ps(out, a, b);
+    mtx_chk_report("matrix product", (const float(*)[4])out, (const float(*)[4])want);
+}
+
+static void mtx_from_raw(float m[4][4], const uint8_t* raw) {
+    float want[4][4];
+
+    mtx_from_raw_c(want, raw);
+    mtx_from_raw_ps(m, raw);
+    mtx_chk_report("matrix", (const float(*)[4])m, (const float(*)[4])want);
+}
+#else
+#define mtx_mul mtx_mul_ps
+#define mtx_from_raw mtx_from_raw_ps
+#endif
+#else
+#define mtx_mul mtx_mul_c
+#define mtx_from_raw mtx_from_raw_c
+#endif
 
 static void mtx_to_raw(uint8_t raw[64], const float m[4][4]) {
     int i;
@@ -318,7 +688,7 @@ static void mtx_to_raw(uint8_t raw[64], const float m[4][4]) {
 /* A DMEM write into a matrix: whole matrices go straight in; partial writes (G_MOVEMEM with an offset,
  * G_MW_MATRIX) round-trip through the fixed point layout. */
 static void mtx_write(float m[4][4], uint32_t ofs, const uint8_t* src, uint32_t len) {
-    uint8_t raw[64];
+    uint8_t raw[64] __attribute__((aligned(8)));
 
     if (ofs == 0 && len >= 64) {
         mtx_from_raw(m, src);
@@ -353,6 +723,7 @@ static void rsp_mtx(uint32_t w0, uint32_t w1) {
         }
         sRsp.pVer++;
     } else {
+        rsp_attrs_before_mv_change();
         if (!(params & G_MTX_PUSH)) {
             if (sRsp.mvDepth >= MTX_STACK_N64) {
                 LOG_ONCE(LOG_MTX_N64_DEPTH, "gfx_rsp: matrix stack deeper than %d (overflows on N64; logged once)",
@@ -384,6 +755,7 @@ static void rsp_popmtx(uint32_t w1) {
     if (n > (uint32_t)sRsp.mvDepth) {
         n = (uint32_t)sRsp.mvDepth;
     }
+    rsp_attrs_before_mv_change();
     sRsp.mvDepth -= (int)n;
     memcpy(sRsp.mv, sRsp.mvStack[sRsp.mvDepth], sizeof(sRsp.mv));
     sRsp.mvpValid = false;
@@ -507,8 +879,9 @@ static inline int32_t rsp_dir_intensity(int nx, int ny, int nz, const int8_t* d)
  *   Lm = floor(MV3x3 * L)                          (model space, not normalized: carries MV's scale)
  *   V  = clamp(n/128 . clamp(4 Lm / sqrt(K), -1, 1), 0, 1)
  *   attenuation = 65536 / (4096 kc + 32768 + 2 kl len + kq * 32 * (min(16 len, 32767)^2 >> 16)),
- *   len = (int)sqrt(K); intensity = V * attenuation, rounded as vmulf does */
-static int32_t rsp_point_intensity(const RspLight* lt, const float* wp, int nx, int ny, int nz) {
+ *   len = (int)sqrt(K); intensity = V * attenuation, rounded as vmulf does
+ * fn is the s8 normal as floats. */
+static int32_t rsp_point_intensity(const RspLight* lt, const float* wp, const float* fn) {
     const float(*m)[4] = (const float(*)[4])sRsp.mv;
     float lx = clampf(lt->pos[0] - wp[0], -32768.0f, 32767.0f);
     float ly = clampf(lt->pos[1] - wp[1], -32768.0f, 32767.0f);
@@ -523,13 +896,13 @@ static int32_t rsp_point_intensity(const RspLight* lt, const float* wp, int nx, 
     if (k > 2147483647.0f) {
         k = 2147483647.0f;
     }
-    mx = clampf(floorf_fast(m[0][0] * lx + m[0][1] * ly + m[0][2] * lz), -32768.0f, 32767.0f);
-    my = clampf(floorf_fast(m[1][0] * lx + m[1][1] * ly + m[1][2] * lz), -32768.0f, 32767.0f);
-    mz = clampf(floorf_fast(m[2][0] * lx + m[2][1] * ly + m[2][2] * lz), -32768.0f, 32767.0f);
+    mx = floor_clamp16(m[0][0] * lx + m[0][1] * ly + m[0][2] * lz);
+    my = floor_clamp16(m[1][0] * lx + m[1][1] * ly + m[1][2] * lz);
+    mz = floor_clamp16(m[2][0] * lx + m[2][1] * ly + m[2][2] * lz);
     inv = rsqrtf_fast(k);
     s = 4.0f * inv;
-    v = ((float)nx * clampf(mx * s, -1.0f, 1.0f) + (float)ny * clampf(my * s, -1.0f, 1.0f) +
-         (float)nz * clampf(mz * s, -1.0f, 1.0f)) *
+    v = (fn[0] * clampf(mx * s, -1.0f, 1.0f) + fn[1] * clampf(my * s, -1.0f, 1.0f) +
+         fn[2] * clampf(mz * s, -1.0f, 1.0f)) *
         (1.0f / 128.0f);
     if (v <= 0.0f) {
         return 0;
@@ -551,6 +924,32 @@ static int32_t rsp_point_intensity(const RspLight* lt, const float* wp, int nx, 
 /* Lit color of one vertex. Colors accumulate as the microcode's vmulf/vmacf do: color += lc * I / 32768,
  * with the truncation that makes a component above 128 lose 1 per accumulation pass. Directional
  * lighting is one pass; positional lighting stores the color after each light. */
+static inline void rsp_light_directional(GfxVtx* d, int nx, int ny, int nz, int odd) {
+    const int n = sRsp.numLights;
+    const RspLight* amb = &sRsp.lights[n];
+    int32_t r = amb->col[odd][0], g = amb->col[odd][1], b = amb->col[odd][2];
+    int32_t sr = 0, sg = 0, sb = 0;
+    int l;
+
+    for (l = 0; l < n; l++) {
+        int32_t in = rsp_dir_intensity(nx, ny, nz, sRsp.lightDir[LIGHT_MAIN + l]);
+
+        if (in != 0) {
+            const uint8_t* c = sRsp.lights[l].col[odd];
+
+            sr += c[0] * in;
+            sg += c[1] * in;
+            sb += c[2] * in;
+        }
+    }
+    r += (sr + 128 - r) >> 15;
+    g += (sg + 128 - g) >> 15;
+    b += (sb + 128 - b) >> 15;
+    d->r = (uint8_t)((r > 255) ? 255 : r);
+    d->g = (uint8_t)((g > 255) ? 255 : g);
+    d->b = (uint8_t)((b > 255) ? 255 : b);
+}
+
 static void rsp_light_vertex(GfxVtx* d, int nx, int ny, int nz, int odd, bool positional, const float* wp) {
     const int n = sRsp.numLights;
     const RspLight* amb = &sRsp.lights[n];
@@ -558,27 +957,16 @@ static void rsp_light_vertex(GfxVtx* d, int nx, int ny, int nz, int odd, bool po
     int l;
 
     if (!positional) {
-        int32_t sr = 0, sg = 0, sb = 0;
-
-        for (l = 0; l < n; l++) {
-            int32_t in = rsp_dir_intensity(nx, ny, nz, sRsp.lightDir[LIGHT_MAIN + l]);
-
-            if (in != 0) {
-                const uint8_t* c = sRsp.lights[l].col[odd];
-
-                sr += c[0] * in;
-                sg += c[1] * in;
-                sb += c[2] * in;
-            }
-        }
-        r += (sr + 128 - r) >> 15;
-        g += (sg + 128 - g) >> 15;
-        b += (sb + 128 - b) >> 15;
+        rsp_light_directional(d, nx, ny, nz, odd);
+        return;
     } else {
+        // The normal as floats once for all point lights (exact: s8 values)
+        const float fn[3] = { (float)nx, (float)ny, (float)nz };
+
         for (l = n - 1; l >= 0; l--) {
             const RspLight* lt = &sRsp.lights[l];
             const uint8_t* c = lt->col[odd];
-            int32_t in = (lt->kc != 0) ? rsp_point_intensity(lt, wp, nx, ny, nz)
+            int32_t in = (lt->kc != 0) ? rsp_point_intensity(lt, wp, fn)
                                        : rsp_dir_intensity(nx, ny, nz, sRsp.lightDir[LIGHT_MAIN + l]);
 
             r += (c[0] * in + 128 - r) >> 15;
@@ -640,10 +1028,270 @@ static inline uint8_t rsp_clip_codes(float x, float y, float z, float w) {
     return c;
 }
 
-static void rsp_vertices(uint32_t w0, uint32_t w1) {
-    int n = (int)((w0 >> 12) & 0xFF);
-    int v0 = (int)((w0 & 0xFF) >> 1) - n;
-    const uint8_t* in;
+/* What a vertex's attributes (color, alpha or fog, texture coordinates) depend on besides its own data, the lights
+ * (sRsp.lights, lightDir) and, with point lights, the modelview. Set at each G_VTX; nothing in it changes while
+ * vertices wait for their attributes (rsp_attrs_flush runs first). */
+#define ATTR_LIT 0x01
+#define ATTR_FOG 0x02
+#define ATTR_TEXGEN 0x04
+#define ATTR_TEXGEN_LINEAR 0x08
+#define ATTR_POSITIONAL 0x10
+#define ATTR_WORLD 0x20 /* positional with a point light: the vertex's world position */
+
+typedef struct {
+    uint32_t flags;
+    int32_t scaleS, scaleT;
+    int16_t fogMultiplier, fogOffset;
+    float fm, fo; /* the fog multiplier and offset as floats */
+} RspAttrState;
+
+static RspAttrState sAttr;
+static uint32_t sPending;                 /* bit i: sVtx[i] still needs its attributes */
+static uint32_t sVtxOdd;                  /* bit i: sVtx[i] was the second of a pair in its G_VTX */
+static const uint8_t* sVtxIn[VTX_COUNT];  /* the N64 Vtx each sVtx came from (RAM does not change during a task) */
+
+#if GFX_VTX_CHECK
+/* Check build: what the original eager pipeline computed for each vertex */
+static GfxVtx sRefVtx[VTX_COUNT];
+
+static void chk_report(const char* what, int idx, const GfxVtx* got, const GfxVtx* want) {
+    sChkBad++;
+    if (sChkLogged < 16) {
+        sChkLogged++;
+        gc_log("gfx_rsp: vtx check: %s differs at %d: got %08X %08X %08X %08X clip %02X rgba %02X%02X%02X%02X st %08X "
+               "%08X, want %08X %08X %08X %08X clip %02X rgba %02X%02X%02X%02X st %08X %08X", what, idx,
+               *(const uint32_t*)&got->x, *(const uint32_t*)&got->y, *(const uint32_t*)&got->z,
+               *(const uint32_t*)&got->w, got->clip, got->r, got->g, got->b, got->a, *(const uint32_t*)&got->s,
+               *(const uint32_t*)&got->t, *(const uint32_t*)&want->x, *(const uint32_t*)&want->y,
+               *(const uint32_t*)&want->z, *(const uint32_t*)&want->w, want->clip, want->r, want->g, want->b,
+               want->a, *(const uint32_t*)&want->s, *(const uint32_t*)&want->t);
+    }
+}
+#endif
+
+/* Lighting with G_LIGHTING_POSITIONAL or texgen, which most vertices do not use (kept out of rsp_vertex_attrs) */
+static __attribute__((noinline)) void rsp_vertex_light_full(GfxVtx* d, const uint8_t* in, int idx, uint32_t flags,
+                                                            int32_t* s, int32_t* t) {
+    int nx = (int8_t)in[12], ny = (int8_t)in[13], nz = (int8_t)in[14];
+    float wp[3] = { 0.0f, 0.0f, 0.0f }; // vertex in world space (point lights)
+
+    if (flags & ATTR_WORLD) {
+        const float(*mv)[4] = (const float(*)[4])sRsp.mv;
+        float x = (float)(int16_t)rd16(in);
+        float y = (float)(int16_t)rd16(in + 2);
+        float z = (float)(int16_t)rd16(in + 4);
+
+        wp[0] = floor_clamp16(x * mv[0][0] + y * mv[1][0] + z * mv[2][0] + mv[3][0]);
+        wp[1] = floor_clamp16(x * mv[0][1] + y * mv[1][1] + z * mv[2][1] + mv[3][1]);
+        wp[2] = floor_clamp16(x * mv[0][2] + y * mv[1][2] + z * mv[2][2] + mv[3][2]);
+    }
+    rsp_light_vertex(d, nx, ny, nz, (int)((sVtxOdd >> idx) & 1), (flags & ATTR_POSITIONAL) != 0, wp);
+    if (flags & ATTR_TEXGEN) {
+        *s = rsp_texgen(nx, ny, nz, sRsp.lightDir[0], (flags & ATTR_TEXGEN_LINEAR) != 0);
+        *t = rsp_texgen(nx, ny, nz, sRsp.lightDir[1], (flags & ATTR_TEXGEN_LINEAR) != 0);
+    }
+}
+
+/* Color, alpha and texture coordinates of sVtx[idx] (the attribute half of the original G_VTX loop) */
+static inline void rsp_vertex_attrs(int idx) {
+    GfxVtx* d = &sVtx[idx];
+    const uint8_t* in = sVtxIn[idx];
+    const uint32_t flags = sAttr.flags;
+    int32_t s = (int16_t)rd16(in + 8);
+    int32_t t = (int16_t)rd16(in + 10);
+
+    if (flags & ATTR_LIT) {
+        if (flags & (ATTR_POSITIONAL | ATTR_TEXGEN)) {
+            rsp_vertex_light_full(d, in, idx, flags, &s, &t);
+        } else {
+            rsp_light_directional(d, (int8_t)in[12], (int8_t)in[13], (int8_t)in[14], (int)((sVtxOdd >> idx) & 1));
+        }
+    } else {
+        d->r = in[12];
+        d->g = in[13];
+        d->b = in[14];
+    }
+
+    if (flags & ATTR_FOG) {
+        // alpha = clamp(floor(z / w * multiplier) + offset, 0, 255); 1/w saturates for w near or below 0
+        const float cz = d->z, cw = d->w;
+        const float fm = sAttr.fm, fo = sAttr.fo;
+        float iw = (cw > (1.0f / 32768.0f)) ? 1.0f / cw : 32768.0f;
+        float f = cz * iw * fm + fo;
+
+        d->a = (f > 0.0f) ? ((f < 255.0f) ? (uint8_t)(int32_t)f : 255) : 0;
+    } else {
+        d->a = in[15];
+    }
+
+    // s10.5 coordinate * 0.16 scale, truncated like the microcode's vmudm, then in texels
+#if RSP_PAIRED
+    {
+        // Both results fit an s16 (a s16 times a u16, shifted by 16): psq_l reads them back as floats, divided by
+        // 32 through the GQR's scale, which is exact, as (float)v * (1 / 32) is
+        int16_t st[2] __attribute__((aligned(8)));
+
+        st[0] = (int16_t)((s * sAttr.scaleS) >> 16);
+        st[1] = (int16_t)((t * sAttr.scaleT) >> 16);
+        // (GQR4 and GQR5 are set by rsp_attrs_compute, the only caller)
+        __asm__ volatile("psq_l 0, 0(%[st]), 0, 4\n\t"
+                         "psq_st 0, %[ofs](%[d]), 0, 5"
+                         :
+                         : [st] "b"(st), [d] "b"(d), [ofs] "i"(offsetof(GfxVtx, s))
+                         : "fr0", "memory");
+    }
+#else
+    d->s = (float)((s * sAttr.scaleS) >> 16) * (1.0f / 32.0f);
+    d->t = (float)((t * sAttr.scaleT) >> 16) * (1.0f / 32.0f);
+#endif
+#if GFX_VTX_CHECK
+    {
+        const GfxVtx* r = &sRefVtx[idx];
+
+        sChkAttr++;
+        if (d->r != r->r || d->g != r->g || d->b != r->b || d->a != r->a || memcmp(&d->s, &r->s, 8) != 0) {
+            chk_report("attributes", idx, d, r);
+        }
+    }
+#endif
+}
+
+/* Attributes of the vertices in `mask` that still wait for them */
+static void rsp_attrs_compute(uint32_t mask) {
+    mask &= sPending;
+    sPending &= ~mask;
+    GFX_PROF_ENTER(GFX_PROF_ATTR);
+#if RSP_PAIRED
+    // GQRs of rsp_vertex_attrs (texture coordinates): s16 / 32 and float. Nothing in between changes them.
+    __asm__ volatile("mtspr 916, %[gqr]\n\t"
+                     "mtspr 917, %[f32]"
+                     :
+                     : [gqr] "r"(RSP_GQR_S16_ST), [f32] "r"(0));
+#endif
+    while (mask != 0) {
+        int idx = __builtin_ctz(mask);
+
+        mask &= mask - 1;
+        rsp_vertex_attrs(idx);
+    }
+    GFX_PROF_LEAVE();
+}
+
+/* Every waiting vertex gets its attributes now: their inputs are about to change */
+static void rsp_attrs_flush(void) {
+    if (sPending != 0) {
+        rsp_attrs_compute(sPending);
+    }
+}
+
+/* The modelview is about to change: waiting vertices lit by point lights need the current one */
+static void rsp_attrs_before_mv_change(void) {
+    if (sPending != 0 && (sAttr.flags & ATTR_WORLD)) {
+        rsp_attrs_compute(sPending);
+    }
+}
+
+/* rsp_prepare_lights would change the light state the waiting vertices use */
+static bool rsp_lights_stale(void) {
+    int n = sRsp.numLights18 / LIGHT_SIZE;
+
+    if (n > MAX_LIGHTS) {
+        n = MAX_LIGHTS;
+    }
+    return !sRsp.lightsValid || !sRsp.lightsParsed || sRsp.numLights != n;
+}
+
+/* Positions and clip codes of n (>= 1) vertices with the current MVP */
+static void rsp_positions_c(GfxVtx* d, const uint8_t* in, int n) {
+    const float(*m)[4] = (const float(*)[4])sRsp.mvp;
+    int i;
+
+    for (i = 0; i < n; i++, in += 16, d++) {
+        float x = (float)(int16_t)rd16(in);
+        float y = (float)(int16_t)rd16(in + 2);
+        float z = (float)(int16_t)rd16(in + 4);
+
+        d->x = x * m[0][0] + y * m[1][0] + z * m[2][0] + m[3][0];
+        d->y = x * m[0][1] + y * m[1][1] + z * m[2][1] + m[3][1];
+        d->z = x * m[0][2] + y * m[1][2] + z * m[2][2] + m[3][2];
+        d->w = x * m[0][3] + y * m[1][3] + z * m[2][3] + m[3][3];
+        d->clip = rsp_clip_codes(d->x, d->y, d->z, d->w);
+    }
+}
+
+#if RSP_PAIRED
+static void rsp_positions(GfxVtx* d, const uint8_t* in, int n) {
+    uint32_t t0, t1, t2;
+
+    if ((uintptr_t)in & 3) {
+        // Vertices are 8-byte aligned (the RSP's DMA needs that); anything else takes the C path
+        rsp_positions_c(d, in, n);
+        return;
+    }
+
+    /* Per vertex: (x, y) and (z, 1) from the s16 coordinates; (cx, cy) and (cz, cw) as y * row 1, then + x * row 0
+     * (fused), + z * row 2 (fused), + row 3, which is how GCC evaluates x * m0 + y * m1 + z * m2 + m3. Clip codes from
+     * six compares (w <= 0 as w <= -w) and one mfcr: LT|EQ and GT|EQ of each field are combined by shifts. */
+    __asm__ volatile("mtspr 914, %[s16]\n\t"
+                     "mtspr 917, %[f32]\n\t"
+                     "psq_l 0, 0(%[m]), 0, 5\n\t"
+                     "psq_l 1, 8(%[m]), 0, 5\n\t"
+                     "psq_l 2, 16(%[m]), 0, 5\n\t"
+                     "psq_l 3, 24(%[m]), 0, 5\n\t"
+                     "psq_l 4, 32(%[m]), 0, 5\n\t"
+                     "psq_l 5, 40(%[m]), 0, 5\n\t"
+                     "psq_l 6, 48(%[m]), 0, 5\n\t"
+                     "psq_l 7, 56(%[m]), 0, 5\n\t"
+                     "mtctr %[n]\n"
+                     "1:\n\t"
+                     "psq_l 8, 0(%[in]), 0, 2\n\t"
+                     "psq_l 9, 4(%[in]), 1, 2\n\t"
+                     "ps_muls1 10, 2, 8\n\t"
+                     "ps_muls1 11, 3, 8\n\t"
+                     "ps_madds0 10, 0, 8, 10\n\t"
+                     "ps_madds0 11, 1, 8, 11\n\t"
+                     "ps_madds0 10, 4, 9, 10\n\t"
+                     "ps_madds0 11, 5, 9, 11\n\t"
+                     "ps_add 10, 10, 6\n\t"
+                     "ps_add 11, 11, 7\n\t"
+                     "psq_st 10, 0(%[d]), 0, 5\n\t"
+                     "psq_st 11, 8(%[d]), 0, 5\n\t"
+                     "ps_merge11 12, 11, 11\n\t"
+                     "ps_neg 13, 12\n\t"
+                     "fcmpu 0, 10, 13\n\t"     /* x : -w  NEG_X */
+                     "fcmpu 1, 10, 12\n\t"     /* x : w   POS_X */
+                     "fcmpu 2, 11, 12\n\t"     /* z : w   FAR */
+                     "ps_cmpu1 5, 10, 13\n\t"  /* y : -w  NEG_Y */
+                     "ps_cmpu1 6, 10, 12\n\t"  /* y : w   POS_Y */
+                     "fcmpu 7, 12, 13\n\t"     /* w : -w  NEG_W */
+                     "mfcr %[t0]\n\t"
+                     "slwi %[t1], %[t0], 2\n\t"
+                     "slwi %[t2], %[t0], 1\n\t"
+                     "or %[t1], %[t1], %[t0]\n\t" /* LT | EQ at each field's LT bit */
+                     "or %[t2], %[t2], %[t0]\n\t" /* GT | EQ at each field's GT bit */
+                     "rlwinm %[t0], %[t1], 1, 31, 31\n\t"
+                     "rlwimi %[t0], %[t2], 7, 30, 30\n\t"
+                     "rlwimi %[t0], %[t1], 23, 29, 29\n\t"
+                     "rlwimi %[t0], %[t2], 29, 28, 28\n\t"
+                     "rlwimi %[t0], %[t1], 1, 27, 27\n\t"
+                     "rlwimi %[t0], %[t2], 15, 26, 26\n\t"
+                     "stb %[t0], %[clipofs](%[d])\n\t"
+                     "addi %[in], %[in], 16\n\t"
+                     "addi %[d], %[d], %[stride]\n\t"
+                     "bdnz 1b"
+                     : [in] "+b"(in), [d] "+b"(d), [t0] "=&r"(t0), [t1] "=&r"(t1), [t2] "=&r"(t2)
+                     : [m] "b"(&sRsp.mvp[0][0]), [n] "r"(n), [s16] "r"(RSP_GQR_S16), [f32] "r"(0),
+                       [clipofs] "i"(offsetof(GfxVtx, clip)), [stride] "i"(sizeof(GfxVtx))
+                     : "fr0", "fr1", "fr2", "fr3", "fr4", "fr5", "fr6", "fr7", "fr8", "fr9", "fr10", "fr11", "fr12",
+                       "fr13", "cr0", "cr1", "cr2", "cr5", "cr6", "cr7", "ctr", "memory");
+}
+#else
+#define rsp_positions rsp_positions_c
+#endif
+
+#if GFX_VTX_CHECK
+/* The original G_VTX loop, into sRefVtx (check build) */
+static void rsp_vertices_ref(int v0, int n, const uint8_t* in) {
     const uint32_t gm = gGfxRsp.geometryMode;
     const bool lit = (gm & G_LIGHTING) != 0;
     const bool fog = (gm & G_FOG) != 0;
@@ -652,41 +1300,18 @@ static void rsp_vertices(uint32_t w0, uint32_t w1) {
     const bool positional = lit && (gm & G_LIGHTING_POSITIONAL);
     const int32_t scaleS = sRsp.texScale[0], scaleT = sRsp.texScale[1];
     const float fm = (float)gGfxRsp.fogMultiplier, fo = (float)gGfxRsp.fogOffset;
+    const bool needWorld = positional && sRsp.hasPointLight;
     float m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, m30, m31, m32, m33;
-    float wp[3] = { 0.0f, 0.0f, 0.0f }; // vertex in world space (point lights)
-    bool needWorld;
+    float wp[3] = { 0.0f, 0.0f, 0.0f };
     GfxVtx* d;
     int i;
-
-    if (n == 0) {
-        return;
-    }
-    if (v0 < 0 || v0 + n > VTX_COUNT) {
-        LOG_ONCE(LOG_VTX_RANGE, "gfx_rsp: G_VTX of %d at %d is outside the vertex buffer (logged once)", n, v0);
-        if (v0 < 0 || v0 >= VTX_COUNT) {
-            return;
-        }
-        n = VTX_COUNT - v0;
-    }
-    in = rsp_ptr(w1, (uint32_t)n * 16);
-    if (in == NULL) {
-        LOG_ONCE(LOG_BAD_VTX, "gfx_rsp: G_VTX from bad address %08X (logged once)", (unsigned int)w1);
-        return;
-    }
-
-    rsp_prepare_mvp();
-    if (lit) {
-        rsp_prepare_lights();
-    }
-    needWorld = positional && sRsp.hasPointLight;
-    sRsp.vpFlip = (gGfxRsp.viewportScale[0] < 0) != (gGfxRsp.viewportScale[1] < 0);
 
     m00 = sRsp.mvp[0][0], m01 = sRsp.mvp[0][1], m02 = sRsp.mvp[0][2], m03 = sRsp.mvp[0][3];
     m10 = sRsp.mvp[1][0], m11 = sRsp.mvp[1][1], m12 = sRsp.mvp[1][2], m13 = sRsp.mvp[1][3];
     m20 = sRsp.mvp[2][0], m21 = sRsp.mvp[2][1], m22 = sRsp.mvp[2][2], m23 = sRsp.mvp[2][3];
     m30 = sRsp.mvp[3][0], m31 = sRsp.mvp[3][1], m32 = sRsp.mvp[3][2], m33 = sRsp.mvp[3][3];
 
-    d = &sVtx[v0];
+    d = &sRefVtx[v0];
     for (i = 0; i < n; i++, in += 16, d++) {
         float x = (float)(int16_t)rd16(in);
         float y = (float)(int16_t)rd16(in + 2);
@@ -739,6 +1364,97 @@ static void rsp_vertices(uint32_t w0, uint32_t w1) {
         d->s = (float)((s * scaleS) >> 16) * (1.0f / 32.0f);
         d->t = (float)((t * scaleT) >> 16) * (1.0f / 32.0f);
     }
+}
+#endif
+
+/* G_VTX: positions and clip codes now; attributes when a triangle that is drawn uses the vertex */
+static void rsp_vertices(uint32_t w0, uint32_t w1) {
+    int n = (int)((w0 >> 12) & 0xFF);
+    int v0 = (int)((w0 & 0xFF) >> 1) - n;
+    const uint8_t* in;
+    const uint32_t gm = gGfxRsp.geometryMode;
+    const bool lit = (gm & G_LIGHTING) != 0;
+    RspAttrState attr;
+    uint32_t mask;
+    int i;
+
+    if (n == 0) {
+        return;
+    }
+    if (v0 < 0 || v0 + n > VTX_COUNT) {
+        LOG_ONCE(LOG_VTX_RANGE, "gfx_rsp: G_VTX of %d at %d is outside the vertex buffer (logged once)", n, v0);
+        if (v0 < 0 || v0 >= VTX_COUNT) {
+            return;
+        }
+        n = VTX_COUNT - v0;
+    }
+    in = rsp_ptr(w1, (uint32_t)n * 16);
+    if (in == NULL) {
+        LOG_ONCE(LOG_BAD_VTX, "gfx_rsp: G_VTX from bad address %08X (logged once)", (unsigned int)w1);
+        return;
+    }
+    mask = (n == 32) ? 0xFFFFFFFFu : (((1u << n) - 1) << v0);
+
+    // Vertices overwritten here never need their attributes; the others get them before the lights change
+    sPending &= ~mask;
+    attr.flags = (lit ? ATTR_LIT : 0) | ((gm & G_FOG) ? ATTR_FOG : 0) |
+                 ((lit && (gm & G_TEXTURE_GEN)) ? ATTR_TEXGEN : 0) | ((gm & G_TEXTURE_GEN_LINEAR) ? ATTR_TEXGEN_LINEAR : 0) |
+                 ((lit && (gm & G_LIGHTING_POSITIONAL)) ? ATTR_POSITIONAL : 0);
+    attr.scaleS = sRsp.texScale[0];
+    attr.scaleT = sRsp.texScale[1];
+    attr.fogMultiplier = gGfxRsp.fogMultiplier;
+    attr.fogOffset = gGfxRsp.fogOffset;
+    attr.fm = (float)attr.fogMultiplier;
+    attr.fo = (float)attr.fogOffset;
+    if (sPending != 0 && ((lit && rsp_lights_stale()) || attr.flags != (sAttr.flags & ~ATTR_WORLD) ||
+                          attr.scaleS != sAttr.scaleS || attr.scaleT != sAttr.scaleT ||
+                          attr.fogMultiplier != sAttr.fogMultiplier || attr.fogOffset != sAttr.fogOffset)) {
+        rsp_attrs_flush();
+    }
+
+    GFX_PROF_ENTER(GFX_PROF_VSETUP);
+    rsp_prepare_mvp();
+    if (lit) {
+        rsp_prepare_lights();
+        if ((attr.flags & ATTR_POSITIONAL) && sRsp.hasPointLight) {
+            attr.flags |= ATTR_WORLD;
+        }
+    }
+    GFX_PROF_LEAVE();
+    sAttr = attr;
+    sRsp.vpFlip = (gGfxRsp.viewportScale[0] < 0) != (gGfxRsp.viewportScale[1] < 0);
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+    if (lit) {
+        int l, points = 0;
+
+        for (l = 0; l < sRsp.numLights; l++) {
+            points += ((attr.flags & ATTR_POSITIONAL) && sRsp.lights[l].kc != 0);
+        }
+        PROF_COUNT(sProfVtxLit, n);
+        PROF_COUNT(sProfVtxPos, (attr.flags & ATTR_WORLD) ? n : 0);
+        PROF_COUNT(sProfDirEvals, n * (sRsp.numLights - points));
+        PROF_COUNT(sProfPointEvals, n * points);
+        PROF_COUNT(sProfVtxTexgen, (attr.flags & ATTR_TEXGEN) ? n : 0);
+    }
+    PROF_COUNT(sProfVtxFog, (attr.flags & ATTR_FOG) ? n : 0);
+#endif
+
+    rsp_positions(&sVtx[v0], in, n);
+    for (i = 0; i < n; i++) {
+        sVtxIn[v0 + i] = in + 16 * i;
+    }
+    // The second vertex of each pair of the load (light colors: col instead of colc)
+    sVtxOdd = (sVtxOdd & ~mask) | ((((v0 & 1) ? 0x55555555u : 0xAAAAAAAAu)) & mask);
+    sPending |= mask;
+#if GFX_VTX_CHECK
+    rsp_vertices_ref(v0, n, in);
+    for (i = v0; i < v0 + n; i++) {
+        sChkPos++;
+        if (memcmp(&sVtx[i].x, &sRefVtx[i].x, 16) != 0 || sVtx[i].clip != sRefVtx[i].clip) {
+            chk_report("position", i, &sVtx[i], &sRefVtx[i]);
+        }
+    }
+#endif
     sStats.vtx += (uint32_t)n;
 }
 
@@ -753,6 +1469,8 @@ static void rsp_modify_vertex(uint32_t w0, uint32_t w1) {
         LOG_ONCE(LOG_TRI_INDEX, "gfx_rsp: vertex index %d out of range (logged once)", idx);
         return;
     }
+    // Its attributes as G_VTX left them, before the write
+    rsp_attrs_compute(1u << idx);
     v = &sVtx[idx];
     switch (where) {
         case G_MWO_POINT_RGBA:
@@ -834,6 +1552,9 @@ static void rsp_triangle(uint32_t word) {
     }
 
     sStats.drawn++;
+    if (sPending & ((1u << i0) | (1u << i1) | (1u << i2))) {
+        rsp_attrs_compute((1u << i0) | (1u << i1) | (1u << i2));
+    }
     if (!(gGfxRsp.geometryMode & G_SHADING_SMOOTH)) {
         // Flat shading: RGB of the first vertex, alpha of each vertex
         GfxVtx fb = *b, fc = *c;
@@ -941,6 +1662,7 @@ static void rsp_movemem(uint32_t w0, uint32_t w1) {
             break;
         case G_MV_MMTX:
             // Raw load: the microcode does not invalidate the MVP or the light directions here
+            rsp_attrs_before_mv_change();
             mtx_write(sRsp.mv, ofs, src, len);
             break;
         case G_MV_PMTX:
@@ -1052,6 +1774,8 @@ static void rsp_load_ucode(uint32_t w1) {
     // The microcode DMAs from this address as is (physical or KSEG0, never segmented)
     uint32_t text = w1 & 0x1FFFFFFF;
 
+    // Geometry mode, fog, G_TEXTURE and the lights are about to be reset
+    rsp_attrs_flush();
     if (text == symbol_phys(gspS2DEX2_fifoTextStart)) {
         sRsp.s2dex = true;
         gfx_s2dex_load();
@@ -1167,6 +1891,9 @@ void gfx_rsp_reset(void) {
     memset(&gGfxRsp, 0, sizeof(gGfxRsp));
     gGfxRsp.geometryMode = G_CLIPPING;
     memset(sVtx, 0, sizeof(sVtx));
+    sPending = 0;
+    sVtxOdd = 0;
+    memset(&sAttr, 0, sizeof(sAttr));
     gfx_s2dex_reset();
 }
 
@@ -1182,6 +1909,7 @@ void gfx_rsp_run(uint32_t dlAddr) {
     uint64_t start = gc_time_ticks();
     uint64_t elapsed;
 
+    GFX_PROF_ENTER(GFX_PROF_DL);
     while (pc != 0) {
         const uint8_t* p;
         uint32_t w0, w1, op;
@@ -1204,9 +1932,19 @@ void gfx_rsp_run(uint32_t dlAddr) {
 #endif
         pc += 8;
         op = w0 >> 24;
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+        sProfOps[op]++;
+#endif
 
-        if (sRsp.s2dex && rsp_s2dex_command(stack, &sp, &pc, w0, w1)) {
-            continue;
+        if (sRsp.s2dex) {
+            bool done;
+
+            GFX_PROF_ENTER(GFX_PROF_S2D);
+            done = rsp_s2dex_command(stack, &sp, &pc, w0, w1);
+            GFX_PROF_LEAVE();
+            if (done) {
+                continue;
+            }
         }
 
         switch (op) {
@@ -1215,7 +1953,9 @@ void gfx_rsp_run(uint32_t dlAddr) {
                 break;
 
             case G_VTX:
+                GFX_PROF_ENTER(GFX_PROF_VTX);
                 rsp_vertices(w0, w1);
+                GFX_PROF_LEAVE();
                 break;
 
             case G_MODIFYVTX:
@@ -1246,14 +1986,24 @@ void gfx_rsp_run(uint32_t dlAddr) {
             }
 
             case G_TRI1:
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+                prof_tex_draw();
+#endif
+                GFX_PROF_ENTER(GFX_PROF_TRI);
                 rsp_triangle(w0);
+                GFX_PROF_LEAVE();
                 break;
 
             case G_TRI2:
             case G_QUAD:
                 // The microcode draws the second triangle first
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+                prof_tex_draw();
+#endif
+                GFX_PROF_ENTER(GFX_PROF_TRI);
                 rsp_triangle(w1);
                 rsp_triangle(w0);
+                GFX_PROF_LEAVE();
                 break;
 
             case G_LINE3D:
@@ -1342,8 +2092,10 @@ void gfx_rsp_run(uint32_t dlAddr) {
 
             case G_RDPHALF_2:
                 if (sRsp.texrectSet) {
+                    GFX_PROF_ENTER(GFX_PROF_RECT);
                     gfx_rdp_texrect(sRsp.texrectW0, sRsp.texrectW1, sRsp.rdpHalf1, w1,
                                     (sRsp.texrectW0 >> 24) == G_TEXRECTFLIP);
+                    GFX_PROF_LEAVE();
                     sStats.rects++;
                 } else {
                     LOG_ONCE(LOG_HALF2, "gfx_rsp: G_RDPHALF_2 without a texture rectangle (logged once)");
@@ -1352,12 +2104,22 @@ void gfx_rsp_run(uint32_t dlAddr) {
 
             case G_SETOTHERMODE_H:
             case G_SETOTHERMODE_L:
+                GFX_PROF_ENTER(GFX_PROF_RDP);
                 gfx_rdp_command(w0, w1);
+                GFX_PROF_LEAVE();
                 break;
 
             default:
                 if (op >= G_RDPLOADSYNC) {
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+                    if (op == G_SETTIMG || op == G_SETTILE || op == G_SETTILESIZE || op == G_LOADBLOCK ||
+                        op == G_LOADTILE || op == G_LOADTLUT) {
+                        prof_tex_cmd(w0, w1);
+                    }
+#endif
+                    GFX_PROF_ENTER(op == G_FILLRECT ? GFX_PROF_RECT : GFX_PROF_RDP);
                     gfx_rdp_command(w0, w1);
+                    GFX_PROF_LEAVE();
                     if (op == G_FILLRECT) {
                         sStats.rects++;
                     } else if (op == G_SETCIMG || op == G_SETZIMG) {
@@ -1371,6 +2133,7 @@ void gfx_rsp_run(uint32_t dlAddr) {
                 break;
         }
     }
+    GFX_PROF_LEAVE();
 
     elapsed = gc_time_ticks() - start;
     sStats.tasks++;
@@ -1434,6 +2197,13 @@ void gfx_rsp_stats_frame(void) {
                (unsigned int)(sStats.maxTicks * 1000000 / GC_TB_HZ));
         rsp_log_tex_stats();
         rsp_log_s2dex_stats();
+#if GFX_PROF && !defined(GFX_HOST_TEST)
+        prof_log((uint32_t)((now - sStats.lastLog) * 1000 / GC_TB_HZ));
+#endif
+#if GFX_VTX_CHECK && !defined(GFX_HOST_TEST)
+        gc_log("gfx_rsp: vtx check: %u positions, %u attribute sets, %u matrices compared since boot, %u differ",
+               (unsigned int)sChkPos, (unsigned int)sChkAttr, (unsigned int)sChkMtx, (unsigned int)sChkBad);
+#endif
     }
     memset(&sStats, 0, sizeof(sStats));
     sStats.lastLog = now;

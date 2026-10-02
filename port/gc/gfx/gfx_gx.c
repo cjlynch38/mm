@@ -15,20 +15,38 @@
  * z_gx = GX_ZK * (ndc - 1) * w and deriving the GX viewport near/far from the N64 viewport's z scale and
  * translation (gx_viewport_n64). GX_ZK < 1/2 puts GX's near clip plane closer to the eye than the N64's
  * (see GX_NDC_NEAR); the far clip plane is the N64's, which F3DZEX2 also clips against.
+ *
+ * CPU/GPU overlap: a task ends after queueing the EFB -> XFB copy and a draw sync token behind it, without waiting
+ * for GX. GX finishes the frame while the game runs its next frame; gfx_gx_present shows the XFB once the token has
+ * come back (nearly always already the case), and the next task begins by waiting for GX (gfx_tex.c and gfx_fb.c
+ * expect an idle GX at task start). -DGFX_LAZY_SYNC=0 waits at the end of each task instead.
+ *
+ * Texture coordinates divide by the texture size like gfx_tex_uv; for power-of-two sizes the division is a
+ * multiplication by the exact reciprocal (the same float), prepared when the binding changes (gx_uv_update).
  */
 #include <gccore.h>
 #include <math.h>
 #include <ogc/lwp_watchdog.h>
 #include <ogc/machine/processor.h>
 #include <string.h>
+#include <unistd.h>
 #include "gc_ogc.h"
 #include "gfx_internal.h"
+#include "gfx_prof.h"
 
 #define GX_FIFO_SIZE (256 * 1024)
 #ifndef XFB_SLOTS
 #define XFB_SLOTS 3 /* -DXFB_SLOTS=2 tests the low-memory path */
 #endif
 #define XFB_SLOTS_MIN 2
+/* 1: a task ends without waiting for GX; the display copy is fenced with a draw sync token (gfx_gx_present) and the
+ * next task begins by waiting for GX. 0: wait at the end of each task, as before. */
+#ifndef GFX_LAZY_SYNC
+#define GFX_LAZY_SYNC 1
+#endif
+#ifndef GFX_VTX_CHECK
+#define GFX_VTX_CHECK 0
+#endif
 #define BATCH_TRIS 128
 #define BATCH_VERTS (BATCH_TRIS * 3)
 
@@ -91,6 +109,8 @@ typedef struct {
     u32 key;    /* N64 framebuffer (KSEG0 form) whose frame this slot holds, 0 = none */
     u32 stamp;  /* order of the last render or presentation, for LRU */
     bool busy;  /* being copied into */
+    bool copying; /* the copy was issued but GX may not have finished it: wait for `token` before showing it */
+    u16 token;  /* draw sync token sent after the copy */
 } XfbSlot;
 
 typedef struct {
@@ -112,6 +132,8 @@ static XfbSlot sSlots[XFB_SLOTS];
 static int sSlotCount;
 static int sPresented = -1; /* slot most recently handed to the VI */
 static u32 sStamp;
+static u16 sCopyToken;      /* draw sync token of the last display copy */
+static bool sGpuBusy;       /* a task ended without waiting for GX (the next task begins with the wait) */
 
 /* Render target of the current task */
 static u32 sFrameKey;    /* the frame's color image (KSEG0 form), 0 until the first draw */
@@ -151,6 +173,17 @@ static GfxTexBinding sTex[2] = {
     { .width = 1, .height = 1, .sShiftScale = 1.0f, .tShiftScale = 1.0f },
     { .width = 1, .height = 1, .sShiftScale = 1.0f, .tShiftScale = 1.0f },
 };
+/* gfx_tex_uv of each binding, prepared when sTex changes (gx_uv_update): a division by a power of two is a
+ * multiplication by its exact reciprocal, which gives the same float; other sizes still divide. */
+typedef struct {
+    float sScale, sOffset, tScale, tOffset;
+    float width, height;
+    float invWidth, invHeight; /* 0: divide */
+} GxUv;
+static GxUv sUv[2] = {
+    { 1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+    { 1.0f, 0.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f },
+};
 static int sNumTex = -1;          /* texture coordinates in the vertex format */
 static VMode sVMode = VMODE_NONE; /* loaded into GX */
 static VMode sTriVMode;           /* for triangles under the current state (one may still take the CPU path) */
@@ -177,7 +210,7 @@ static struct {
 static u64 sStatsStart;
 static u64 sTaskStart;
 static int sLogCount, sLogBindCount;
-static bool sLoggedNoFrame, sLoggedCpuProj, sLoggedFillZ;
+static bool sLoggedNoFrame, sLoggedCpuProj, sLoggedFillZ, sLoggedCopyWait;
 
 static inline u32 gx_key(u32 addr) {
     return (addr == 0) ? 0 : ((addr & 0x1FFFFFFF) | 0x80000000);
@@ -253,6 +286,9 @@ void gfx_gx_init(void) {
     }
 
     GX_Init(sFifo, GX_FIFO_SIZE);
+    // Display copy tokens continue from what the token register holds (the loader may have left any value in it):
+    // gx_token_reached compares within half the 16-bit range
+    sCopyToken = GX_GetDrawSync();
 
     // EFB at 2x the N64 resolution, copied to an XFB of the TV mode (scaled vertically for 50 Hz modes)
     GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
@@ -491,19 +527,26 @@ static void gx_set_target_scale(int scale, int w, int h) {
 static void gx_use_frame(void) {
     if (sCanvasKey != 0) {
         gfx_gx_flush();
+        GFX_PROF_ENTER(GFX_PROF_FB);
         gfx_fb_canvas_end();
+        GFX_PROF_LEAVE();
         sCanvasKey = 0;
         gx_set_target_scale(GFX_SCALE, GFX_EFB_WIDTH, GFX_EFB_HEIGHT);
     }
 }
 
 static bool gx_use_canvas(u32 key) {
+    bool ok;
+
     // The same address with another pixel size or width is another image for gfx_fb.c (and another canvas width)
     if (sCanvasKey == key && sCanvasSiz == gGfxRdp.colorImageSiz && sTargetW == gGfxRdp.colorImageWidth) {
         return true;
     }
     gfx_gx_flush();
-    if (!gfx_fb_canvas_begin(key, gGfxRdp.colorImageFmt, gGfxRdp.colorImageSiz, gGfxRdp.colorImageWidth)) {
+    GFX_PROF_ENTER(GFX_PROF_FB);
+    ok = gfx_fb_canvas_begin(key, gGfxRdp.colorImageFmt, gGfxRdp.colorImageSiz, gGfxRdp.colorImageWidth);
+    GFX_PROF_LEAVE();
+    if (!ok) {
         return false;
     }
     sCanvasKey = key;
@@ -515,14 +558,18 @@ static bool gx_use_canvas(u32 key) {
 /* Render target for a draw under the current color image: the frame, a depth clear (`fill`: FILL mode into the z
  * image), or an off-screen image. Switching between the frame and off-screen images happens here, before the draw
  * binds its textures. */
-static Target gx_target(bool fill) {
+static inline bool gx_target_same(bool fill) {
+    return sTargetValid && gGfxRdp.colorImageAddr == sTargetCimg && gGfxRdp.zImageAddr == sTargetZimg &&
+           fill == sTargetFill && gGfxRdp.colorImageSiz == sTargetSiz && gGfxRdp.colorImageWidth == sTargetWidth;
+}
+
+static Target gx_target_slow(bool fill) {
     u32 cimg = gGfxRdp.colorImageAddr;
     u32 zimg = gGfxRdp.zImageAddr;
     u32 key;
     bool isZ;
 
-    if (sTargetValid && cimg == sTargetCimg && zimg == sTargetZimg && fill == sTargetFill &&
-        gGfxRdp.colorImageSiz == sTargetSiz && gGfxRdp.colorImageWidth == sTargetWidth) {
+    if (gx_target_same(fill)) {
         return sTarget;
     }
     sTargetCimg = cimg;
@@ -562,6 +609,10 @@ static Target gx_target(bool fill) {
     return sTarget;
 }
 
+static inline Target gx_target(bool fill) {
+    return gx_target_same(fill) ? sTarget : gx_target_slow(fill);
+}
+
 /* Whether a rectangle sets each of its pixels without reading the color image: no memory reads in the blender
  * (IM_RD), no alpha compare dropping pixels */
 static bool gx_rect_opaque(void) {
@@ -591,7 +642,9 @@ static void gx_canvas_draw(float x0, float y0, float x1, float y1, bool opaque) 
     if (opaque && (x0 != (float)(int)x0 || y0 != (float)(int)y0 || x1 != (float)(int)x1 || y1 != (float)(int)y1)) {
         opaque = (float)ix0 >= x0 && (float)iy0 >= y0 && (float)ix1 <= x1 && (float)iy1 <= y1;
     }
+    GFX_PROF_ENTER(GFX_PROF_FB);
     gfx_fb_canvas_draw(ix0, iy0, ix1, iy1, opaque);
+    GFX_PROF_LEAVE();
     sStats.canvasDraws++;
 }
 
@@ -616,11 +669,40 @@ static void gx_set_num_tex(int numTex) {
     sNumTex = numTex;
 }
 
+/* sTex[index] changed */
+static void gx_uv_update(int index) {
+    const GfxTexBinding* b = &sTex[index];
+    GxUv* u = &sUv[index];
+
+    u->sScale = b->sShiftScale;
+    u->sOffset = b->sOffset;
+    u->tScale = b->tShiftScale;
+    u->tOffset = b->tOffset;
+    u->width = (float)b->width;
+    u->height = (float)b->height;
+    u->invWidth = (b->width != 0 && (b->width & (b->width - 1)) == 0) ? 1.0f / u->width : 0.0f;
+    u->invHeight = (b->height != 0 && (b->height & (b->height - 1)) == 0) ? 1.0f / u->height : 0.0f;
+}
+
+/* gfx_tex_uv (gfx_internal.h) with the prepared sizes: the same expressions and floats */
+static inline void gx_uv(const GxUv* u, float s, float t, float* ou, float* ov) {
+    float ns = s * u->sScale - u->sOffset;
+    float nt = t * u->tScale - u->tOffset;
+
+    *ou = (u->invWidth != 0.0f) ? ns * u->invWidth : ns / u->width;
+    *ov = (u->invHeight != 0.0f) ? nt * u->invHeight : nt / u->height;
+}
+
 static void gx_bind(int index, int tile) {
     GfxTexBinding* b = &sTex[index];
     int texMap = (index == 0) ? GX_TEXMAP0 : GX_TEXMAP1;
+    bool ok;
 
-    if (gfx_tex_bind(tile & 7, texMap, b) && b->valid) {
+    GFX_PROF_ENTER(GFX_PROF_BIND);
+    ok = gfx_tex_bind(tile & 7, texMap, b) && b->valid;
+    GFX_PROF_LEAVE();
+    gx_uv_update(index);
+    if (ok) {
         return;
     }
 #ifdef GFX_TEX_FAIL_TRACE
@@ -662,6 +744,7 @@ static void gx_bind(int index, int tile) {
     b->width = 8;
     b->height = 4;
     b->sShiftScale = b->tShiftScale = 1.0f;
+    gx_uv_update(index);
 }
 
 /* Make the RAM a tile was loaded from current, if the renderer drew there (VisMono and PreRender's coverage load
@@ -682,7 +765,9 @@ static void gx_sync_tile_source(int tile) {
     if (gGfxRdp.texImageWidth > 1) {
         addr += (t->ult >> 2) * stride;
     }
+    GFX_PROF_ENTER(GFX_PROF_FB);
     gfx_fb_sync_ram((const void*)addr, (rows + 1) * rowBytes);
+    GFX_PROF_LEAVE();
 }
 
 /* Bring GX up to date with the RSP/RDP state for a draw of `kind` reading tile `tile` (and tile + 1). */
@@ -693,18 +778,23 @@ static void gx_prepare_slow(GfxPrimKind kind, int tile) {
     bool oldDecal = sInfo.decal;
 
     gfx_gx_flush();
+    GFX_PROF_ENTER(GFX_PROF_PREP);
 
-    if (full || (dirty & ~(GFX_DIRTY_SCISSOR | GFX_DIRTY_VIEWPORT))) {
+    if (full || (dirty & ~(GFX_DIRTY_SCISSOR | GFX_DIRTY_VIEWPORT | GFX_DIRTY_TEXTURES))) {
         bool used0 = sInfo.usesTexel0, used1 = sInfo.usesTexel1;
 
+        GFX_PROF_ENTER(GFX_PROF_TEV);
         gfx_tev_apply(kind, &sInfo);
+        GFX_PROF_LEAVE();
         if (full || (dirty & (GFX_DIRTY_TEXTURES | GFX_DIRTY_OTHERMODE)) || tile != sTexTile ||
             (sInfo.usesTexel0 && !used0) || (sInfo.usesTexel1 && !used1)) {
             sTexBound[0] = sTexBound[1] = false;
         }
         sKind = kind;
         sZPrim = (kind == GFX_PRIM_TRIANGLE) && (gGfxRdp.otherModeL & G_ZS_PRIM);
-    } else if (tile != sTexTile) {
+    } else if ((dirty & GFX_DIRTY_TEXTURES) || tile != sTexTile) {
+        // Only tiles, loads or G_TEXTURE changed: gfx_tev_apply reads none of them (combiner, other modes, colors and
+        // geometry mode are as last applied), the textures are bound again
         sTexBound[0] = sTexBound[1] = false;
     }
 
@@ -762,6 +852,7 @@ static void gx_prepare_slow(GfxPrimKind kind, int tile) {
 
     gGfxRdp.dirty = 0;
     sStateValid = true;
+    GFX_PROF_LEAVE();
 }
 
 static inline void gx_prepare(GfxPrimKind kind, int tile) {
@@ -806,6 +897,7 @@ void gfx_gx_flush(void) {
     if (sBatchCount == 0) {
         return;
     }
+    GFX_PROF_ENTER(GFX_PROF_FLUSH);
     GX_Begin(GX_TRIANGLES, GX_VTXFMT0, sBatchCount);
     switch (sNumTex) {
         case 0:
@@ -833,6 +925,7 @@ void gfx_gx_flush(void) {
     GX_End();
     sStats.batches++;
     sBatchCount = 0;
+    GFX_PROF_LEAVE();
 }
 
 static inline BatchVtx* gx_batch_alloc(int count) {
@@ -846,12 +939,37 @@ static inline BatchVtx* gx_batch_alloc(int count) {
     return v;
 }
 
+#if GFX_VTX_CHECK
+/* Check build (-DGFX_VTX_CHECK=1): every texture coordinate against gfx_tex_uv */
+static u32 sChkUv, sChkUvBad;
+
+static void gx_uv_check(const GfxTexBinding* b, float s, float t, float u, float v) {
+    float ru, rv;
+
+    gfx_tex_uv(b, s, t, &ru, &rv);
+    sChkUv++;
+    if (memcmp(&ru, &u, sizeof(u)) != 0 || memcmp(&rv, &v, sizeof(v)) != 0) {
+        if (sChkUvBad++ < 16) {
+            gc_log("gx: uv check: (%08X, %08X) size %ux%u: got %08X %08X, want %08X %08X", *(const u32*)&s,
+                   *(const u32*)&t, b->width, b->height, *(const u32*)&u, *(const u32*)&v, *(const u32*)&ru,
+                   *(const u32*)&rv);
+        }
+    }
+}
+#endif
+
 static inline void gx_texcoords(BatchVtx* out, float s, float t) {
     if (sNumTex >= 1) {
-        gfx_tex_uv(&sTex[0], s, t, &out->u0, &out->v0);
+        gx_uv(&sUv[0], s, t, &out->u0, &out->v0);
+#if GFX_VTX_CHECK
+        gx_uv_check(&sTex[0], s, t, out->u0, out->v0);
+#endif
     }
     if (sNumTex >= 2) {
-        gfx_tex_uv(&sTex[1], s, t, &out->u1, &out->v1);
+        gx_uv(&sUv[1], s, t, &out->u1, &out->v1);
+#if GFX_VTX_CHECK
+        gx_uv_check(&sTex[1], s, t, out->u1, out->v1);
+#endif
     }
 }
 
@@ -859,7 +977,7 @@ static inline bool gx_fits_persp(const GfxVtx* v) {
     return fabsf(v->z - (sProjA * v->w + sProjB)) <= PERSP_FIT_TOLERANCE * (fabsf(v->w) + 1.0f);
 }
 
-void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
+static void gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
     const GfxVtx* vtx[3] = { v0, v1, v2 };
     BatchVtx* out;
     bool cpu;
@@ -922,6 +1040,12 @@ void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
     if (target == TARGET_FRAME) {
         sColorClean = sDepthClean = false;
     }
+}
+
+void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
+    GFX_PROF_ENTER(GFX_PROF_GXTRI);
+    gx_triangle(v0, v1, v2);
+    GFX_PROF_LEAVE();
 }
 
 /* Quad in N64 screen pixels as two triangles (VMODE_SCREEN). st[i] are the texel coordinates of the
@@ -1042,8 +1166,15 @@ static bool gx_vismono(float ulx, float uly, float lrx, float lry, int tile, flo
         return false;
     }
     // The rectangles go down the frame, each reading rows not drawn yet: one copy of the frame serves them all
-    if (y0 != sVisMonoNext && !gfx_fb_frame_texture(&sVisMonoTex)) {
-        return false;
+    if (y0 != sVisMonoNext) {
+        bool ok;
+
+        GFX_PROF_ENTER(GFX_PROF_FB);
+        ok = gfx_fb_frame_texture(&sVisMonoTex);
+        GFX_PROF_LEAVE();
+        if (!ok) {
+            return false;
+        }
     }
     sVisMonoNext = (int)ceilf(lry);
 
@@ -1054,6 +1185,7 @@ static bool gx_vismono(float ulx, float uly, float lrx, float lry, int tile, flo
     sTex[0].width = GFX_N64_WIDTH;
     sTex[0].height = GFX_N64_HEIGHT;
     sTex[0].sShiftScale = sTex[0].tShiftScale = 1.0f;
+    gx_uv_update(0);
     memset(&sInfo, 0, sizeof(sInfo));
     gx_set_vmode(VMODE_SCREEN);
     gx_apply_scissor();
@@ -1156,6 +1288,8 @@ void gfx_gx_image_rect(float ulx, float uly, float lrx, float lry, const GfxTexB
     sTex[1].width = 8;
     sTex[1].height = 4;
     sTex[1].sShiftScale = sTex[1].tShiftScale = 1.0f;
+    gx_uv_update(0);
+    gx_uv_update(1);
     gx_prepare(GFX_PRIM_TEXRECT, GX_TILE_IMAGE);
     if (sScissorEmpty) {
         return;
@@ -1333,11 +1467,28 @@ void gfx_gx_state_lost(void) {
 /* ============================================================================================== */
 
 void gfx_gx_task_begin(void) {
+    GFX_PROF_TASK_BEGIN();
     // The thread that writes the FIFO is the one GX suspends when the FIFO fills up
     if (GX_GetCurrentGXThread() != LWP_GetSelf()) {
         GX_SetCurrentGXThread();
     }
     sTaskStart = gettime();
+    if (sGpuBusy) {
+        // The last task's draws and display copy finish before this task changes textures or reads anything GX
+        // wrote (gfx_tex.c and gfx_fb.c assume an idle GX at task start). Usually long done by now.
+        u32 level;
+        int i;
+
+        GFX_PROF_ENTER(GFX_PROF_WAIT);
+        GX_DrawDone();
+        GFX_PROF_LEAVE();
+        sGpuBusy = false;
+        _CPU_ISR_Disable(level);
+        for (i = 0; i < sSlotCount; i++) {
+            sSlots[i].copying = false;
+        }
+        _CPU_ISR_Restore(level);
+    }
     sFrameKey = 0;
     sTargetValid = false;
     sStateValid = false;
@@ -1366,6 +1517,9 @@ static void gx_log_stats(u64 now) {
            sStats.rects / tasks, sStats.batches / tasks, sStats.fillQuads, sStats.depthQuads, sStats.fillsSkipped,
            sStats.canvasDraws, sStats.offscreen, sStats.visMono, (u32)ticks_to_microsecs(sStats.taskTicks / tasks),
            (u32)ticks_to_microsecs(sStats.maxTaskTicks));
+#if GFX_VTX_CHECK
+    gc_log("gx: uv check: %u texture coordinates compared since boot, %u differ", sChkUv, sChkUvBad);
+#endif
     gfx_fb_take_stats(&fb);
     if (fb.readbacks != 0 || fb.passes != 0 || fb.depthWrites != 0) {
         gc_log("gx: fb: %u frame readbacks (%u rows), %u off-screen passes, %u writes and %u loads of off-screen "
@@ -1420,11 +1574,14 @@ void gfx_gx_task_end(void) {
     int slot = -1;
     int i;
 
+    GFX_PROF_ENTER(GFX_PROF_END);
     gfx_gx_flush();
     // An off-screen pass still open ends here; the z-buffer's RAM gets the frame's depth if the task cleared it
     // and drew no colors into it since
     gx_use_frame();
+    GFX_PROF_ENTER(GFX_PROF_FB);
     gfx_fb_task_end(gfx_addr(gGfxRdp.zImageAddr), sDepthFilled && !sDepthColored);
+    GFX_PROF_LEAVE();
 
     if (key != 0) {
         // With 3 XFBs one is always free; with 2, the previous frame stays on screen until the next retrace
@@ -1440,10 +1597,20 @@ void gfx_gx_task_end(void) {
         GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
         GX_SetCopyClear(sClearColor, GX_MAX_Z24);
         GX_CopyDisp(sSlots[slot].xfb, GX_TRUE);
+        // Written to the PE token register once the copy is in the XFB (gfx_gx_present waits for it)
+        GX_SetDrawSync(++sCopyToken);
         sStateValid = false;
         gfx_tev_invalidate();
     }
+#if GFX_LAZY_SYNC
+    // No wait here: GX finishes the frame while the game runs, and the next task begins by waiting for it
+    GX_Flush();
+    sGpuBusy = true;
+#else
+    GFX_PROF_ENTER(GFX_PROF_WAIT);
     GX_DrawDone();
+    GFX_PROF_LEAVE();
+#endif
 
     if (slot >= 0) {
         sColorClean = sDepthClean = true;
@@ -1456,6 +1623,8 @@ void gfx_gx_task_end(void) {
         }
         sSlots[slot].key = key;
         sSlots[slot].stamp = ++sStamp;
+        sSlots[slot].copying = GFX_LAZY_SYNC;
+        sSlots[slot].token = sCopyToken;
         sSlots[slot].busy = false;
         _CPU_ISR_Restore(level);
         sStats.frames++;
@@ -1474,12 +1643,49 @@ void gfx_gx_task_end(void) {
     if (ticks_to_millisecs(now - sStatsStart) >= STATS_INTERVAL_MS) {
         gx_log_stats(now);
     }
+    GFX_PROF_LEAVE();
+    GFX_PROF_TASK_END();
+}
+
+/* GX has written the PE token register with `token` or a later one (tokens increase; GX processes them in order) */
+static inline bool gx_token_reached(u16 token) {
+    return (s16)(GX_GetDrawSync() - token) >= 0;
+}
+
+/* VI thread: the copy into a slot about to be shown may still be running (gfx_gx_task_end does not wait for it).
+ * It is nearly always done by the retrace after the game swaps; otherwise wait for its token, which is at most the
+ * GX work queued at the end of the task. The wait sleeps between polls: this thread runs above every game thread
+ * and the audio thread, and spinning would keep them off the CPU until GX is done (the frame is latched at the
+ * next retrace anyway). */
+#define COPY_WAIT_POLL_US 100
+static void gx_wait_copy(int slot, u16 token) {
+    u64 start = gettime();
+    u32 level;
+
+    while (!gx_token_reached(token)) {
+        if (ticks_to_millisecs(gettime() - start) > 100) {
+            if (!sLoggedCopyWait) {
+                sLoggedCopyWait = true;
+                gc_log("gfx: display copy not finished after 100 ms (token %u, GX at %u), shown anyway (logged once)",
+                       token, GX_GetDrawSync());
+            }
+            break;
+        }
+        usleep(COPY_WAIT_POLL_US);
+    }
+    _CPU_ISR_Disable(level);
+    if (sSlots[slot].token == token) {
+        sSlots[slot].copying = false;
+    }
+    _CPU_ISR_Restore(level);
 }
 
 void gfx_gx_present(const void* n64Framebuffer) {
     u32 key = gx_key((u32)n64Framebuffer);
     u32 level;
     void* xfb = NULL;
+    bool copying = false;
+    u16 token = 0;
     int i;
 
     if (!sReady || key == 0) {
@@ -1495,10 +1701,16 @@ void gfx_gx_present(const void* n64Framebuffer) {
         sPresented = i;
         sSlots[i].stamp = ++sStamp;
         xfb = sSlots[i].xfb;
+        copying = sSlots[i].copying;
+        token = sSlots[i].token;
     }
     _CPU_ISR_Restore(level);
 
     if (xfb != NULL) {
+        // (sPresented keeps gx_pick_slot away from this slot while it waits)
+        if (copying) {
+            gx_wait_copy(i, token);
+        }
         gc_ogc_video_show_frame(xfb);
     } else if (i >= sSlotCount && sStamp != 0 && !sLoggedNoFrame) {
         // (before the first rendered frame this is the boot framebuffer: not interesting)

@@ -747,7 +747,9 @@ static void TestFlash(void) {
         gc_log("flash: stored after one failed write, %u ms after the change", waited);
         CHECK_EQ(mock_save_store_attempts(), attempts0 + 2);
         CHECK_EQ(mock_save_stores(), stores0 + 3);
-        CHECK((waited >= 1980) && (waited <= 4500));
+        // The retry comes 1 s after the failed attempt. The attempt itself may come earlier than 1 s after this
+        // change when the writer's delay from the previous step is still running, so only the retry gap is bounded.
+        CHECK((waited >= 980) && (waited <= 4500));
         CHECK(Equal(mock_saved_image() + 0x300 * FLASH_BLOCK_SIZE, sFlashData, FLASH_BLOCK_SIZE));
 
         // ... but not forever: after the first attempt and 3 retries it waits for the next change

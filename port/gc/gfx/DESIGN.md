@@ -11,11 +11,13 @@ On the GameCube, `gc_gfx_run_task()` interprets the list on the CPU and draws th
 sp.c osSpTaskStartGo(M_GFXTASK) -> gc_gfx_run_task(data_ptr)        [Sched thread]
     gfx_gx_task_begin, gfx_rsp_reset, gfx_rdp_reset, gfx_tex_frame
     gfx_rsp_run(dl): RSP commands
-        G_VTX     -> transform, light, fog, texgen into the vertex buffer (GfxVtx[32])
+        G_VTX     -> positions and clip codes into the vertex buffer (GfxVtx[32]); lighting, fog and
+                     texgen are computed lazily, when a triangle using the vertex survives reject/cull
         G_TRI*    -> cull (winding), then gfx_gx_triangle
         G_MTX ... -> matrix stacks; gfx_gx_set_projection on projection changes
         RDP cmds  -> gfx_rdp_command / gfx_rdp_texrect -> gfx_gx_texrect / gfx_gx_fillrect
-    gfx_gx_task_end: GX_DrawDone, EFB -> XFB slot for the frame's color image
+    gfx_gx_task_end: queue EFB -> XFB copy for the frame's color image + a draw-sync token (no wait;
+                     the next task begins with GX_DrawDone, present waits for the token)
     then sp.c posts OS_EVENT_SP / OS_EVENT_DP as before
 vi.c retrace: current buffer changed -> gc_gfx_present(fb) -> VIDEO_SetNextFramebuffer(xfb[fb])
 ```
@@ -312,6 +314,37 @@ requires 4,104 KiB plus a 1,536 KiB reserve for the game; with less it logs the 
 the renderer off (console display, tasks skipped) instead of starving the game. The renderer is
 initialised at the end of gc_ogc_boot, after the ROM preload, so the 5.75 MiB moved to ARAM is what
 makes it fit.
+
+## Performance (Milestone 6)
+
+Measured in Dolphin (emulated time), output verified identical by in-game check builds:
+- **West Clock Town:** gfx task 17.5 → 9.1 ms.
+- **Motion blur:** 16 → 6 ms.
+- **End-of-day shrink:** extra cost +19 → +5 ms.
+
+The rules the optimizations rely on:
+- **Paired singles (gfx_rsp.c).** Positions, clip codes and matrix parsing/products use psq_l/ps_*
+  in the same operation order GCC emits for the scalar C, so results are bit-identical.
+  `GFX_VTX_CHECK=1` runs the old eager C pipeline alongside and logs any difference: run it once on
+  hardware.
+- **GQR2-5 are reserved for the renderer:** GQR2 = s16, GQR3 = u16/65536, GQR4 = s16/32, GQR5 =
+  float. gfx_rsp.c sets them before each use. libogc's context switch does not save GQRs, so any
+  other code that uses GQR2-5 must restore them.
+- **Lazy attributes.** Lighting, fog and ST are computed when a triangle first needs a vertex, about
+  45% of vertices. State changes that would alter them (light rebuilds, modelview under point lights,
+  G_MODIFYVTX, microcode switches, a G_VTX with recorded state) flush pending vertices first.
+- **Lazy GX sync (gfx_gx.c, `GFX_LAZY_SYNC=1`).** Task end queues the display copy and a PE draw-sync
+  token instead of GX_DrawDone. The next task begins with GX_DrawDone, so gfx_tex/gfx_fb see an idle
+  GX. gfx_gx_present waits (sleeping, at most 100 ms) for the slot's token. The token counter starts
+  from the PE register's value at boot. `-DGFX_LAZY_SYNC=0` restores the synchronous behaviour if
+  hardware shows torn frames.
+- **Power-of-two UV reciprocals.** Per-vertex texture coordinate divides become a multiply by an
+  exact reciprocal prepared when the binding changes.
+- **GPU-side backgrounds (gfx_fb.c, gfx_s2dex.c).** S2DEX2 backgrounds whose source is the current
+  frame, or an image the renderer itself produced, are drawn from a GPU EFB copy instead of a RAM round
+  trip through the texture cache. Render-target images stay out of the LRU cache. A binding falls
+  back to the RAM path if the copy buffer would be reused before its draw is queued.
+- `GFX_PROF=1` (gfx_prof.h) gives a per-phase profile in the `gfx_prof:` log lines.
 
 ## Debugging
 

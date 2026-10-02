@@ -309,6 +309,7 @@ typedef struct {
     uint16_t frameWidth;       /* its pixels per row */
     int16_t dirtyY0, dirtyY1;  /* N64 rows [y0, y1) drawn in the EFB since the frame's RAM was last written */
     bool canvasDirty;          /* the off-screen image being drawn has EFB pixels that are not in RAM yet */
+    uint32_t frameGen;         /* counts draws into the frame (copies of it made before a draw are out of date) */
 } GfxFbState;
 
 extern GfxFbState gGfxFb;
@@ -321,6 +322,7 @@ static inline void gfx_fb_frame_drawn(int y0, int y1) {
     if (y1 > gGfxFb.dirtyY1) {
         gGfxFb.dirtyY1 = y1;
     }
+    gGfxFb.frameGen++;
 }
 
 /** True if some N64 image has newer pixels in the EFB than in RAM (gfx_fb_sync_ram would have work to do). */
@@ -346,6 +348,33 @@ void gfx_fb_set_frame(uint32_t key, uint16_t width);
  * callers of gfx_tex_bind_image().
  */
 void gfx_fb_sync_ram(const void* addr, uint32_t bytes);
+
+/** Binds an image from RAM as gfx_tex_bind_image() does (gfx_fb_bind_image's way back to RAM; passed in, so that
+ *  gfx_fb.c does not depend on gfx_tex.c) */
+typedef bool (*GfxBindImageFn)(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height,
+                               uint16_t stride, const void* tlut, bool tlutIA, bool linear, int texMap,
+                               GfxTexBinding* out);
+
+/**
+ * Bind an RGBA16 image the renderer holds on the GPU to `texMap`, instead of gfx_fb_sync_ram() + gfx_tex_bind_image():
+ * the frame (`addr` is the task's frame and every row of its RAM is, or would be after gfx_fb_sync_ram, what the EFB
+ * holds: an EFB copy at N64 size), or the off-screen image last written to RAM whole (the EFB copy that wrote it, while
+ * its RAM still matches: checked once per task). The texture is exactly what gfx_tex_bind_image would make after
+ * gfx_fb_sync_ram (RGB5A3 texels of RGBA5551 pixels with the alpha bit set, `width` x `height`, clamp, `linear`
+ * filtering) and so is the binding, without the RAM round trip, hashing or texture cache entry; the frame's RAM stays
+ * pending. Images of GFX_N64_WIDTH x GFX_N64_HEIGHT pixels (`stride` the same width) only. False: bind it from RAM.
+ * Batched draws are submitted first (gfx_gx_flush).
+ * The texture lives in memory gfx_fb.c reuses for its own copies. Draws queued before a reuse still read it (EFB copies
+ * are executed after them; CPU writes wait for them), but gfx_gx_image_rect() selects its render target and prepares
+ * the canvas (which can write or load an off-screen image) after the caller bound the texture and before it queues
+ * the draw. So until gfx_fb_image_done(), a reuse first moves the binding to RAM: the image's pixels go to RAM if it is
+ * the frame, and `fromRam` (gfx_tex_bind_image) binds it to `texMap` from there, the same texels and binding.
+ */
+bool gfx_fb_bind_image(const void* addr, uint16_t width, uint16_t height, uint16_t stride, bool linear, int texMap,
+                       GfxBindImageFn fromRam, GfxTexBinding* out);
+/** Every draw of the image gfx_fb_bind_image() served last has been issued (after the background's last
+ *  gfx_gx_image_rect): its memory may be reused without moving the binding to RAM. */
+void gfx_fb_image_done(void);
 
 /**
  * Off-screen pass (gfx_gx.c): from now on draws go to the N64 color image `key` (fmt/siz, `width` pixels per row)
@@ -391,8 +420,9 @@ void gfx_fb_take_stats(GfxFbStats* out);
 void gfx_s2dex_reset(void);
 /** G_LOAD_UCODE of S2DEX2: its DMEM data comes back (object render mode, status words, 2D matrix). */
 void gfx_s2dex_load(void);
-/** Execute an S2DEX2-only command (G_BG_*, G_OBJ_*). Backgrounds are drawn from the whole image in RAM
- *  (gfx_fb_sync_ram, gfx_tex_bind_image, gfx_gx_image_rect); sprites as the microcode draws them, with RDP commands
+/** Execute an S2DEX2-only command (G_BG_*, G_OBJ_*). Backgrounds are drawn from the whole image (gfx_fb_bind_image
+ *  for the frame and captures, else gfx_fb_sync_ram + gfx_tex_bind_image from RAM; gfx_gx_image_rect); sprites as the
+ *  microcode draws them, with RDP commands
  *  (render tile, TMEM loads, texture rectangles) through gfx_rdp_command() / gfx_rdp_texrect(). Returns false if
  *  the opcode is not one of them (G_SELECT_DL and the commands shared with F3DEX2 are gfx_rsp.c's). */
 bool gfx_s2dex_command(uint32_t w0, uint32_t w1);

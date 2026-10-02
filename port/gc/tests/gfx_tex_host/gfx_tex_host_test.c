@@ -1722,6 +1722,66 @@ static void test_cache_basic(void) {
     test_end();
 }
 
+/* Rewrites the once-per-task content check (the hash) must notice: rows scrolled by one, words swapped or changed in
+ * opposite directions a 32-byte block apart (the same position in the hash's lanes), single bytes anywhere */
+static void test_cache_changes(void) {
+    GfxTexStats s0, s1;
+    uint32_t a, i, w0, w1, missed = 0;
+    uint8_t row[128];
+
+    test_begin("cache: content changes noticed");
+    task_begin();
+    a = ram_random(64 * 32 * 2);
+    load_texture_block(K0(a), G_IM_FMT_RGBA, G_IM_SIZ_16b, 64, 32, 0, 0, 0, 6, 5, 0, 0);
+    compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+    for (i = 0; i < 48; i++) {
+        uint32_t o = ((rnd() >> 8) % (64 * 32 * 2 - 64)) & ~3u;
+
+        switch (i) {
+            case 0: /* scrolled up by one row (128 bytes, four blocks) */
+                memcpy(row, gRam + a, 128);
+                memmove(gRam + a, gRam + a + 128, 64 * 31 * 2);
+                memcpy(gRam + a + 64 * 31 * 2, row, 128);
+                break;
+            case 1: /* two words one block apart swapped */
+                memcpy(&w0, gRam + a + o, 4);
+                memcpy(&w1, gRam + a + o + 32, 4);
+                if (w0 == w1) {
+                    w1 ^= 1;
+                }
+                memcpy(gRam + a + o, &w1, 4);
+                memcpy(gRam + a + o + 32, &w0, 4);
+                break;
+            case 2: /* the same bit flipped in two words one block apart */
+                gRam[a + o] ^= 0x10;
+                gRam[a + o + 32] ^= 0x10;
+                break;
+            case 3: /* +1 and -1 in two words one block apart */
+                gRam[a + o + 3] += 1;
+                gRam[a + o + 35] -= 1;
+                break;
+            case 4: /* the two words of a 64-bit step changed in opposite directions */
+                gRam[a + o + 3] += 4;
+                gRam[a + o + 7] -= 4;
+                break;
+            default: /* one byte anywhere */
+                gRam[a + (rnd() >> 8) % (64 * 32 * 2)] ^= (uint8_t)(1 + (rnd() >> 24) % 255);
+                break;
+        }
+        task_begin();
+        load_texture_block(K0(a), G_IM_FMT_RGBA, G_IM_SIZ_16b, 64, 32, 0, 0, 0, 6, 5, 0, 0);
+        gfx_tex_get_stats(&s0);
+        compare_tile(0, GX_TEXMAP0, GX_TF_RGB5A3, NULL);
+        gfx_tex_get_stats(&s1);
+        if (s1.reconverts != s0.reconverts + 1) {
+            missed++;
+            printf("    change %u not noticed\n", i);
+        }
+    }
+    CHECK(missed == 0, "%u of 48 rewrites not noticed", missed);
+    test_end();
+}
+
 /* Many textures of different sizes (expanded masked regions inside large clamps) through a small cache */
 static void test_cache_pressure(void) {
     GfxTexStats s0, s1;
@@ -2502,6 +2562,7 @@ int main(void) {
     test_rects();
     test_state();
     test_cache_basic();
+    test_cache_changes();
     test_cache_pressure();
     test_cache_pinning();
     test_rect_strips();

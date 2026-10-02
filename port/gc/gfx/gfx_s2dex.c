@@ -7,13 +7,15 @@
  * S2DEX2 shares with F3DEX2 (display lists, other modes, segments, RDP commands).
  *
  * Backgrounds (uObjBg): the geometry is the microcode's (clipping to the scissor, in 1-cycle mode a frame no larger
- * than the scaled image, G_BG_FLAG_FLIPS), but the image is drawn from RAM as one texture (gfx_tex_bind_image,
- * gfx_gx_image_rect) instead of strips loaded into TMEM, so strips never leave seams. The microcode reads the
- * image as linear memory: a row read past its end continues on the next row, and rows past the last one wrap to
- * the first; each wrapped part is one more rectangle. Every image goes through gfx_fb_sync_ram first, since most
- * of MM's are framebuffers; without gfx_fb.c, images in N64 render targets (recorded from G_SETCIMG / G_SETZIMG)
- * are skipped, their RAM never having received what was drawn there. CI images take their palette from the TLUT
- * load (G_LOADTLUT) that holds it, as the RDP reads it from TMEM.
+ * than the scaled image, G_BG_FLAG_FLIPS), but the image is drawn as one texture (gfx_gx_image_rect) instead of strips
+ * loaded into TMEM, so strips never leave seams. The microcode reads the image as linear memory: a row read past its
+ * end continues on the next row, and rows past the last one wrap to the first; each wrapped part is one more
+ * rectangle. Most of MM's images are framebuffers: the frame and the captures the renderer wrote are GPU textures
+ * gfx_fb.c holds (gfx_fb_bind_image: an EFB copy, no RAM round trip; gfx_fb_image_done once the background's
+ * rectangles are drawn, before which gfx_fb.c moves the binding to RAM if it needs the copy's memory); any other image
+ * is bound from RAM (gfx_tex_bind_image) after gfx_fb_sync_ram. Without gfx_fb.c, images in N64 render targets
+ * (recorded from G_SETCIMG / G_SETZIMG) are skipped, their RAM never having received what was drawn there. CI images
+ * take their palette from the TLUT load (G_LOADTLUT) that holds it, as the RDP reads it from TMEM.
  *
  * Sprites (uObjSprite) are drawn as the microcode draws them, with RDP commands: the render tile from the sprite
  * (its texels are in TMEM, loaded by G_OBJ_LOADTXTR or by the game) and a texture rectangle. A G_OBJ_SPRITE whose
@@ -353,27 +355,34 @@ static bool s2d_bg_bind(const S2dBg* bg, S2dImage* im) {
         }
     }
     p = gfx_addr(addr);
-    gfx_fb_sync_ram(p, bytes);
-
-    if (tt != G_TT_NONE && bg->siz <= G_IM_SIZ_8b) {
-        /* CI4 reads the 16 entries of its palette, CI8 all 256 */
-        uint32_t first = (bg->siz == G_IM_SIZ_4b) ? bg->pal * 16 : 0;
-        uint32_t count = (bg->siz == G_IM_SIZ_4b) ? 16 : 256;
-
-        if (s2d_find_tlut(first, count, &tlutAddr) && s2d_in_ram(tlutAddr, count * 2)) {
-            tlut = gfx_addr(tlutAddr);
-        } else {
-            LOG_ONCE(LOG_BG_TLUT, "gfx_s2dex: TLUT of a CI background not found, drawn as intensity (logged once)");
-        }
-    }
     linear = (omH & (3u << G_MDSFT_TEXTFILT)) != G_TF_POINT && !s2d_copy_mode();
-    if (!gfx_tex_bind_image(p, (uint8_t)bg->fmt, (uint8_t)bg->siz, (uint16_t)width, (uint16_t)height,
-                            (uint16_t)width, tlut, tt == G_TT_IA16, linear, GX_TEXMAP0, &im->b) ||
-        !im->b.valid) {
-        LOG_ONCE(LOG_BG_BIND, "gfx_s2dex: background image %08X (%ux%u, format %u/%u) could not be bound (logged once)",
-                 (unsigned int)addr, (unsigned int)width, (unsigned int)height, (unsigned int)bg->fmt,
-                 (unsigned int)bg->siz);
-        return false;
+    /* The frame, or a capture the renderer wrote (motion blur, VisFbuf, pause and transition captures): RGBA16 images
+     * gfx_fb.c holds as GPU textures, the same texels without the RAM round trip */
+    if (!(bg->fmt == G_IM_FMT_RGBA && bg->siz == G_IM_SIZ_16b &&
+          gfx_fb_bind_image(p, (uint16_t)width, (uint16_t)height, (uint16_t)width, linear, GX_TEXMAP0,
+                            gfx_tex_bind_image, &im->b) &&
+          im->b.valid)) {
+        gfx_fb_sync_ram(p, bytes);
+        if (tt != G_TT_NONE && bg->siz <= G_IM_SIZ_8b) {
+            /* CI4 reads the 16 entries of its palette, CI8 all 256 */
+            uint32_t first = (bg->siz == G_IM_SIZ_4b) ? bg->pal * 16 : 0;
+            uint32_t count = (bg->siz == G_IM_SIZ_4b) ? 16 : 256;
+
+            if (s2d_find_tlut(first, count, &tlutAddr) && s2d_in_ram(tlutAddr, count * 2)) {
+                tlut = gfx_addr(tlutAddr);
+            } else {
+                LOG_ONCE(LOG_BG_TLUT, "gfx_s2dex: TLUT of a CI background not found, drawn as intensity (logged once)");
+            }
+        }
+        if (!gfx_tex_bind_image(p, (uint8_t)bg->fmt, (uint8_t)bg->siz, (uint16_t)width, (uint16_t)height,
+                                (uint16_t)width, tlut, tt == G_TT_IA16, linear, GX_TEXMAP0, &im->b) ||
+            !im->b.valid) {
+            LOG_ONCE(LOG_BG_BIND,
+                     "gfx_s2dex: background image %08X (%ux%u, format %u/%u) could not be bound (logged once)",
+                     (unsigned int)addr, (unsigned int)width, (unsigned int)height, (unsigned int)bg->fmt,
+                     (unsigned int)bg->siz);
+            return false;
+        }
     }
     if (linear) {
         /* The RDP's bilinear filter samples texel s at s, GX at s + 0.5 (as gfx_tex_bind does for tiles) */
@@ -514,6 +523,7 @@ static void s2d_bg_copy(const S2dBg* bg) {
     } else {
         s2d_bg_draw(&im, x0, x1, y0, y1, imgX * 0.25, imgY, ds, 1.0);
     }
+    gfx_fb_image_done();
 }
 
 /* G_BG_1CYC (uObjScaleBg): scaled by scaleW/scaleH texels per pixel, in the cycle type the game set. The frame is
@@ -577,6 +587,7 @@ static void s2d_bg_1cyc(const S2dBg* bg) {
     } else {
         s2d_bg_draw(&im, x0, x1, y0, y1, s0, gh * (1.0 / 32.0), ds, dt);
     }
+    gfx_fb_image_done();
 }
 
 /* ============================================================================================== */

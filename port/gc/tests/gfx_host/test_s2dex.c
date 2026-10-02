@@ -400,6 +400,80 @@ static void test_bg_ci(void) {
     }
 }
 
+/* RGBA16 images gfx_fb.c holds as GPU textures (the frame, captures it wrote): bound from there, without a RAM sync
+ * or the texture cache; anything gfx_fb.c does not serve (other formats, other sizes) is bound from RAM */
+static void test_bg_gpu_image(void) {
+    uint32_t img = ram_alloc(320 * 240 * 2);
+    uint32_t ci = ram_alloc(320 * 240);
+    Bg b = bg_full(img, 320, 240, G_IM_FMT_RGBA, G_IM_SIZ_16b);
+    Bg bc = bg_full(ci, 320, 240, G_IM_FMT_CI, G_IM_SIZ_8b);
+    Dl d = dl_new(16);
+
+    gFbBindImage = true;
+    b.scaleW = b.scaleH = 0;
+    load_s2dex(&d);
+    othermode(&d, G_CYC_COPY, 0);
+    op(&d, CMD(BG_COPY), put_bg(&b));
+    end(&d);
+    run(&d);
+    CHECK(gFbBindCount == 1 && gFbBindAddr == ram_ptr(img) && !gFbBindLinear, "the image is offered to gfx_fb.c");
+    CHECK(gFbBindFromRam == gfx_tex_bind_image, "with the texture cache's image bind as the way back to RAM");
+    CHECK(gBindCount == 0 && gFbSyncCount == 0, "served by gfx_fb.c: no RAM sync, no texture cache bind (%d, %d)",
+          gBindCount, gFbSyncCount);
+    CHECK(gImageRectCount == 1 && rect_is(0, 0, 0, 320, 240, 0, 0, 1, 1) && gImageRects[0].b.valid &&
+              gImageRects[0].b.width == 320 && gImageRects[0].b.sOffset == 0.0f,
+          "drawn with gfx_fb.c's binding (%d)", gImageRectCount);
+    CHECK(gFbDoneCount == 1 && gFbDoneRects == 1, "gfx_fb.c told when its draw was issued (%d, %d)", gFbDoneCount,
+          gFbDoneRects);
+
+    // A wrapped background: done after its last rectangle
+    {
+        Dl e = dl_new(16);
+
+        b.imageY = 100 << 5;
+        load_s2dex(&e);
+        othermode(&e, G_CYC_COPY, 0);
+        op(&e, CMD(BG_COPY), put_bg(&b));
+        end(&e);
+        run(&e);
+        CHECK(gFbBindCount == 1 && gImageRectCount == 2 && gFbDoneCount == 1 && gFbDoneRects == 2,
+              "wrapped: done after both rectangles (%d rects, done %d at %d)", gImageRectCount, gFbDoneCount,
+              gFbDoneRects);
+    }
+
+    // Filtered: the binding gets the half texel shift as a RAM image's does
+    {
+        Dl e = dl_new(16);
+
+        b = bg_full(img, 320, 240, G_IM_FMT_RGBA, G_IM_SIZ_16b);
+        load_s2dex(&e);
+        othermode(&e, G_CYC_1CYCLE | G_TF_BILERP, 0);
+        op(&e, CMD(BG_1CYC), put_bg(&b));
+        end(&e);
+        run(&e);
+        CHECK(gFbBindCount == 1 && gFbBindLinear && gBindCount == 0 && gImageRectCount == 1 &&
+                  gImageRects[0].b.sOffset == -0.5f && gImageRects[0].b.tOffset == -0.5f,
+              "bilinear: offered as linear, half texel shift (%d %d %d)", gFbBindCount, gBindCount, gImageRectCount);
+    }
+    // Other formats are not offered; a size gfx_fb.c does not serve falls back to RAM
+    {
+        Dl e = dl_new(16);
+        uint32_t small = ram_alloc(64 * 64 * 2);
+        Bg bs = bg_full(small, 64, 64, G_IM_FMT_RGBA, G_IM_SIZ_16b);
+
+        load_s2dex(&e);
+        othermode(&e, G_CYC_COPY, 0);
+        op(&e, CMD(BG_COPY), put_bg(&bc));
+        op(&e, CMD(BG_COPY), put_bg(&bs));
+        end(&e);
+        run(&e);
+        CHECK(gFbBindCount == 1 && gFbBindAddr == ram_ptr(small), "CI8 not offered, the 64x64 RGBA16 image offered");
+        CHECK(gBindCount == 2 && gFbSyncCount == 2 && gBinds[0].addr == ram_ptr(ci) && gBinds[1].addr == ram_ptr(small),
+              "both bound from RAM after a sync (%d binds, %d syncs)", gBindCount, gFbSyncCount);
+    }
+    gFbBindImage = false;
+}
+
 /* Images in render targets (motion blur, pause background, transitions): synced through gfx_fb.c, or skipped
  * without it */
 static void test_bg_render_target(void) {
@@ -424,7 +498,8 @@ static void test_bg_render_target(void) {
     logs = gLogCount;
     run(&d);
     gfx_s2dex_get_stats(&s1);
-    CHECK(gBindCount == 0 && gImageRectCount == 0 && gFbSyncCount == 0, "without gfx_fb.c: not drawn");
+    CHECK(gBindCount == 0 && gImageRectCount == 0 && gFbSyncCount == 0 && gFbBindCount == 0,
+          "without gfx_fb.c: not drawn");
     CHECK(s1.targetBgs == s0.targetBgs + 1 && s1.skipped == s0.skipped + 1 && s1.bgs == s0.bgs, "counted as skipped");
     CHECK(gLogCount > logs && strstr(gLastLog, "render target") != NULL, "logged: %s", gLastLog);
 
@@ -780,8 +855,8 @@ static void test_s2dex_stats(void) {
 
 void test_s2dex(void) {
     static void (*const sTests[])(void) = {
-        test_bg_copy,       test_bg_copy_clip_wrap, test_bg_1cyc,   test_bg_ci,       test_obj_rectangle,
-        test_obj_sprite,    test_obj_loadtxtr,      test_select_dl, test_s2dex_stats,
+        test_bg_copy,       test_bg_copy_clip_wrap, test_bg_1cyc,   test_bg_ci,       test_bg_gpu_image,
+        test_obj_rectangle, test_obj_sprite,        test_obj_loadtxtr, test_select_dl, test_s2dex_stats,
         // Last: the render targets it records stay (as across tasks) and would cover the next tests' images
         test_bg_render_target,
     };

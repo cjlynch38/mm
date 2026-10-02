@@ -16,6 +16,26 @@
 #include <string.h>
 #include "gfx_internal.h"
 
+/* Profile builds (-DGFX_TEX_PROFILE=1 in GFX_CFLAGS): time spent in binds, content hashes and conversions, logged as
+ * "gfx_tex: prof:" lines every few seconds */
+#ifndef GFX_TEX_PROFILE
+#define GFX_TEX_PROFILE 0
+#endif
+#if GFX_TEX_PROFILE && defined(GEKKO)
+#include <ogc/lwp_watchdog.h>
+static struct {
+    u64 bindTicks, hashTicks, convTicks, last;
+    u32 hashBytes, convTexels, convs, tasks;
+} sProf;
+#define PROF_START() u64 profStart = gettime()
+#define PROF_ADD(field) (sProf.field += gettime() - profStart)
+#define PROF_COUNT(field, n) (sProf.field += (n))
+#else
+#define PROF_START() ((void)0)
+#define PROF_ADD(field) ((void)0)
+#define PROF_COUNT(field, n) ((void)0)
+#endif
+
 /* ================================================================================================ */
 /* Constants and types                                                                              */
 /* ================================================================================================ */
@@ -139,6 +159,7 @@ typedef struct {
     const uint8_t* rows; /* N64 texels, row y at rows + y * rowStride */
     uint32_t rowStride;
     uint32_t ci4pal;
+    bool directS;        /* sMapS is the identity below `width` (no masked region expanded along s) */
     uint8_t* dst;
 } TexJob;
 
@@ -663,36 +684,61 @@ static bool tex_find_pal(uint32_t first, uint32_t n, uint32_t* addr, uint32_t* c
 /* Hashing                                                                                          */
 /* ================================================================================================ */
 
-static uint32_t tex_hash(const uint8_t* p, uint32_t n, uint32_t h) {
-    uint32_t h2 = h ^ 0x85EBCA6B;
-    uint32_t a, b;
+static inline uint32_t tex_rotl(uint32_t v, int r) {
+    return (v << r) | (v >> (32 - r));
+}
 
+static inline uint32_t tex_ld32(const uint8_t* p) {
+    uint32_t v;
+
+    memcpy(&v, p, 4);
+    return v;
+}
+
+/* One 64-bit step of a hash lane: both words go in before the multiply (one multiply per 8 bytes) */
+#define TEX_HASH_STEP(h, p, k) ((tex_rotl((h) ^ tex_ld32(p), 15) + tex_ld32((p) + 4)) * (k))
+
+/* Content hash: four independent lanes over 32-byte blocks (a cache line), then 8-byte steps and bytes. It is checked
+ * once per task for every texture bound, so it is a large part of the cost of binding textures: one multiply per 8
+ * bytes, and independent lanes the CPU can overlap. */
+static uint32_t tex_hash(const uint8_t* p, uint32_t n, uint32_t h) {
+    uint32_t h1 = h ^ 0x85EBCA6B, h2 = h + 0x27D4EB2F, h3 = h ^ 0x165667B1, h4 = h - 0x61C88647;
+
+    while (n >= 32) {
+        __builtin_prefetch(p + 64);
+        h1 = TEX_HASH_STEP(h1, p, 0x9E3779B1);
+        h2 = TEX_HASH_STEP(h2, p + 8, 0x85EBCA77);
+        h3 = TEX_HASH_STEP(h3, p + 16, 0xC2B2AE3D);
+        h4 = TEX_HASH_STEP(h4, p + 24, 0x27D4EB2F);
+        p += 32;
+        n -= 32;
+    }
     while (n >= 8) {
-        memcpy(&a, p, 4);
-        memcpy(&b, p + 4, 4);
-        h = (h ^ a) * 0x9E3779B1;
-        h2 = (h2 ^ b) * 0x85EBCA77;
-        h = (h << 13) | (h >> 19);
-        h2 = (h2 << 15) | (h2 >> 17);
+        h1 = TEX_HASH_STEP(h1, p, 0x9E3779B1);
         p += 8;
         n -= 8;
     }
     while (n-- != 0) {
-        h = (h ^ *p++) * 0x01000193;
+        h2 = (h2 ^ *p++) * 0x01000193;
     }
-    h ^= h2 * 0xC2B2AE35;
+    h = tex_rotl(h1, 1) + tex_rotl(h2, 7) + tex_rotl(h3, 12) + tex_rotl(h4, 18);
+    h = (h ^ (h >> 15)) * 0x2C1B3C6D;
     return h ^ (h >> 16);
 }
 
 static uint32_t tex_hash_rows(const uint8_t* p, uint32_t stride, uint32_t rowBytes, uint32_t rows) {
     uint32_t h = 0x165667B1 ^ rowBytes, y;
+    PROF_START();
 
     if (stride == rowBytes) {
-        return tex_hash(p, rowBytes * rows, h);
+        h = tex_hash(p, rowBytes * rows, h);
+    } else {
+        for (y = 0; y < rows; y++) {
+            h = tex_hash(p + y * stride, rowBytes, h);
+        }
     }
-    for (y = 0; y < rows; y++) {
-        h = tex_hash(p + y * stride, rowBytes, h);
-    }
+    PROF_ADD(hashTicks);
+    PROF_COUNT(hashBytes, rowBytes * rows);
     return h;
 }
 
@@ -1019,12 +1065,163 @@ static inline const uint8_t* job_row(const TexJob* j, uint32_t y) {
     return j->rows + sMapT[y] * j->rowStride;
 }
 
+/* Big-endian 16/32-bit accesses at any alignment (N64 data and GX textures are big endian; host tests run little
+ * endian): plain loads and stores on the GameCube */
+static inline uint32_t ld_be32(const uint8_t* p) {
+    uint32_t v;
+
+    memcpy(&v, p, 4);
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    v = __builtin_bswap32(v);
+#endif
+    return v;
+}
+
+static inline void st_be32(uint8_t* p, uint32_t v) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    v = __builtin_bswap32(v);
+#endif
+    memcpy(p, &v, 4);
+}
+
+static inline void st_be16(uint8_t* p, uint32_t v) {
+    uint16_t h = (uint16_t)v;
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    h = __builtin_bswap16(h);
+#endif
+    memcpy(p, &h, 2);
+}
+
+/* Two RGBA5551 texels (one 32-bit word) -> two RGB5A3 texels; both opaque (the usual case) in one go */
+static inline uint32_t rgba16x2_to_rgb5a3(uint32_t v) {
+    if ((v & 0x00010001) == 0x00010001) {
+        return ((v >> 1) & 0x7FFF7FFF) | 0x80008000;
+    }
+    return (rgba16_to_rgb5a3(v >> 16) << 16) | rgba16_to_rgb5a3(v & 0xFFFF);
+}
+
+/* GX IA4 texels of an N64 IA4 byte (two texels: 3-bit intensity, 1-bit alpha each), the first one in the high byte */
+static uint16_t sIa4Pairs[256];
+
+static void tex_init_tables(void) {
+    uint32_t b;
+
+    for (b = 0; b < 256; b++) {
+        uint32_t hi = b >> 4, lo = b & 0xF;
+
+        sIa4Pairs[b] = (uint16_t)((((hi & 1) ? 0xF0 : 0x00) | (hi & 0xE) | (hi >> 3)) << 8 |
+                                  (((lo & 1) ? 0xF0 : 0x00) | (lo & 0xE) | (lo >> 3)));
+    }
+}
+
+/*
+ * One GX block whose texels are texels bx.. of the rows (no s map, the block inside the texture's width): converted
+ * from whole words of the rows instead of texel by texel. The same texels tex_fetch gives. False for conversions done
+ * texel by texel only.
+ */
+static inline __attribute__((always_inline)) bool tex_block_direct(int conv, const uint8_t* const* r, uint32_t bx,
+                                                                   uint32_t ci4pal, uint8_t* d) {
+    int i, k;
+
+    switch (conv) {
+        case CONV_I4:
+            /* A GX I4 block row is the N64 row's bytes (two texels each, the first in the high nibble) */
+            for (i = 0; i < 8; i++) {
+                memcpy(d + i * 4, r[i] + bx / 2, 4);
+            }
+            return true;
+        case CONV_IA4:
+            for (i = 0; i < 4; i++) {
+                const uint8_t* s = r[i] + bx / 2;
+
+                st_be32(d + i * 8, ((uint32_t)sIa4Pairs[s[0]] << 16) | sIa4Pairs[s[1]]);
+                st_be32(d + i * 8 + 4, ((uint32_t)sIa4Pairs[s[2]] << 16) | sIa4Pairs[s[3]]);
+            }
+            return true;
+        case CONV_CI4_I8:
+            for (i = 0; i < 4; i++) {
+                const uint8_t* s = r[i] + bx / 2;
+
+                for (k = 0; k < 4; k++) {
+                    d[i * 8 + k * 2] = (uint8_t)((ci4pal << 4) | (s[k] >> 4));
+                    d[i * 8 + k * 2 + 1] = (uint8_t)((ci4pal << 4) | (s[k] & 0xF));
+                }
+            }
+            return true;
+        case CONV_CI4_RGBA:
+        case CONV_CI4_IA:
+            for (i = 0; i < 4; i++) {
+                const uint8_t* s = r[i] + bx / 2;
+
+                st_be32(d + i * 8, ((uint32_t)sPal[s[0] >> 4] << 16) | sPal[s[0] & 0xF]);
+                st_be32(d + i * 8 + 4, ((uint32_t)sPal[s[1] >> 4] << 16) | sPal[s[1] & 0xF]);
+            }
+            return true;
+        case CONV_I8:
+            for (i = 0; i < 4; i++) {
+                memcpy(d + i * 8, r[i] + bx, 8);
+            }
+            return true;
+        case CONV_IA8:
+            /* N64 intensity in the high nibble, GX IA4 alpha */
+            for (i = 0; i < 4; i++) {
+                uint32_t a = ld_be32(r[i] + bx), b = ld_be32(r[i] + bx + 4);
+
+                st_be32(d + i * 8, ((a & 0x0F0F0F0F) << 4) | ((a >> 4) & 0x0F0F0F0F));
+                st_be32(d + i * 8 + 4, ((b & 0x0F0F0F0F) << 4) | ((b >> 4) & 0x0F0F0F0F));
+            }
+            return true;
+        case CONV_CI8_RGBA:
+        case CONV_CI8_IA:
+            for (i = 0; i < 4; i++) {
+                const uint8_t* s = r[i] + bx;
+
+                st_be32(d + i * 8, ((uint32_t)sPal[s[0]] << 16) | sPal[s[1]]);
+                st_be32(d + i * 8 + 4, ((uint32_t)sPal[s[2]] << 16) | sPal[s[3]]);
+            }
+            return true;
+        case CONV_RGBA16:
+            for (i = 0; i < 4; i++) {
+                const uint8_t* s = r[i] + bx * 2;
+
+                st_be32(d + i * 8, rgba16x2_to_rgb5a3(ld_be32(s)));
+                st_be32(d + i * 8 + 4, rgba16x2_to_rgb5a3(ld_be32(s + 4)));
+            }
+            return true;
+        case CONV_IA16:
+            /* N64 intensity, alpha; GX alpha, intensity: the bytes of each texel swapped */
+            for (i = 0; i < 4; i++) {
+                uint32_t a = ld_be32(r[i] + bx * 2), b = ld_be32(r[i] + bx * 2 + 4);
+
+                st_be32(d + i * 8, ((a << 8) & 0xFF00FF00) | ((a >> 8) & 0x00FF00FF));
+                st_be32(d + i * 8 + 4, ((b << 8) & 0xFF00FF00) | ((b >> 8) & 0x00FF00FF));
+            }
+            return true;
+        case CONV_RGBA32:
+            /* Alpha/red pairs, then green/blue 32 bytes further */
+            for (i = 0; i < 4; i++) {
+                for (k = 0; k < 4; k++) {
+                    uint32_t v = ld_be32(r[i] + (bx + k) * 4);
+
+                    st_be16(d + (i * 4 + k) * 2, ((v & 0xFF) << 8) | (v >> 24));
+                    st_be16(d + 32 + (i * 4 + k) * 2, v >> 8);
+                }
+            }
+            return true;
+        default: /* CONV_YUV16 */
+            return false;
+    }
+}
+
 /* Write the GX texture in its tiled layout: blocks of 32 bytes (8x8 texels at 4 bits, 8x4 at 8 bits, 4x4 at
  * 16 bits) in rows of blocks; RGBA8 blocks are 4x4 texels in 64 bytes, alpha/red pairs then green/blue. */
 static inline __attribute__((always_inline)) void tex_convert(const TexJob* j, int conv) {
     int gxFmt = sConvGxFmt[conv];
     int bw = (gxFmt == GX_TF_I4 || gxFmt == GX_TF_I8 || gxFmt == GX_TF_IA4) ? 8 : 4;
     int bh = (gxFmt == GX_TF_I4) ? 8 : 4;
+    int bytes = (gxFmt == GX_TF_RGBA8) ? 64 : 32;
+    uint32_t direct = j->directS ? (j->width & ~(uint32_t)(bw - 1)) : 0; /* blocks before this column: direct */
     uint8_t* d = j->dst;
     const uint8_t* r[8];
     uint32_t bx, by;
@@ -1037,7 +1234,9 @@ static inline __attribute__((always_inline)) void tex_convert(const TexJob* j, i
         for (bx = 0; bx < j->width; bx += bw) {
             const uint16_t* ms = &sMapS[bx];
 
-            if (gxFmt == GX_TF_I4) {
+            if (bx < direct && tex_block_direct(conv, r, bx, j->ci4pal, d)) {
+                d += bytes;
+            } else if (gxFmt == GX_TF_I4) {
                 for (i = 0; i < 8; i++) {
                     for (k = 0; k < 8; k += 2) {
                         *d++ = (tex_fetch(conv, r[i], ms[k], j->ci4pal) << 4) |
@@ -1267,7 +1466,29 @@ static bool tex_fail(GfxTexBinding* out) {
     return false;
 }
 
+static bool tex_bind_tile(int tile, int texMap, GfxTexBinding* out);
+static bool tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height,
+                           uint16_t stride, const void* tlut, bool tlutIA, bool linear, int texMap,
+                           GfxTexBinding* out);
+
 bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
+    PROF_START();
+    bool ok = tex_bind_tile(tile, texMap, out);
+
+    PROF_ADD(bindTicks);
+    return ok;
+}
+
+bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height, uint16_t stride,
+                        const void* tlut, bool tlutIA, bool linear, int texMap, GfxTexBinding* out) {
+    PROF_START();
+    bool ok = tex_bind_image(addr, fmt, siz, width, height, stride, tlut, tlutIA, linear, texMap, out);
+
+    PROF_ADD(bindTicks);
+    return ok;
+}
+
+static bool tex_bind_tile(int tile, int texMap, GfxTexBinding* out) {
     const GfxTile* t;
     uint32_t omH;
     TexMemo* memo = NULL;
@@ -1458,6 +1679,7 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
 
     if (convert) {
         TexJob job;
+        PROF_START();
 
         if (key.flags & KEY_PAL_ADDR) {
             tex_convert_pal(gfx_addr(palAddr), palRam, palCount, conv);
@@ -1481,10 +1703,14 @@ bool gfx_tex_bind(int tile, int texMap, GfxTexBinding* out) {
         job.width = width;
         job.height = height;
         job.ci4pal = t->palette;
+        job.directS = key.mapS == 0;
         job.dst = sArena + en->offset;
         tex_run(&job);
         DCFlushRange(job.dst, gx_tex_bytes(sConvGxFmt[conv], width, height));
         sNeedInvalidate = true;
+        PROF_ADD(convTicks);
+        PROF_COUNT(convTexels, (uint32_t)width * height);
+        PROF_COUNT(convs, 1);
     }
 
     /* GX texture object and the binding */
@@ -1534,8 +1760,9 @@ static bool tex_ptr_ok(const void* p, uint32_t bytes) {
 #endif
 }
 
-bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height, uint16_t stride,
-                        const void* tlut, bool tlutIA, bool linear, int texMap, GfxTexBinding* out) {
+static bool tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t width, uint16_t height,
+                           uint16_t stride, const void* tlut, bool tlutIA, bool linear, int texMap,
+                           GfxTexBinding* out) {
     const uint8_t* rows = addr;
     TexMemo* memo = NULL;
     TexKey key;
@@ -1639,6 +1866,7 @@ bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t wid
 
     if (convert) {
         TexJob job;
+        PROF_START();
 
         if (palCount != 0) {
             tex_convert_pal(tlut, palCount, palCount, conv);
@@ -1651,10 +1879,14 @@ bool gfx_tex_bind_image(const void* addr, uint8_t fmt, uint8_t siz, uint16_t wid
         job.rows = rows;
         job.rowStride = strideBytes;
         job.ci4pal = 0;
+        job.directS = true;
         job.dst = sArena + en->offset;
         tex_run(&job);
         DCFlushRange(job.dst, gx_tex_bytes(gxFmt, width, height));
         sNeedInvalidate = true;
+        PROF_ADD(convTicks);
+        PROF_COUNT(convTexels, (uint32_t)width * height);
+        PROF_COUNT(convs, 1);
     }
 
     GX_InitTexObj(&obj, sArena + en->offset, width, height, gxFmt, GX_CLAMP, GX_CLAMP, GX_FALSE);
@@ -1689,6 +1921,7 @@ void gfx_tex_init(void) {
         return;
     }
     sInit = true;
+    tex_init_tables();
     for (size = TEX_CACHE_SIZE; size >= TEX_CACHE_MIN; size >>= 1) {
         sArena = gc_mem_alloc(size, 32);
         if (sArena != NULL) {
@@ -1734,6 +1967,23 @@ void gfx_tex_frame(void) {
     /* Contents are checked lazily: the first bind of each entry in a task hashes its source again */
     sFrame++;
     sMemo[0].valid = sMemo[1].valid = false;
+#if GFX_TEX_PROFILE && defined(GEKKO)
+    sProf.tasks++;
+    if (sProf.last == 0) {
+        sProf.last = gettime();
+    } else if (ticks_to_millisecs(gettime() - sProf.last) >= 5000) {
+        u32 n = sProf.tasks;
+
+        gc_log("gfx_tex: prof: %u tasks; per task: binds %u us, hashing %u us (%u KB), converting %u us; %u "
+               "conversions (%u Ktexels) in all", (unsigned int)n,
+               (unsigned int)ticks_to_microsecs(sProf.bindTicks / n),
+               (unsigned int)ticks_to_microsecs(sProf.hashTicks / n), (unsigned int)(sProf.hashBytes / n / 1024),
+               (unsigned int)ticks_to_microsecs(sProf.convTicks / n), (unsigned int)sProf.convs,
+               (unsigned int)(sProf.convTexels / 1024));
+        memset(&sProf, 0, sizeof(sProf));
+        sProf.last = gettime();
+    }
+#endif
 }
 
 void gfx_tex_ram_written(uint32_t addr, uint32_t bytes) {

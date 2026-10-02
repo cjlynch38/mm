@@ -9,8 +9,12 @@
  *   3. With the reference interpreter (CXD4=<mupen64plus-rsp-cxd4 source>): random instances of every
  *      command and random MM-like synthesis lists, run both here and as MM's real microcode
  *      (extracted/n64-us/incbin/aspMainText) on cxd4. All of DMEM and RAM must match bit for bit.
+ *   4. aud_test --replay <capture.bin>...: tasks captured from the game (AUD_CAPTURE builds of
+ *      port/gc/audio/aud_task.c, converted by audcap.py), fast paths against exact versions and, with
+ *      the reference, against the real microcode.
  *
- * Usage: aud_test [seed] [iterations]. Exit status 0 if every test passed.
+ * Usage: aud_test [seed] [iterations], or aud_test --replay <capture.bin>... Exit status 0 if every
+ * test passed.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -916,6 +920,8 @@ static u32 RandRam(u32 size) {
     return RAM_POOL + (RandRange(0, RAM_POOL_SIZE - size - 64) & ~1);
 }
 
+static void RandFilterCoefs(u32 addr);
+
 /** One random command of type `op`, with whatever setup it needs before it */
 static void RandomCommand(u32 op) {
     u32 in;
@@ -985,7 +991,9 @@ static void RandomCommand(u32 op) {
             break;
         case A_FILTER:
             count = RandRange(0, 0x1A0);
-            A(aFilter, 2, count, RandRam(16) & ~7);
+            in = RandRam(16) & ~7;
+            RandFilterCoefs(in);
+            A(aFilter, 2, count, in);
             A(aFilter, Rand() & 1, RandDmem(16, count + 32), RandRam(32) & ~7);
             if (Rand() & 1) {
                 // Again without a new count: one step
@@ -1131,6 +1139,162 @@ static void Test_ResampleNearAddrTables(void) {
     }
 }
 
+/** Rows of MM's low- and high-pass tables (src/audio/lib/data.c): symmetric FIRs */
+static const s16 sMmFilters[][8] = {
+    { 0, 0, 0, 32767, 0, 0, 0, 0 },
+    { 3854, 4188, 4398, 4469, 4398, 4188, 3854, 3416 },
+    { -2252, -693, 7121, 11962, 7121, -693, -2252, 668 },
+    { 841, -853, 863, 26829, 863, -853, 841, -820 },
+    { -289, -291, -289, 30736, -289, -291, -289, -290 },
+    { -772, -3, -6985, 17240, -6985, -3, -772, -3 },
+};
+
+/**
+ * 8 filter coefficients at RAM addr: random ones, MM's (symmetric), or random symmetric ones whose
+ * absolute values add up to about 0xFFFF (the limit of the 32-bit loop)
+ */
+static void RandFilterCoefs(u32 addr) {
+    s32 c[8];
+    s32 sum;
+    int i;
+
+    switch (Rand() % 4) {
+        case 0:
+            break; // the random contents
+        case 1:
+            for (i = 0; i < 8; i++) {
+                Wr16(&sRamInit[addr + 2 * i], sMmFilters[Rand() % 6][i]);
+            }
+            break;
+        default:
+            sum = 0;
+            for (i = 0; i < 4; i++) {
+                c[i] = (s32)RandRange(0, 0x3000) - 0x1800;
+                sum += (c[i] < 0) ? -c[i] : c[i];
+            }
+            c[7] = (s32)RandRange(0, 0x2000) - 0x1000;
+            sum = 2 * sum - ((c[3] < 0) ? -c[3] : c[3]) + ((c[7] < 0) ? -c[7] : c[7]);
+            // Scale the centre tap to bring the total near 0xFFFF, sometimes just over
+            c[3] += ((c[3] < 0) ? -1 : 1) * (0xFFFF - sum + (s32)RandRange(0, 2) - 1);
+            if ((c[3] < -0x8000) || (c[3] > 0x7FFF)) {
+                c[3] = 0x7FFF;
+            }
+            for (i = 0; i < 8; i++) {
+                Wr16(&sRamInit[addr + 2 * i], (i < 4) ? c[i] : (i < 7) ? c[6 - i] : c[7]);
+            }
+            break;
+    }
+}
+
+/**
+ * FILTER at the bounds of the 32-bit loop: coefficients whose absolute values add up to 0xFFFF and
+ * 0x10000, symmetric or not, on full-scale samples with the signs of the coefficients. Only -0x8000
+ * has a magnitude of 0x8000, so the largest sum, 0x8000 times the total (2^31 at 0x10000, which
+ * overflows the 32-bit loop's sum + 0x4000), takes negative coefficients on -0x8000 samples: the
+ * "extreme" case, all coefficients negative. The mixed-sign cases stay up to about 50000 below it.
+ */
+static void Test_FilterBounds(void) {
+    static const s32 base[8] = { 4000, -6000, 8000, 0, 8000, -6000, 4000, -4000 };
+    static const char* const sSignNames[] = { "positive", "negative", "extreme" };
+    char name[64];
+    s32 c[8];
+    int total;
+    int sym;
+    int sign;
+    int i;
+
+    for (total = 0xFFFE; total <= 0x10000; total++) {
+        for (sym = 0; sym < 2; sym++) {
+            for (sign = 0; sign < 3; sign++) {
+                snprintf(name, sizeof(name), "FILTER sum 0x%X %s %s", total, sym ? "symmetric" : "asymmetric",
+                         sSignNames[sign]);
+                Begin(name);
+                RandomizeMemory();
+                for (i = 0; i < 8; i++) {
+                    c[i] = (sign == 2) ? -abs(base[i]) : base[i];
+                }
+                if (!sym) {
+                    c[0] += 1;
+                    c[6] -= 1;
+                }
+                c[3] = total - 40000; // |c| of the others: 40000
+                if (sign == 2) {
+                    c[3] = -c[3];
+                }
+                for (i = 0; i < 8; i++) {
+                    Wr16(&sRamInit[RAM_POOL + 2 * i], c[i]);
+                    // State: 8 previous inputs, then old coefficients equal to the new ones (no halving)
+                    Wr16(&sRamInit[RAM_POOL + 0x100 + 16 + 2 * i], c[i]);
+                }
+                // Samples: input n meets coefficient j at output n + j; full scale with the sign of the
+                // coefficient that the middle outputs see (all -0x8000 in the extreme case)
+                for (i = 0; i < 64; i++) {
+                    s32 cj = c[(64 - i) % 8];
+                    s32 s = ((sign == 2) || ((cj < 0) != (sign != 0))) ? -0x8000 : 0x7FFF;
+
+                    Wr16(&sDmemInit[0x800 + 2 * i], s);
+                }
+                for (i = 0; i < 8; i++) {
+                    Wr16(&sRamInit[RAM_POOL + 0x100 + 2 * i], -0x8000);
+                }
+                A(aFilter, 2, 128, RAM_POOL);
+                A(aFilter, 0, 0x800, RAM_POOL + 0x100);
+                RunAndCompare(name);
+            }
+        }
+    }
+}
+
+/**
+ * ADPCM and RESAMPLE writing just below their input, as MM does for some notes: around the distances
+ * where the output starts to catch up with input that the vector loop has not read yet
+ */
+static void Test_OutputBelowInput(void) {
+    static const u32 sFrames[] = { 1, 2, 5, 9, 23 };
+    static const u16 sPitches[] = { 0x8000, 0x8FAC, 0x7F00, 0x6000, 0x7FF0, 0x4000 };
+    char name[96];
+    u32 f;
+    u32 shortMode;
+    s32 d;
+    s32 dMin;
+    u32 p;
+    u32 frameSize;
+    u32 count;
+
+    for (f = 0; f < sizeof(sFrames) / sizeof(sFrames[0]); f++) {
+        for (shortMode = 0; shortMode < 2; shortMode++) {
+            frameSize = shortMode ? 5 : 9;
+            // The straight loop's limit: in - out >= 32 * frames - frameSize * (frames - 1). Closer than
+            // that by up to about 20 bytes the result happens to be the same; then it differs.
+            dMin = 32 * sFrames[f] - frameSize * (sFrames[f] - 1);
+            for (d = dMin - 50; d <= dMin + 10; d += 3) {
+                snprintf(name, sizeof(name), "ADPCM %u frames%s, input %d bytes above the output", sFrames[f],
+                         shortMode ? " (2-bit)" : "", d);
+                Begin(name);
+                RandomizeMemory();
+                A(aLoadADPCM, 16 * 16, RandRam(256) & ~7);
+                A(aSetBuffer, 0, 0x600 + d, 0x600 - 32, sFrames[f] * 32);
+                A(aADPCMdec, (shortMode ? A_ADPCM_SHORT : 0) | (Rand() & 1), RandRam(32) & ~7);
+                RunAndCompare(name);
+            }
+        }
+    }
+    for (p = 0; p < sizeof(sPitches) / sizeof(sPitches[0]); p++) {
+        for (count = 0x160; count <= 0x180; count += 0x20) {
+            for (d = 0; d <= 0x30; d += 2) {
+                snprintf(name, sizeof(name), "RESAMPLE pitch 0x%X, %u bytes, input %d bytes above the output",
+                         sPitches[p], count, d);
+                Begin(name);
+                RandomizeMemory();
+                // The input (after the 4 state samples, 8 bytes) starts d bytes above out
+                A(aSetBuffer, 0, 0x600 + 8 + d, 0x600, count);
+                A(aResample, Rand() & 1, sPitches[p], RandRam(32) & ~7);
+                RunAndCompare(name);
+            }
+        }
+    }
+}
+
 static void Test_RandomCommands(int iterations) {
     char name[64];
     u32 i;
@@ -1194,7 +1358,10 @@ static void SynthNote(u32 numSamplesPerUpdate, int first) {
         CmdHiLoGain(RandRange(0x10, 0x7F), DMEM_TEMP, 0, size + 32);
     }
     if (Rand() & 1) {
-        A(aFilter, 2, size, RandRam(16) & ~15);
+        u32 coefs = RandRam(16) & ~15;
+
+        RandFilterCoefs(coefs);
+        A(aFilter, 2, size, coefs);
         A(aFilter, first ? A_INIT : 0, DMEM_TEMP, state + 0x040);
     }
     if ((Rand() & 3) == 0) {
@@ -1282,7 +1449,10 @@ static void SynthUpdate(u32 numSamplesPerUpdate, u32 aiBuf, int first) {
         SynthNote(numSamplesPerUpdate, first);
     }
     if (Rand() & 1) {
-        A(aFilter, 2, size, RandRam(16) & ~15);
+        u32 coefs = RandRam(16) & ~15;
+
+        RandFilterCoefs(coefs);
+        A(aFilter, 2, size, coefs);
         A(aFilter, first ? A_INIT : 0, DMEM_WET_LEFT_CH, RandRam(32) & ~15);
     }
     if (Rand() & 1) {
@@ -1316,10 +1486,203 @@ static void Test_SynthLists(int iterations) {
 }
 
 /* ------------------------------------------------------------------------------------------------ */
+/* Captured game tasks (AUD_CAPTURE builds, audcap.py)                                              */
+/* ------------------------------------------------------------------------------------------------ */
+
+static u32 Be32(const u8* p) {
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+/**
+ * Replays every task of a capture file from its own DMEM and RAM: fast paths, exact versions and (with
+ * the reference) the real microcode must give the same DMEM and RAM. Game addresses are used modulo
+ * 16 MiB, as the RSP does; a capture whose pieces of RAM collide there is reported and skipped.
+ */
+static void Test_Replay(const char* path) {
+    static u8 owner[RAM_SIZE / 8]; // which 8-byte units of RAM a piece of this task has written
+    u8 header[AUD_TASK_HEADER_SIZE];
+    char name[96];
+    FILE* f = fopen(path, "rb");
+    u8* file;
+    long size;
+    const u8* p;
+    const u8* udata;
+    const u8* t;
+    u32 ntasks;
+    u32 k;
+    u32 n;
+    u32 i;
+    u32 addr;
+    u32 len;
+    u32 off;
+    int clash;
+
+    if ((f == NULL) || (fseek(f, 0, SEEK_END) != 0) || ((size = ftell(f)) < 12) || (fseek(f, 0, SEEK_SET) != 0)) {
+        fprintf(stderr, "cannot read %s\n", path);
+        sFailures++;
+        if (f != NULL) {
+            fclose(f);
+        }
+        return;
+    }
+    file = malloc(size);
+    if ((file == NULL) || (fread(file, 1, size, f) != (size_t)size) || (memcmp(file, "AUDCAP1", 8) != 0)) {
+        fprintf(stderr, "%s is not a capture file (audcap.py)\n", path);
+        sFailures++;
+        fclose(f);
+        free(file);
+        return;
+    }
+    fclose(f);
+
+    ntasks = Be32(file + 8);
+    udata = file + 12;
+    p = udata + AUD_UCODE_DATA_SIZE;
+    for (k = 0; k < ntasks; k++) {
+        snprintf(name, sizeof(name), "captured task %u", (unsigned)k);
+        sTestName = name;
+        t = p;
+        p += 12 + AUD_DMEM_SIZE + AUD_TASK_HEADER_SIZE;
+        n = Be32(p);
+        p += 4;
+
+        // RAM: the pieces the list reads (the aspMainStack copy among them), then the microcode's data where
+        // the OSTask points (the GameCube build's OSTask points to zero-filled stand-ins for both)
+        memset(owner, 0, sizeof(owner));
+        clash = 0;
+        for (i = 0; i <= n; i++) {
+            if (i < n) {
+                addr = Be32(p) & 0xFFFFFF;
+                len = Be32(p + 4);
+            } else {
+                // Not a piece: placed by hand below
+                addr = Be32(t + 12 + AUD_DMEM_SIZE + 0x18) & 0xFFFFF8;
+                len = AUD_UCODE_DATA_SIZE;
+                for (off = 0; off < len; off += 8) {
+                    if (owner[((addr + off) & 0xFFFFFF) >> 3] != 0) {
+                        clash = 1;
+                    }
+                }
+                if (addr + len <= RAM_SIZE) {
+                    memcpy(&sRamInit[addr], udata, len);
+                }
+                break;
+            }
+            for (off = 0; off < len; off += 8) {
+                u32 unit = ((addr + off) & 0xFFFFFF) >> 3;
+
+                if ((owner[unit] != 0) && (memcmp(&sRamInit[unit * 8], p + 8 + off, 8) != 0)) {
+                    clash = 1;
+                }
+                owner[unit] = 1;
+            }
+            if (addr + len <= RAM_SIZE) {
+                memcpy(&sRamInit[addr], p + 8, len);
+            } else {
+                clash = 1;
+            }
+            p += 8 + len;
+        }
+        if (clash) {
+            fprintf(stderr, "%s: pieces of RAM collide modulo 16 MiB, skipped\n", name);
+            continue;
+        }
+        // The list itself must be there (captures before the fix of lists over 4 KiB lack it)
+        for (off = 0; off < Be32(t + 4); off += 8) {
+            if (owner[((Be32(t) + off) & 0xFFFFFF) >> 3] == 0) {
+                clash = 1;
+            }
+        }
+        if (clash) {
+            Fail("%s: the capture lacks the command list", name);
+            continue;
+        }
+        memcpy(sDmemInit, t + 12, AUD_DMEM_SIZE);
+
+        // As RunAndCompare, with the captured list and OSTask, whose dram_stack points to the real
+        // aspMainStack (the game's points to a zero-filled stand-in; DMEM keeps the OSTask, so the
+        // microcode and this implementation must see the same one)
+        memcpy(header, t + 12 + AUD_DMEM_SIZE, AUD_TASK_HEADER_SIZE);
+        Wr32(&header[0x20], Be32(t + 8));
+        sChecks++;
+        memcpy(sRamA, sRamInit, RAM_SIZE);
+        memcpy(sRamB, sRamInit, RAM_SIZE);
+        for (i = 0; i < 2; i++) {
+            AudUcodeTask task;
+            u8* ram = (i == 0) ? sRamA : sRamB;
+            u8* dmem = (i == 0) ? sDmemA : sDmemB;
+
+            AudUcode_Reset();
+            memcpy(AudUcode_GetDmem(), sDmemInit, AUD_DMEM_SIZE);
+            gAudHostRam = ram;
+            gAudForceExact = i;
+            task.ucodeData = udata;
+            task.dramStack = Be32(t + 8);
+            task.alistAddr = Be32(t);
+            task.alistSize = Be32(t + 4);
+            task.header = header;
+            AudUcode_RunTask(&task);
+            gAudForceExact = 0;
+            memcpy(dmem, AudUcode_GetDmem(), AUD_DMEM_SIZE);
+            if ((i == 0) && (AudUcode_GetErrorCount() != 0)) {
+                fprintf(stderr, "%s: %u unknown commands or zero-size DMAs\n", name,
+                        (unsigned)AudUcode_GetErrorCount());
+            }
+        }
+        if (Compare("DMEM fast/exact", sDmemA, sDmemB, AUD_DMEM_SIZE, 0) ||
+            Compare("RAM fast/exact", sRamA, sRamB, RAM_SIZE, 0)) {
+            Fail("%s", name);
+            continue;
+        }
+#ifdef AUD_LLE
+        if (sHaveLle) {
+            memcpy(sRamB, sRamInit, RAM_SIZE);
+            memcpy(sDmemB, sDmemInit, AUD_DMEM_SIZE);
+            memcpy(&sDmemB[AUD_TASK_HEADER_ADDR], header, AUD_TASK_HEADER_SIZE);
+            Lle_ResetRegs();
+            if (Lle_Run(sRamB, sDmemB, sAspText) < 0) {
+                Fail("%s: the microcode did not end with BREAK", name);
+                continue;
+            }
+            if (Compare("DMEM vs microcode", sDmemA, sDmemB, AUD_DMEM_SIZE, 0) ||
+                Compare("RAM vs microcode", sRamA, sRamB, RAM_SIZE, 0)) {
+                Fail("%s", name);
+            }
+        }
+#endif
+    }
+    printf("replay %s: %u tasks\n", path, (unsigned)ntasks);
+    free(file);
+}
+
+/* ------------------------------------------------------------------------------------------------ */
 
 int main(int argc, char** argv) {
     int iterations = 200;
 
+    if ((argc > 2) && (strcmp(argv[1], "--replay") == 0)) {
+        if (LoadFile("aspMainText", sAspText, sizeof(sAspText)) ||
+            LoadFile("aspMainData", sAspData, sizeof(sAspData)) ||
+            LoadFile("aspMainStack", sAspStack, sizeof(sAspStack))) {
+            return 2;
+        }
+        sRamA = calloc(1, RAM_SIZE + 0x10000);
+        sRamB = calloc(1, RAM_SIZE + 0x10000);
+        sRamInit = calloc(1, RAM_SIZE + 0x10000);
+        if ((sRamA == NULL) || (sRamB == NULL) || (sRamInit == NULL)) {
+            return 2;
+        }
+#ifdef AUD_LLE
+        sHaveLle = (Lle_Init() == 0);
+#endif
+        printf("audio host test, replay: %s\n",
+               sHaveLle ? "with the microcode on cxd4" : "without the reference interpreter");
+        for (int a = 2; a < argc; a++) {
+            Test_Replay(argv[a]);
+        }
+        printf("total: %d checks, %d failures\n", sChecks, sFailures);
+        return (sFailures == 0) ? 0 : 1;
+    }
     if (argc > 1) {
         sRng ^= strtoull(argv[1], NULL, 0) * 0x2545F4914F6CDD1Dull;
     }
@@ -1362,6 +1725,8 @@ int main(int argc, char** argv) {
 
     Test_MultTableCorners();
     Test_ResampleNearAddrTables();
+    Test_FilterBounds();
+    Test_OutputBelowInput();
     Test_RandomCommands(iterations);
     Test_SynthLists(iterations / 4 + 1);
     printf("total: %d checks, %d failures\n", sChecks, sFailures);

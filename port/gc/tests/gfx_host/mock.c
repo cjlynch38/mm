@@ -37,6 +37,13 @@ bool gBindFail;
 ImageRectRec gImageRects[MAX_IMAGE_RECTS];
 int gImageRectCount;
 bool gFbReady;
+bool gFbBindImage;
+int gFbBindCount;
+const void* gFbBindAddr;
+bool gFbBindLinear;
+GfxBindImageFn gFbBindFromRam;
+bool gFbBound;
+int gFbDoneCount, gFbDoneRects;
 int gFbSyncCount;
 const void* gFbSyncAddr;
 uint32_t gFbSyncBytes;
@@ -103,6 +110,13 @@ void mock_reset(void) {
     gTexrectCount = 0;
     gBindCount = 0;
     gImageRectCount = 0;
+    gFbBindCount = 0;
+    gFbBindAddr = NULL;
+    gFbBindLinear = false;
+    gFbBindFromRam = NULL;
+    gFbBound = false;
+    gFbDoneCount = 0;
+    gFbDoneRects = -1;
     gFbSyncCount = 0;
     gFbSyncAddr = NULL;
     gFbSyncBytes = 0;
@@ -318,4 +332,33 @@ void gfx_fb_sync_ram(const void* addr, uint32_t bytes) {
     gFbSyncCount++;
     gFbSyncAddr = addr;
     gFbSyncBytes = bytes;
+}
+
+bool gfx_fb_bind_image(const void* addr, uint16_t width, uint16_t height, uint16_t stride, bool linear, int texMap,
+                       GfxBindImageFn fromRam, GfxTexBinding* out) {
+    gFbBindCount++;
+    gFbBindAddr = addr;
+    gFbBindLinear = linear;
+    gFbBindFromRam = fromRam;
+    gFbBound = false;
+    if (!gFbBindImage || width != GFX_N64_WIDTH || height != GFX_N64_HEIGHT || stride != width ||
+        texMap != GX_TEXMAP0) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->valid = true;
+    out->width = width;
+    out->height = height;
+    out->sShiftScale = out->tShiftScale = 1.0f;
+    out->linear = linear;
+    gFbBound = true;
+    return true;
+}
+
+void gfx_fb_image_done(void) {
+    gFbDoneCount++;
+    if (gFbBound) {
+        gFbBound = false;
+        gFbDoneRects = gImageRectCount;
+    }
 }

@@ -77,6 +77,14 @@ extern bool gBindFail; /* gfx_tex_bind_image fails */
 extern ImageRectRec gImageRects[MAX_IMAGE_RECTS];
 extern int gImageRectCount;
 extern bool gFbReady;  /* what gfx_fb_ready returns */
+extern bool gFbBindImage; /* gfx_fb_bind_image serves 320x240 images (a GPU texture of the frame or a capture) */
+extern int gFbBindCount;  /* gfx_fb_bind_image calls, and the last one's image and filtering */
+extern const void* gFbBindAddr;
+extern bool gFbBindLinear;
+extern GfxBindImageFn gFbBindFromRam; /* the last call's way back to RAM */
+extern bool gFbBound;                 /* the last gfx_fb_bind_image call served the image... */
+extern int gFbDoneCount;              /* ...gfx_fb_image_done calls... */
+extern int gFbDoneRects;              /* ...and gImageRectCount when the served image was done with (-1: not yet) */
 extern int gFbSyncCount; /* gfx_fb_sync_ram calls, and the last one's range */
 extern const void* gFbSyncAddr;
 extern uint32_t gFbSyncBytes;

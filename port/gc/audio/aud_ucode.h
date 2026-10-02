@@ -86,6 +86,11 @@ u32 AudUcode_GetOpCount(u32 op);
  *  outside RAM, since the statistics were cleared. They are skipped. */
 u32 AudUcode_GetErrorCount(void);
 
+#ifdef AUD_HOST_TEST
+/** The saturation the commands use (for the benchmark's check of its GameCube version) */
+s32 AudUcode_TestSat16(s32 x);
+#endif
+
 /*
  * Optional profiling (AUD_PROFILE builds): time spent per opcode, in clock ticks from the given
  * clock (gc_time_ticks on GameCube).

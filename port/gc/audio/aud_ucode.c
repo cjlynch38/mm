@@ -40,19 +40,30 @@
  * Higher opcodes jump through whatever follows the table; they are skipped and counted as errors.
  *
  * The host test (port/gc/tests/audio_host) checks all of this against the real microcode run on an
- * RSP interpreter: DMEM and RAM match bit for bit on random instances of every command and on
- * MM-like synthesis lists.
+ * RSP interpreter: DMEM and RAM match bit for bit on random instances of every command, on MM-like
+ * synthesis lists and on lists captured from the game.
  *
  * Byte order: DMEM and RAM hold big-endian data, as on N64. The GameCube is big-endian too, so the
  * BE16 conversions vanish there; they only swap in the x86 host tests.
  *
  * Performance: the hot commands (ADPCM, RESAMPLE, ENVMIXER, MIXER, ADDMIXER, FILTER, INTERL,
  * INTERLEAVE, DMEMMOVE) have a straight loop over the samples, used when their buffers do not
- * overlap (always, for MM's lists), and keep the exact vector-by-vector version for the rest. The
- * straight loops take exact shortcuts: ADPCM frames are unrolled, ENVMIXER skips the wet half for
- * notes without reverb and all of it for silent ones, RESAMPLE drops the intermediate saturations
- * the microcode's own table can never reach. Paired-single maths does not fit: a 16 x 16-bit product
- * needs 31 bits, more than a single-precision mantissa, so results would not be exact.
+ * overlap in a way that would change the result (always, for MM's lists), and keep the exact
+ * vector-by-vector version for the rest. The straight loops take exact shortcuts, each explained
+ * where it is taken:
+ *   - ADPCM multiplies the residuals by table lookups (AudAdpcmTable), cached across commands;
+ *   - RESAMPLE drops the intermediate saturations that the microcode's own table can never reach,
+ *     loads each sample once at a pitch of exactly 1, and stores outputs one by one while they stay
+ *     behind the input;
+ *   - ENVMIXER skips the wet half for notes without reverb and all of it for silent ones, and uses
+ *     mulhw for the (x * volume) >> 16 products;
+ *   - MIXER and FILTER use rearranged sums that are equal modulo 2^32 (fewer products, and FILTER's
+ *     32-bit sum where the microcode's accumulator is 48 bits wide);
+ *   - Sat16 is extsh/cmpw/branch with the clamping out of line.
+ * Paired singles do not pay off: a 16 x 16-bit product needs 31 bits, more than a single-precision
+ * mantissa, so the products would have to be split, and with the rounding each command does the
+ * paired version takes about as many cycles on the 750 as the integer one (the FPU does one paired
+ * operation per cycle, the integer units two instructions).
  */
 #include "aud_ucode.h"
 #include "PR/abi.h"
@@ -82,8 +93,10 @@
 
 #if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
 #define BE16(x) ((u16)__builtin_bswap16((u16)(x)))
+#define BE32(x) ((u32)__builtin_bswap32((u32)(x)))
 #else
 #define BE16(x) ((u16)(x))
+#define BE32(x) ((u32)(x))
 #endif
 
 #define ALIGN16_COUNT(n) (((n) + 15) & ~15)
@@ -116,7 +129,7 @@ static unsigned long long (*sProfileClock)(void);
 static unsigned long long sOpTicks[AUD_NUM_OPS];
 // A copy of the resample table in the microcode's data; sLutSafe points to it when it allows
 // RESAMPLE's shortcut (Aud_CheckLut), else NULL
-static u8 sLutCopy[DMEM_RESAMPLE_LUT_SIZE];
+static u8 sLutCopy[DMEM_RESAMPLE_LUT_SIZE] __attribute__((aligned(32)));
 static const u8* sLutSource;
 static const u8* sLutSafe;
 
@@ -156,7 +169,11 @@ static inline void Dmem_Sw(u32 addr, u32 val) {
     Dmem_Sh(addr + 2, val);
 }
 
-/* 16-bit lanes at even addresses below DMEM_SIZE (the fast paths) */
+/* 16-bit lanes at even addresses below DMEM_SIZE (the fast paths), words at multiples of 4 */
+
+static inline u32 Dmem_Get32(u32 addr) {
+    return BE32(*(u32*)&sDmem[addr]);
+}
 
 static inline s32 Dmem_Get16(u32 addr) {
     return (s16)BE16(*(u16*)&sDmem[addr]);
@@ -284,12 +301,52 @@ static inline s32 Dmem_Overlap(u32 a, u32 aSize, u32 b, u32 bSize) {
 /* Arithmetic                                                                                       */
 /* ------------------------------------------------------------------------------------------------ */
 
-/** Saturate to s16 (one compare: out of range iff x + 0x8000 is not in 0..0xFFFF) */
+/**
+ * Saturate to s16: out of range iff sign-extending the low 16 bits changes x. On the GameCube that is
+ * extsh, cmpw and a branch that is rarely taken, to the clamping placed after the file's code (gcc
+ * itself adds a register copy to every saturation for the same C). The clamping's srawi sets XER[CA],
+ * hence the "xer" clobber: gcc keeps the carry of 64-bit additions there (addc/adde), and must not
+ * place a saturation between the two halves of one. The clamping code comes after all of this file's
+ * code, and a conditional branch reaches 32 KiB: the furthest saturation is now 26 KiB from its
+ * clamping (33 KiB of .text in all). The assembler fails the build if one gets out of range.
+ */
+#if defined(__PPC__) && defined(__GNUC__)
 static inline s32 Sat16(s32 x) {
-    if ((u32)x + 0x8000 > 0xFFFF) {
+    s32 t;
+
+    __asm__("extsh %1,%0\n\t"
+            "cmpw %1,%0\n\t"
+            "bne- 2f\n"
+            "1:\n\t"
+            ".subsection 1\n"
+            "2:\tsrawi %0,%0,31\n\t"
+            "xori %0,%0,0x7fff\n\t"
+            "b 1b\n\t"
+            ".previous"
+            : "+r"(x), "=&r"(t)
+            :
+            : "cr0", "xer");
+    return x;
+}
+#else
+static inline s32 Sat16(s32 x) {
+    if (__builtin_expect((s16)x != x, 0)) {
         x = (x >> 31) ^ 0x7FFF;
     }
     return x;
+}
+#endif
+
+#ifdef AUD_HOST_TEST
+/** Sat16 for the benchmark's check of the GameCube version (aud_bench.c) */
+s32 AudUcode_TestSat16(s32 x) {
+    return Sat16(x);
+}
+#endif
+
+/** High word of the signed 64-bit product (mulhw): (a * b) >> 32 */
+static inline s32 Mulhw(s32 a, s32 b) {
+    return (s32)(((s64)a * b) >> 32);
 }
 
 /** vmulf: (a * b * 2 + 0x8000) >> 16, saturated (only -0x8000 * -0x8000 saturates) */
@@ -635,25 +692,123 @@ static void Aud_MultTable(u32 w0, u32 w1) {
 /* ------------------------------------------------------------------------------------------------ */
 
 /**
- * 8 samples of one half of an ADPCM frame: o[i] = (b1[i] * l1 + b2[i] * l2 + sum over j < i of
- * b2[i - 1 - j] * x[j] + x[i] << 11) >> 11, saturated, accumulated in 32 bits (wrapping like the
- * vector accumulator's 32 bits that the microcode keeps). l1, l2 are the two samples before the half.
+ * The straight ADPCM loop's tables. Sample i of a half frame is (b1[i] * l1 + b2[i] * l2 + sum over j < i
+ * of b2[i - 1 - j] * x[j] + x[i] << 11) >> 11, saturated, accumulated in 32 bits (wrapping like the
+ * vector accumulator's 32 bits that the microcode keeps), where l1, l2 are the two samples before the
+ * half and x[j] the residuals. A residual is n << s, n its signed 4-bit (2-bit) value and s the frame's
+ * scale capped at 12 (14), so the residual terms are R_i << s modulo 2^32, with
+ * R_i = n_i << 11 + sum over j < i of b2[i - 1 - j] * n_j: products of b2 with one of 16 values. Each
+ * codebook entry gets a table of them, a 32-byte row per n: rows[n & 15][k] = n * b2[k] for k < 7, and
+ * n << 11 in column 7. The tables live in a 2-way set-associative cache keyed by the 16 bytes of b2
+ * they are made from, so that the codebooks of the notes playing (about 20 different entries in Clock
+ * Town) are made once rather than for every command.
  */
-static inline __attribute__((always_inline)) void Aud_AdpcmHalf(s32* o, const s32* b1, const s32* b2, const s32* x,
-                                                                s32 l1, s32 l2) {
-    u32 acc;
+typedef struct {
+    /* 0x000 */ s32 rows[16][8];
+    /* 0x200 */ u32 key[4];
+    /* 0x210 */ s32 valid;
+} AudAdpcmTable; // size = 0x220
+
+#ifndef AUD_ADPCM_SETS
+#define AUD_ADPCM_SETS 32 // a power of 2 (the host test makes it 2, to replace tables often)
+#endif
+
+static AudAdpcmTable sAdpcmTables[AUD_ADPCM_SETS][2] __attribute__((aligned(32)));
+static u8 sAdpcmNextWay[AUD_ADPCM_SETS]; // the way of each set to replace next
+static u32 sAdpcmTablesMade;             // counts the tables made (each replaces one)
+
+/** The table of DMEM's codebook entry e, from the cache, or made */
+static const s32* Aud_AdpcmRows(u32 e) {
+    const s16* b2 = Dmem_Ptr16(DMEM_ADPCM_BOOK + e * 32 + 16);
+    const u32* key = (const u32*)b2;
+    u32 h = (key[0] * 0x9E3779B1u) ^ (key[1] * 0x85EBCA6Bu) ^ (key[2] * 0xC2B2AE35u) ^ key[3];
+    u32 set = (h ^ (h >> 15) ^ (h >> 27)) & (AUD_ADPCM_SETS - 1);
+    AudAdpcmTable* t;
+    s32 b;
+    s32 v;
+    s32 n;
+    s32 k;
+
+    for (k = 0; k < 2; k++) {
+        t = &sAdpcmTables[set][k];
+        if (t->valid && (t->key[0] == key[0]) && (t->key[1] == key[1]) && (t->key[2] == key[2]) &&
+            (t->key[3] == key[3])) {
+            sAdpcmNextWay[set] = k ^ 1;
+            return &t->rows[0][0];
+        }
+    }
+    t = &sAdpcmTables[set][sAdpcmNextWay[set]];
+    sAdpcmNextWay[set] ^= 1;
+    sAdpcmTablesMade++;
+    for (k = 0; k < 7; k++) {
+        b = Ptr_Get16(&b2[k]);
+        v = -8 * b;
+        for (n = -8; n < 8; n++) {
+            t->rows[n & 15][k] = v;
+            v += b;
+        }
+    }
+    for (n = -8; n < 8; n++) {
+        t->rows[n & 15][7] = n * 2048;
+    }
+    for (k = 0; k < 4; k++) {
+        t->key[k] = key[k];
+    }
+    t->valid = true;
+    return &t->rows[0][0];
+}
+
+/**
+ * 8 samples of a half frame: its residuals (4 bytes from nib, 2 with shortMode), the table rows of their
+ * codebook entry (see AudAdpcmTable), the entry bk (b1 then b2), the scale s; l1, l2 are the two samples
+ * before the half, and become the half's last two. The residuals are added in one at a time, each to the
+ * sums of all the samples it reaches, so that only the 8 sums and one row are live.
+ */
+static inline __attribute__((always_inline)) void Aud_AdpcmHalf(s16* restrict dst, const s16* bk, const u8* nib,
+                                                                const s32* rows, s32* l1, s32* l2, s32 s,
+                                                                const s32 shortMode) {
+    // The rows of a 2-bit value: 0, 1, -2, -1
+    static const u8 sRows2[4] = { 0, 1, 14, 15 };
+    const s32* row;
+    s32 sum[8];
+    s32 o[8];
+    s32 p1;
+    s32 p2;
+    u32 d;
     s32 i;
     s32 j;
 
 #pragma GCC unroll 8
     for (i = 0; i < 8; i++) {
-        acc = (u32)(b1[i] * l1) + (u32)(b2[i] * l2) + ((u32)x[i] << 11);
-#pragma GCC unroll 8
-        for (j = 0; j < i; j++) {
-            acc += (u32)(b2[i - 1 - j] * x[j]);
-        }
-        o[i] = Sat16((s32)acc >> 11);
+        sum[i] = 0;
     }
+#pragma GCC unroll 8
+    for (j = 0; j < 8; j++) {
+        if (shortMode) {
+            d = nib[j >> 2];
+            row = rows + 8 * sRows2[(d >> (6 - 2 * (j & 3))) & 3];
+        } else {
+            d = nib[j >> 1];
+            row = rows + 8 * ((j & 1) ? (d & 0xF) : (d >> 4));
+        }
+        sum[j] += row[7];
+#pragma GCC unroll 8
+        for (i = j + 1; i < 8; i++) {
+            sum[i] += row[i - 1 - j];
+        }
+    }
+    // Keeps gcc from computing the 16 products before the sums, which needs more registers than there are
+    p1 = *l1;
+    p2 = *l2;
+    __asm__ __volatile__("" : "+r"(p1), "+r"(p2) : : "memory");
+#pragma GCC unroll 8
+    for (i = 0; i < 8; i++) {
+        o[i] =
+            Sat16((s32)((u32)(Ptr_Get16(&bk[i]) * p1) + (u32)(Ptr_Get16(&bk[8 + i]) * p2) + ((u32)sum[i] << s)) >> 11);
+        Ptr_Set16(&dst[i], o[i]);
+    }
+    *l1 = o[6];
+    *l2 = o[7];
 }
 
 /**
@@ -678,28 +833,13 @@ static void Aud_Adpcm(u32 w0, u32 w1) {
     s32 shiftBase = shortMode ? 14 : 12;
     s16 zero[8];
     s16 prev[8];
-    s16 data[8];
-    s16 nextData[8];
-    s16 book[16];
-    s16 nextBook[16];
-    s16 x[16];
-    s16 o[16];
     u32 header;
-    u32 nextHeader;
-    u32 entry;
-    s32 shift;
-    u32 nibbles;
-    u32 acc;
     u32 nframes;
     u32 inSize;
-    s32 i;
-    s32 j;
 
     Vec_Lqv(sRegs.v31, DMEM_CONST);
     __builtin_memset(zero, 0, sizeof(zero));
     __builtin_memset(prev, 0, sizeof(prev));
-    __builtin_memset(data, 0, sizeof(data));
-    __builtin_memset(nextData, 0, sizeof(nextData));
 
     Vec_Sqv(zero, out);
     Vec_Sqv(zero, out + 16);
@@ -711,59 +851,71 @@ static void Aud_Adpcm(u32 w0, u32 w1) {
 
     nframes = (count + 31) >> 5;
     inSize = (nframes - 1) * frameSize + 9;
+    // The vector loop reads a frame before it stores the previous one. Going straight through gives the
+    // same samples when the output and the input are apart, and also when the output stays below the
+    // input: frame f ends at out + 32 * (f + 1), frame f's input starts at in + frameSize * f, and the
+    // gap between them shrinks with f (MM decodes some notes from DMEM 0x850 into 0x590)
     if (FAST_PATH_OK && (count != 0) && ((out & 1) == 0) && (out + nframes * 32 <= AUD_DMEM_SIZE) &&
-        (in + inSize <= AUD_DMEM_SIZE) && !Dmem_Overlap(out, nframes * 32, in, inSize) &&
+        (in + inSize <= AUD_DMEM_SIZE) &&
+        (!Dmem_Overlap(out, nframes * 32, in, inSize) || (out + nframes * 32 <= in + (nframes - 1) * frameSize)) &&
         !Dmem_Overlap(out, nframes * 32, DMEM_ADPCM_BOOK, 16 * 32)) {
-        // The output overlaps neither the input nor the codebook: straight through, frame by frame
+        // The output does not overlap the codebook either: straight through, frame by frame. The
+        // residual (n << 12 or n << 14 as s16) >> (12 - scale) or (14 - scale) when positive is n << s.
+        // The codebook cannot change during the command: each entry's table is looked up once, unless
+        // making another entry's table replaces it
         const u8* src = &sDmem[in];
         s16* dst = Dmem_Ptr16(out);
         const s16* bk;
-        s32 b1[8];
-        s32 b2[8];
-        s32 r[16];
-        s32 res[16];
+        const s32* rows;
+        const s32* entryRows[16] __attribute__((uninitialized));
+        u32 known = 0;
+        u32 made;
         s32 l1 = prev[6];
         s32 l2 = prev[7];
-        u32 d;
+        s32 s;
 
         do {
             header = src[0];
             bk = Dmem_Ptr16(DMEM_ADPCM_BOOK + (header & 0xF) * 32);
-            for (i = 0; i < 8; i++) {
-                b1[i] = Ptr_Get16(&bk[i]);
-                b2[i] = Ptr_Get16(&bk[8 + i]);
+            if (!(known & (1u << (header & 0xF)))) {
+                made = sAdpcmTablesMade;
+                entryRows[header & 0xF] = Aud_AdpcmRows(header & 0xF);
+                known = (sAdpcmTablesMade == made) ? (known | (1u << (header & 0xF))) : (1u << (header & 0xF));
             }
-            // Residual << 12 (<< 14) as s16, then >> (12 - scale) (>> (14 - scale)) if positive
-            shift = shiftBase - (s32)(header >> 4);
-            shift = 16 + ((shift > 0) ? shift : 0);
+            rows = entryRows[header & 0xF];
+            s = header >> 4;
+            if (s > shiftBase) {
+                s = shiftBase;
+            }
             if (shortMode) {
-                for (i = 0; i < 4; i++) {
-                    d = src[1 + i];
-                    r[4 * i + 0] = (s32)((d & 0xC0) << 24) >> shift;
-                    r[4 * i + 1] = (s32)((d & 0x30) << 26) >> shift;
-                    r[4 * i + 2] = (s32)((d & 0x0C) << 28) >> shift;
-                    r[4 * i + 3] = (s32)(d << 30) >> shift;
-                }
+                Aud_AdpcmHalf(&dst[0], bk, &src[1], rows, &l1, &l2, s, true);
+                Aud_AdpcmHalf(&dst[8], bk, &src[3], rows, &l1, &l2, s, true);
             } else {
-                for (i = 0; i < 8; i++) {
-                    d = src[1 + i];
-                    r[2 * i + 0] = (s32)((d & 0xF0) << 24) >> shift;
-                    r[2 * i + 1] = (s32)(d << 28) >> shift;
-                }
+                Aud_AdpcmHalf(&dst[0], bk, &src[1], rows, &l1, &l2, s, false);
+                Aud_AdpcmHalf(&dst[8], bk, &src[5], rows, &l1, &l2, s, false);
             }
-            Aud_AdpcmHalf(&res[0], b1, b2, &r[0], l1, l2);
-            Aud_AdpcmHalf(&res[8], b1, b2, &r[8], res[6], res[7]);
-            for (i = 0; i < 16; i++) {
-                Ptr_Set16(&dst[i], res[i]);
-            }
-            l1 = res[14];
-            l2 = res[15];
             src += frameSize;
             dst += 16;
             count -= 32;
         } while (count > 0);
         out += nframes * 32;
     } else if (count != 0) {
+        s16 data[8];
+        s16 nextData[8];
+        s16 book[16];
+        s16 nextBook[16];
+        s16 x[16];
+        s16 o[16];
+        u32 nextHeader;
+        u32 entry;
+        s32 shift;
+        u32 nibbles;
+        u32 acc;
+        s32 i;
+        s32 j;
+
+        __builtin_memset(data, 0, sizeof(data));
+        __builtin_memset(nextData, 0, sizeof(nextData));
         header = Dmem_Lbu(in);
         Vec_LoadBytes(data, 0, in + 1, 8);
         entry = DMEM_ADPCM_BOOK + (header & 0xF) * 32;
@@ -901,18 +1053,57 @@ static inline s32 Aud_ResampleTap(u32 sampleAddr, u32 lutAddr) {
 static inline __attribute__((always_inline)) u32 Aud_ResampleLoop(s16* po, s32 in, u32 pos, u32 step, s32 n,
                                                                   const s32 safeLut) {
     const s16* lut = Dmem_Ptr16(DMEM_RESAMPLE_LUT);
+    const s16* base = Dmem_Ptr16(in);
     const s16* s;
     const s16* c;
     s32 k;
 
-    for (k = 0; k < n; k++) {
-        s = Dmem_Ptr16(in + 2 * (pos >> 16));
+    // Rounded product of a sample and a coefficient
+#define AUD_RS(x, y) (((x) * (y) + 0x4000) >> 15)
+
+    if (safeLut && (step == 0x10000)) {
+        // A pitch of exactly 1 (MM's most common): one table row, and each output starts a sample after
+        // the previous one, so each sample is loaded once. n is a multiple of 8.
+        s32 c0;
+        s32 c1;
+        s32 c2;
+        s32 c3;
+        s32 x0;
+        s32 x1;
+        s32 x2;
+        s32 x3;
+
         c = &lut[(pos >> 10 & 0x3F) * 4];
+        c0 = Ptr_Get16(&c[0]);
+        c1 = Ptr_Get16(&c[1]);
+        c2 = Ptr_Get16(&c[2]);
+        c3 = Ptr_Get16(&c[3]);
+        s = base + (pos >> 16);
+        x0 = Ptr_Get16(&s[0]);
+        x1 = Ptr_Get16(&s[1]);
+        x2 = Ptr_Get16(&s[2]);
+        for (k = 0; k < n; k += 4) {
+            x3 = Ptr_Get16(&s[k + 3]);
+            Ptr_Set16(&po[k + 0], Sat16(AUD_RS(x0, c0) + AUD_RS(x1, c1) + AUD_RS(x2, c2) + AUD_RS(x3, c3)));
+            x0 = Ptr_Get16(&s[k + 4]);
+            Ptr_Set16(&po[k + 1], Sat16(AUD_RS(x1, c0) + AUD_RS(x2, c1) + AUD_RS(x3, c2) + AUD_RS(x0, c3)));
+            x1 = Ptr_Get16(&s[k + 5]);
+            Ptr_Set16(&po[k + 2], Sat16(AUD_RS(x2, c0) + AUD_RS(x3, c1) + AUD_RS(x0, c2) + AUD_RS(x1, c3)));
+            x2 = Ptr_Get16(&s[k + 6]);
+            Ptr_Set16(&po[k + 3], Sat16(AUD_RS(x3, c0) + AUD_RS(x0, c1) + AUD_RS(x1, c2) + AUD_RS(x2, c3)));
+        }
+        return pos + n * step;
+    }
+
+    // One add per pointer below (gcc would otherwise add sDmem and in separately)
+    __asm__("" : "+r"(base), "+r"(lut));
+    for (k = 0; k < n; k++) {
+        s = (const s16*)((const u8*)base + ((pos >> 15) & ~1));
+        c = (const s16*)((const u8*)lut + ((pos >> 7) & 0x1F8));
         if (safeLut) {
-            Ptr_Set16(&po[k], Sat16(((Ptr_Get16(&s[0]) * Ptr_Get16(&c[0]) + 0x4000) >> 15) +
-                                    ((Ptr_Get16(&s[1]) * Ptr_Get16(&c[1]) + 0x4000) >> 15) +
-                                    ((Ptr_Get16(&s[2]) * Ptr_Get16(&c[2]) + 0x4000) >> 15) +
-                                    ((Ptr_Get16(&s[3]) * Ptr_Get16(&c[3]) + 0x4000) >> 15)));
+            Ptr_Set16(&po[k],
+                      Sat16(AUD_RS(Ptr_Get16(&s[0]), Ptr_Get16(&c[0])) + AUD_RS(Ptr_Get16(&s[1]), Ptr_Get16(&c[1])) +
+                            AUD_RS(Ptr_Get16(&s[2]), Ptr_Get16(&c[2])) + AUD_RS(Ptr_Get16(&s[3]), Ptr_Get16(&c[3]))));
         } else {
             Ptr_Set16(
                 &po[k],
@@ -922,6 +1113,58 @@ static inline __attribute__((always_inline)) u32 Aud_ResampleLoop(s16* po, s32 i
         pos += step;
     }
     return pos;
+#undef AUD_RS
+}
+
+/**
+ * Aud_ResampleLoop with and without safeLut, as functions of their own (inlined into Aud_Resample, the
+ * loop does not get gcc's count register loop)
+ */
+static __attribute__((noinline)) u32 Aud_ResampleSafe(s16* po, s32 in, u32 pos, u32 step, s32 n) {
+    return Aud_ResampleLoop(po, in, pos, step, n, true);
+}
+
+static __attribute__((noinline)) u32 Aud_ResampleUnsafe(s16* po, s32 in, u32 pos, u32 step, s32 n) {
+    return Aud_ResampleLoop(po, in, pos, step, n, false);
+}
+
+/**
+ * Can RESAMPLE's n outputs at out be stored one by one, rather than 8 at a time after their inputs are
+ * read, from the input at in (the state samples included) to the end? Yes when they overlap nothing
+ * they read, and also when out is far enough behind in that no output lands where a later one reads
+ * (MM resamples some notes into DMEM 0x3B0 from 0x3D0): output k is stored at out + 2k and output
+ * m > k reads from in + 2 * floor(pos_m), pos_m >= m * step / 2^16, so it suffices that
+ * in - out >= 2 + 2 * n * (2^16 - step) / 2^16 (in >= out for steps of at least a sample).
+ */
+static inline s32 Aud_ResampleOutBehind(u32 out, u32 in, u32 n, u32 step) {
+    u32 posEnd = step * (n + 7) + 0xFFFF; // past the furthest position read, as endPos
+
+    if (!Dmem_Overlap(out, 2 * n, in, 2 * (posEnd >> 16) + 8)) {
+        return true;
+    }
+    if (in < out) {
+        return false;
+    }
+    if (step >= 0x10000) {
+        return true;
+    }
+    return (in - out >= 2) && ((in - out - 2) * 0x8000 >= n * (0x10000 - step));
+}
+
+/**
+ * Do bytes offset..offset + size (multiples of 8) of DMEM's resample table match `lut` (the same part of
+ * a whole table)? Compared 8 bytes at a time, without stopping early (they normally match)
+ */
+static inline s32 Aud_LutMatches(const u8* lut, u32 offset, u32 size) {
+    const u32* a = (const u32*)&sDmem[DMEM_RESAMPLE_LUT + offset];
+    const u32* b = (const u32*)&lut[offset];
+    u32 diff = 0;
+    u32 i;
+
+    for (i = 0; i < size / 4; i += 2) {
+        diff |= (a[i] ^ b[i]) | (a[i + 1] ^ b[i + 1]);
+    }
+    return diff == 0;
 }
 
 /**
@@ -1033,21 +1276,21 @@ static void Aud_Resample(u32 w0, u32 w1) {
     endPos = frac + step * (u32)(nb * 8 + 7);
 
     if (FAST_PATH_OK && ((endPos >> 16) <= 0x7FFF) && (in >= 0) && ((in & 1) == 0) && Dmem_Fits(out, outBytes, 16) &&
-        ((u32)in + 2 * (endPos >> 16) + 8 <= AUD_DMEM_SIZE) &&
-        !Dmem_Overlap(out, outBytes, in, 2 * (endPos >> 16) + 8) &&
+        ((u32)in + 2 * (endPos >> 16) + 8 <= AUD_DMEM_SIZE) && Aud_ResampleOutBehind(out, in, nb * 8, step) &&
         !Dmem_Overlap(out, outBytes, DMEM_RESAMPLE_LUT, DMEM_RESAMPLE_LUT_SIZE) &&
         !Dmem_Overlap(out, outBytes, DMEM_STATE, AUD_DMEM_SIZE - DMEM_STATE) &&
         !Dmem_Overlap(in, 2 * (endPos >> 16) + 8, DMEM_RESAMPLE_ADDRS, 0x20)) {
-        // No position saturates, the output overlaps nothing it reads, and the input does not reach the
-        // address tables the vector loop rewrites between batches: one straight loop. With the
+        // No position saturates, no output is stored where a later one reads, and the input does not
+        // reach the address tables the vector loop rewrites between batches: one straight loop. With the
         // microcode's own table in DMEM, only the final sum can saturate (see Aud_CheckLut).
         po = Dmem_Ptr16(out);
         pos = frac;
-        if ((sLutSafe != NULL) &&
-            (__builtin_memcmp(&sDmem[DMEM_RESAMPLE_LUT], sLutSafe, DMEM_RESAMPLE_LUT_SIZE) == 0)) {
-            pos = Aud_ResampleLoop(po, in, pos, step, nb * 8, true);
+        // With a pitch of 1 only the row of the fraction is used
+        if ((sLutSafe != NULL) && ((step == 0x10000) ? Aud_LutMatches(sLutSafe, (frac >> 10) * 8, 8)
+                                                     : Aud_LutMatches(sLutSafe, 0, DMEM_RESAMPLE_LUT_SIZE))) {
+            pos = Aud_ResampleSafe(po, in, pos, step, nb * 8);
         } else {
-            pos = Aud_ResampleLoop(po, in, pos, step, nb * 8, false);
+            pos = Aud_ResampleUnsafe(po, in, pos, step, nb * 8);
         }
         // The positions of the batch after the last one: the pipelined loop leaves their address tables
         for (i = 0; i < 8; i++) {
@@ -1136,19 +1379,56 @@ static void Aud_Mixer(u32 w0, u32 w1) {
     s16 o1[8];
     s16 i0[8];
     s16 i1[8];
+    u32 i;
     u32 k;
 
     Vec_Lqv(sRegs.v31, DMEM_CONST);
     scale = sRegs.v31[6];
 
+    // The vector loop below only ever reads samples that it has not written yet when in is at or above
+    // out (both 16-byte aligned: MM's comb filter mixes 0x750 into 0x740), so the straight loop gives the
+    // same result then, and for disjoint buffers
     if (FAST_PATH_OK && (scale == 0x7FFF) && Dmem_Fits(out, size, 16) && Dmem_Fits(in, size, 16) &&
-        ((in == out) || !Dmem_Overlap(out, size, in, size))) {
-        // o * 0x7FFF + i * gain + 0x4000 stays within 32 bits
+        ((in >= out) || !Dmem_Overlap(out, size, in, size))) {
+        // (o * 0x7FFF + i * gain + 0x4000) >> 15 (within 32 bits) = o + ((i * gain - o + 0x4000) >> 15), as
+        // o * 0x8000 is a multiple of 2^15
+        s32 x[4];
+        s32 o[4];
+
         po = Dmem_Ptr16(out);
         pi = Dmem_Ptr16(in);
-        for (k = 0; k < size / 2; k++) {
-            Ptr_Set16(&po[k], Sat16((Ptr_Get16(&po[k]) * 0x7FFF + Ptr_Get16(&pi[k]) * gain + 0x4000) >> 15));
+        k = size / 8;
+        if (gain == 0x7FFF) {
+            // MM's wet-to-dry mix: i * 0x7FFF = i * 0x8000 - i, so the sum is o + i + ((0x4000 - o - i) >> 15)
+            do {
+#pragma GCC unroll 4
+                for (i = 0; i < 4; i++) {
+                    o[i] = Ptr_Get16(&po[i]) + Ptr_Get16(&pi[i]);
+                }
+#pragma GCC unroll 4
+                for (i = 0; i < 4; i++) {
+                    Ptr_Set16(&po[i], Sat16(o[i] + ((0x4000 - o[i]) >> 15)));
+                }
+                po += 4;
+                pi += 4;
+            } while (--k != 0);
+            return;
         }
+        do {
+            // All 4 inputs first (in can be out, and is then read where it is written; a higher in is
+            // read before the samples of the group are written)
+#pragma GCC unroll 4
+            for (i = 0; i < 4; i++) {
+                o[i] = Ptr_Get16(&po[i]);
+                x[i] = Ptr_Get16(&pi[i]);
+            }
+#pragma GCC unroll 4
+            for (i = 0; i < 4; i++) {
+                Ptr_Set16(&po[i], Sat16(o[i] + ((x[i] * gain - o[i] + 0x4000) >> 15)));
+            }
+            po += 4;
+            pi += 4;
+        } while (--k != 0);
         return;
     }
 
@@ -1263,12 +1543,20 @@ static void Aud_EnvSetup2(u32 w0, u32 w1) {
  * throughout and no wet XOR (useWet false) every wet sample is 0, so the wet buffers stay as they are.
  */
 static inline __attribute__((always_inline)) void
-Aud_EnvMixerLoop(const s16* pin, s16* pdl, s16* pdr, s16* pwl, s16* pwr, u16* vol, u16 rampL, u16 rampR, u16 rampRev,
-                 s32 count, s32 xorDryL, s32 xorDryR, s32 xorWetL, s32 xorWetR, const s32 useXor, const s32 useWet) {
-    s32 volL;
-    s32 volR;
+Aud_EnvMixerLoop(const s16* restrict pin, s16* restrict pdl, s16* restrict pdr, s16* restrict pwl, s16* restrict pwr,
+                 u16* vol, u16 rampL, u16 rampR, u16 rampRev, s32 count, s32 xorDryL, s32 xorDryR, s32 xorWetL,
+                 s32 xorWetR, const s32 useXor, const s32 useWet, const s32 revShort) {
+    // The volumes of both halves, in registers (u16, so (s << 16) * vol fits mulhw's signed operands)
+    u32 volL0 = vol[0];
+    u32 volL1 = vol[1];
+    u32 volR0 = vol[2];
+    u32 volR1 = vol[3];
+    u32 rev0 = vol[4];
+    u32 rev1 = vol[5];
+    u32 volL;
+    u32 volR;
     s32 rev;
-    s32 s;
+    s32 sh;
     s32 dryL;
     s32 dryR;
     s32 wetL;
@@ -1278,25 +1566,34 @@ Aud_EnvMixerLoop(const s16* pin, s16* pdl, s16* pdr, s16* pwl, s16* pwr, u16* vo
 
     do {
         for (half = 0; half < 2; half++) {
-            volL = vol[0 + half];
-            volR = vol[2 + half];
-            rev = vol[4 + half];
+            volL = half ? volL1 : volL0;
+            volR = half ? volR1 : volR0;
+            rev = half ? rev1 : rev0;
+#pragma GCC unroll 8
             for (k = 0; k < 8; k++) {
-                s = Ptr_Get16(&pin[k]);
-                dryL = (s * volL) >> 16;
-                dryR = (s * volR) >> 16;
+                // (s * vol) >> 16 = mulhw(s << 16, vol)
+                sh = Ptr_Get16(&pin[k]) << 16;
+                dryL = Mulhw(sh, volL);
+                dryR = Mulhw(sh, volR);
                 if (useXor) {
-                    dryL = (s16)(dryL ^ xorDryL);
-                    dryR = (s16)(dryR ^ xorDryR);
+                    // The XOR values are 0, -1, -2 or -4: the results stay within s16 without truncating
+                    dryL ^= xorDryL;
+                    dryR ^= xorDryR;
                 }
                 Ptr_Set16(&pdl[k], Sat16(Ptr_Get16(&pdl[k]) + dryL));
                 Ptr_Set16(&pdr[k], Sat16(Ptr_Get16(&pdr[k]) + dryR));
                 if (useWet) {
-                    wetL = (dryL * rev) >> 16;
-                    wetR = (dryR * rev) >> 16;
+                    if (revShort) {
+                        // (dry * rev) >> 16 = mulhw(dry, rev << 16) while rev < 0x8000
+                        wetL = Mulhw(dryL, rev << 16);
+                        wetR = Mulhw(dryR, rev << 16);
+                    } else {
+                        wetL = (dryL * rev) >> 16;
+                        wetR = (dryR * rev) >> 16;
+                    }
                     if (useXor) {
-                        wetL = (s16)(wetL ^ xorWetL);
-                        wetR = (s16)(wetR ^ xorWetR);
+                        wetL ^= xorWetL;
+                        wetR ^= xorWetR;
                     }
                     Ptr_Set16(&pwl[k], Sat16(Ptr_Get16(&pwl[k]) + wetL));
                     Ptr_Set16(&pwr[k], Sat16(Ptr_Get16(&pwr[k]) + wetR));
@@ -1308,14 +1605,20 @@ Aud_EnvMixerLoop(const s16* pin, s16* pdl, s16* pdr, s16* pwl, s16* pwr, u16* vo
             pwl += 8;
             pwr += 8;
         }
-        vol[0] += rampL;
-        vol[1] += rampL;
-        vol[2] += rampR;
-        vol[3] += rampR;
-        vol[4] += rampRev;
-        vol[5] += rampRev;
+        volL0 = (u16)(volL0 + rampL);
+        volL1 = (u16)(volL1 + rampL);
+        volR0 = (u16)(volR0 + rampR);
+        volR1 = (u16)(volR1 + rampR);
+        rev0 = (u16)(rev0 + rampRev);
+        rev1 = (u16)(rev1 + rampRev);
         count -= 16;
     } while (count > 0);
+    vol[0] = volL0;
+    vol[1] = volL1;
+    vol[2] = volR0;
+    vol[3] = volR1;
+    vol[4] = rev0;
+    vol[5] = rev1;
 }
 
 /**
@@ -1342,16 +1645,6 @@ static void Aud_EnvMixer(u32 w0, u32 w1) {
     u16 rampR;
     u16 rampRev;
     u16 vol[6];
-    s16 x[16];
-    s16 vdl[16];
-    s16 vdr[16];
-    s16 vwl[16];
-    s16 vwr[16];
-    s32 dryL;
-    s32 dryR;
-    s32 wetL;
-    s32 wetR;
-    s32 half;
     s32 k;
 
     sRegs.envRampL *= 2;
@@ -1378,19 +1671,36 @@ static void Aud_EnvMixer(u32 w0, u32 w1) {
 
         if ((xorDryL | xorDryR | xorWetL | xorWetR) != 0) {
             Aud_EnvMixerLoop(pin, pdl, pdr, pwl, pwr, vol, rampL, rampR, rampRev, count, xorDryL, xorDryR, xorWetL,
-                             xorWetR, true, true);
+                             xorWetR, true, true, false);
         } else if ((vol[0] | vol[1] | vol[2] | vol[3] | rampL | rampR) == 0) {
             // Silent: every dry sample is 0, so every wet one too. Only the reverb volumes ramp.
             k = (count > 16) ? ((count + 15) >> 4) : 1;
             vol[4] += rampRev * k;
             vol[5] += rampRev * k;
         } else if ((vol[4] | vol[5] | rampRev) == 0) {
-            Aud_EnvMixerLoop(pin, pdl, pdr, pwl, pwr, vol, rampL, rampR, rampRev, count, 0, 0, 0, 0, false, false);
+            Aud_EnvMixerLoop(pin, pdl, pdr, pwl, pwr, vol, rampL, rampR, rampRev, count, 0, 0, 0, 0, false, false,
+                             false);
+        } else if ((rampRev == 0) && (vol[4] < 0x8000) && (vol[5] < 0x8000)) {
+            // A constant reverb volume below 0x8000 (MM's reverb volume is the note's (0-0x7F) << 9; those of
+            // the Clock Town captures are all below 0x40 << 9)
+            Aud_EnvMixerLoop(pin, pdl, pdr, pwl, pwr, vol, rampL, rampR, rampRev, count, 0, 0, 0, 0, false, true, true);
         } else {
-            Aud_EnvMixerLoop(pin, pdl, pdr, pwl, pwr, vol, rampL, rampR, rampRev, count, 0, 0, 0, 0, false, true);
+            Aud_EnvMixerLoop(pin, pdl, pdr, pwl, pwr, vol, rampL, rampR, rampRev, count, 0, 0, 0, 0, false, true,
+                             false);
         }
     } else {
         // The vector loop's order: all four destinations of 16 samples are read before any is written
+        s16 x[16];
+        s16 vdl[16];
+        s16 vdr[16];
+        s16 vwl[16];
+        s16 vwr[16];
+        s32 dryL;
+        s32 dryR;
+        s32 wetL;
+        s32 wetR;
+        s32 half;
+
         __builtin_memset(x, 0, sizeof(x));
         Vec_Lqv(&x[0], in);
         do {
@@ -1448,6 +1758,96 @@ static void Aud_EnvMixer(u32 w0, u32 w1) {
 /* ------------------------------------------------------------------------------------------------ */
 
 /**
+ * FILTER's straight loop: the 8-tap FIR in place over count bytes (8 samples per step), from the 8
+ * coefficients cf and the 8 previous inputs w, which it replaces with the last 8 inputs. Returns the
+ * count left. With |cf| summing to at most 0xFFFF, |sum| <= 0xFFFF * 0x8000, so sum + 0x4000 fits in 32
+ * bits, and the microcode's (0x8000 + 2 * sum) >> 16 is (0x4000 + sum) >> 15. For MM's coefficients the
+ * sum takes fewer products (and is the same modulo 2^32, so the result is the same):
+ *   - AUD_FIR_SYMMETRIC: cf[0..6] a palindrome (the low- and high-pass tables): the taps that share a
+ *     coefficient are added first, 5 products instead of 8;
+ *   - AUD_FIR_CENTER: only cf[3] is not 0 (the identity filter, which most filtered notes have): 1.
+ */
+#define AUD_FIR_GENERAL 0
+#define AUD_FIR_SYMMETRIC 1
+#define AUD_FIR_CENTER 2
+
+static inline __attribute__((always_inline)) s32 Aud_FilterFir(s16* p, s32 count, const s16* cf, s16* w,
+                                                               const s32 mode) {
+    s32 c0 = cf[0];
+    s32 c1 = cf[1];
+    s32 c2 = cf[2];
+    s32 c3 = cf[3];
+    s32 c4 = cf[4];
+    s32 c5 = cf[5];
+    s32 c6 = cf[6];
+    s32 c7 = cf[7];
+    // The 7 inputs before the step, oldest first
+    s32 h1 = w[1];
+    s32 h2 = w[2];
+    s32 h3 = w[3];
+    s32 h4 = w[4];
+    s32 h5 = w[5];
+    s32 h6 = w[6];
+    s32 h7 = w[7];
+    s32 a0;
+    s32 a1;
+    s32 a2;
+    s32 a3;
+    s32 a4;
+    s32 a5;
+    s32 a6;
+    s32 a7;
+
+    // Output from the current input x0 and the 7 before it (x7 the oldest)
+#define AUD_FIR(x0, x1, x2, x3, x4, x5, x6, x7)                                                               \
+    Sat16(((mode == AUD_FIR_CENTER) ? (0x4000 + c3 * x3)                                                      \
+           : (mode == AUD_FIR_SYMMETRIC)                                                                      \
+               ? (0x4000 + c0 * (x0 + x6) + c1 * (x1 + x5) + c2 * (x2 + x4) + c3 * x3 + c7 * x7)              \
+               : (0x4000 + c0 * x0 + c1 * x1 + c2 * x2 + c3 * x3 + c4 * x4 + c5 * x5 + c6 * x6 + c7 * x7)) >> \
+          15)
+
+    do {
+        // In place: the step's 8 inputs are read before its outputs are written
+        a0 = Ptr_Get16(&p[0]);
+        a1 = Ptr_Get16(&p[1]);
+        a2 = Ptr_Get16(&p[2]);
+        a3 = Ptr_Get16(&p[3]);
+        a4 = Ptr_Get16(&p[4]);
+        a5 = Ptr_Get16(&p[5]);
+        a6 = Ptr_Get16(&p[6]);
+        a7 = Ptr_Get16(&p[7]);
+        Ptr_Set16(&p[0], AUD_FIR(a0, h7, h6, h5, h4, h3, h2, h1));
+        Ptr_Set16(&p[1], AUD_FIR(a1, a0, h7, h6, h5, h4, h3, h2));
+        Ptr_Set16(&p[2], AUD_FIR(a2, a1, a0, h7, h6, h5, h4, h3));
+        Ptr_Set16(&p[3], AUD_FIR(a3, a2, a1, a0, h7, h6, h5, h4));
+        Ptr_Set16(&p[4], AUD_FIR(a4, a3, a2, a1, a0, h7, h6, h5));
+        Ptr_Set16(&p[5], AUD_FIR(a5, a4, a3, a2, a1, a0, h7, h6));
+        Ptr_Set16(&p[6], AUD_FIR(a6, a5, a4, a3, a2, a1, a0, h7));
+        Ptr_Set16(&p[7], AUD_FIR(a7, a6, a5, a4, a3, a2, a1, a0));
+        h1 = a1;
+        h2 = a2;
+        h3 = a3;
+        h4 = a4;
+        h5 = a5;
+        h6 = a6;
+        h7 = a7;
+        p += 8;
+        count -= 16;
+    } while (count > 0);
+#undef AUD_FIR
+
+    w[0] = a0;
+    w[1] = a1;
+    w[2] = a2;
+    w[3] = a3;
+    w[4] = a4;
+    w[5] = a5;
+    w[6] = a6;
+    w[7] = a7;
+    return count;
+}
+
+/**
  * FILTER with flags >= 2 sets the count (w0 & 0xFFFF bytes) and loads 8 coefficients (16 bytes at w1)
  * to DMEM 0xFE0, between zeros at 0xFD0 and 0xFF0. FILTER with flags 0 or 1 (A_INIT) then filters the
  * buffer at w0 & 0xFFFF in place, 8 samples per step (count rounds up to 16 bytes), with the state at
@@ -1470,7 +1870,6 @@ static void Aud_Filter(u32 w0, u32 w1) {
     s16 z[24];
     s16 w[16];
     s64 acc;
-    s32 acc32;
     s32 l1;
     s32 firOnly;
     u32 size;
@@ -1519,37 +1918,13 @@ static void Aud_Filter(u32 w0, u32 w1) {
     Vec_Lqv(&w[0], DMEM_STATE);
     __builtin_memset(&w[8], 0, sizeof(s16) * 8);
 
-    if (FAST_PATH_OK && firOnly && (l1 < 0x7FFF) && Dmem_Fits(dmem, size, 16)) {
-        // The 8-tap FIR in 32 bits (|2 * sum| < 2^31 - 0x8000), in place
-        s16* p = Dmem_Ptr16(dmem);
-        s32 cf[8];
-        s32 win[16];
-
-        for (i = 0; i < 8; i++) {
-            cf[i] = z[8 + i];
-            win[i] = w[i];
-        }
-        do {
-            for (i = 0; i < 8; i++) {
-                win[8 + i] = Ptr_Get16(&p[i]);
-            }
-#pragma GCC unroll 8
-            for (i = 0; i < 8; i++) {
-                acc32 = 0;
-#pragma GCC unroll 8
-                for (j = 0; j < 8; j++) {
-                    acc32 += cf[j] * win[8 + i - j];
-                }
-                Ptr_Set16(&p[i], Sat16((0x8000 + 2 * acc32) >> 16));
-            }
-            for (i = 0; i < 8; i++) {
-                win[i] = win[8 + i];
-            }
-            p += 8;
-            count -= 16;
-        } while (count > 0);
-        for (i = 0; i < 8; i++) {
-            w[i] = win[i];
+    if (FAST_PATH_OK && firOnly && (l1 <= 0xFFFF) && Dmem_Fits(dmem, size, 16)) {
+        if ((z[8] | z[9] | z[10] | z[12] | z[13] | z[14] | z[15]) == 0) {
+            count = Aud_FilterFir(Dmem_Ptr16(dmem), count, &z[8], w, AUD_FIR_CENTER);
+        } else if ((z[8] == z[14]) && (z[9] == z[13]) && (z[10] == z[12])) {
+            count = Aud_FilterFir(Dmem_Ptr16(dmem), count, &z[8], w, AUD_FIR_SYMMETRIC);
+        } else {
+            count = Aud_FilterFir(Dmem_Ptr16(dmem), count, &z[8], w, AUD_FIR_GENERAL);
         }
     } else {
         do {
@@ -1687,8 +2062,8 @@ void AudUcode_RunTask(const AudUcodeTask* task) {
         chunk = (remaining > DMEM_ALIST_SIZE) ? DMEM_ALIST_SIZE : remaining;
         Aud_Dma(DMEM_ALIST, alistAddr, chunk - 1, false);
         for (pos = 0; pos < chunk; pos += 8) {
-            w0 = Dmem_Lw(DMEM_ALIST + pos);
-            w1 = Dmem_Lw(DMEM_ALIST + pos + 4);
+            w0 = Dmem_Get32(DMEM_ALIST + pos);
+            w1 = Dmem_Get32(DMEM_ALIST + pos + 4);
             alistAddr += 8;
             remaining -= 8;
             op = (w0 >> 24) & 0x7F;

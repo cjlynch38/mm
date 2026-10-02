@@ -5,8 +5,12 @@
  * and point lighting, fog, texgen, culling, display list calls / branches / G_BRANCH_Z / G_CULLDL,
  * segments, G_MODIFYVTX, texture rectangles, forced matrices, S2DEX2 switching and logging, the microcode's
  * light direction quantization and matrix saturation, bad addresses in display lists, the statistics
- * lines, and random display lists (fuzzing under the sanitizers, S2DEX2 commands included). The S2DEX2
+ * lines, vertex attributes computed after state changes (gfx_rsp.c computes them when a drawn triangle first
+ * uses a vertex), and random display lists (fuzzing under the sanitizers, S2DEX2 commands included). The S2DEX2
  * commands themselves are tested in test_s2dex.c.
+ *
+ * The Makefile also builds everything with -DGFX_VTX_CHECK=1 (test_gfx_rsp_chk): gfx_rsp.c then runs the original
+ * eager vertex pipeline next to the lazy one and the test fails if any vertex attribute differs.
  */
 #include <math.h>
 #include <stdio.h>
@@ -14,6 +18,10 @@
 #include <string.h>
 #include <time.h>
 #include "test.h"
+
+#ifndef GFX_VTX_CHECK
+#define GFX_VTX_CHECK 0
+#endif
 
 /* ============================================================================================== */
 /* Display list builder and GBI encoders (F3DEX2 encodings from include/PR/gbi.h)                 */
@@ -1843,6 +1851,166 @@ static void test_fuzz(void) {
     ram_reset();
 }
 
+/* gfx_rsp.c computes a vertex's color, alpha (fog) and texture coordinates when a drawn triangle first uses it, not at
+ * G_VTX. Whatever comes between must not change them: each case draws a triangle of three lit, fogged, textured
+ * vertices right after the G_VTX, then again with state changes in between, and the attributes must be the same. */
+enum {
+    LZ_MV_LOAD,     /* another modelview (directional lights keep the directions of the G_VTX) */
+    LZ_MV_POP,      /* push, G_VTX, pop */
+    LZ_FOG,         /* G_MW_FOG */
+    LZ_TEXSCALE,    /* G_TEXTURE scale */
+    LZ_GEOMETRY,    /* lighting and fog off */
+    LZ_TEXGEN,      /* texgen on */
+    LZ_LIGHTS,      /* new light direction and count, applied by a G_VTX into other slots */
+    LZ_POINT_MV,    /* point light, then another modelview */
+    LZ_POINT_MMTX,  /* point light, then G_MV_MMTX */
+    LZ_UCODE,       /* F3DZEX2 loaded again (geometry mode, fog, lights reset) */
+    LZ_S2DEX,       /* S2DEX2 and back */
+    LZ_ZSCREEN,     /* G_MODIFYVTX of the screen z of a vertex (fog came from its G_VTX z) */
+    LZ_VTX_STATE,   /* fog, texture scale and geometry mode changed, then a G_VTX into other slots */
+    LZ_COUNT
+};
+
+static void lazy_case(int kase, bool change, GfxVtx out[3]) {
+    Dl d = dl_new(64);
+    uint32_t vb = vtx_buf(6);
+    M4 p, mv, mv2;
+    const bool point = (kase == LZ_POINT_MV || kase == LZ_POINT_MMTX);
+    int i;
+
+    m_perspective(p, 60.0, 4.0 / 3.0, 10.0, 4000.0);
+    m_translate(mv, 0.0, 0.0, -600.0);
+    m_rot_y(mv2, 30.0);
+    mv2[3][2] = -500.0;
+    setup(&d, p, mv);
+    gGeom(&d, 0, G_LIGHTING | G_FOG | (point ? G_LIGHTING_POSITIONAL : 0));
+    gTexture(&d, 0x8000, 0x4000, 0, 0, 1);
+    gFog(&d, 2560, -1920);
+    gNumLights(&d, 2);
+    if (point) {
+        gLight(&d, put_point_light(220, 180, 90, 40, 30, 50, 8, 60, 10), 1);
+    } else {
+        gLight(&d, put_light2(200, 120, 60, 180, 100, 40, 50, 60, 70), 1);
+    }
+    gLight(&d, put_light(40, 200, 90, -70, 20, 60), 2);
+    gLight(&d, put_light(30, 25, 20, 0, 0, 0), 3);
+    gLookAtX(&d, put_light(0, 0, 0, 127, 0, 0));
+    gLookAtY(&d, put_light(0, 0, 0, 0, 127, 0));
+    for (i = 0; i < 6; i++) {
+        vtx_set(vb, i, -150 + 140 * (i % 3), -100 + 90 * (i / 3) + 40 * (i == 1), 30 * i - 60, 32 * (i + 3),
+                -48 * i + 100, 60 - 25 * i, 70 + 10 * i, 50 - 30 * (i & 1), 200);
+    }
+    if (kase == LZ_MV_POP) {
+        gMtx(&d, put_mtx(mv2), G_MTX_MODELVIEW | G_MTX_MUL | G_MTX_PUSH);
+    }
+    gVtx(&d, vb, 3, 0);
+    if (change) {
+        switch (kase) {
+            case LZ_MV_LOAD:
+            case LZ_POINT_MV:
+                gMtx(&d, put_mtx(mv2), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+                break;
+            case LZ_MV_POP:
+                gPopMtx(&d, 1);
+                break;
+            case LZ_FOG:
+                gFog(&d, 1000, 300);
+                break;
+            case LZ_TEXSCALE:
+                gTexture(&d, 0x1234, 0xFFFF, 0, 0, 1);
+                break;
+            case LZ_GEOMETRY:
+                gGeom(&d, G_LIGHTING | G_FOG, 0);
+                break;
+            case LZ_TEXGEN:
+                gGeom(&d, 0, G_TEXTURE_GEN);
+                break;
+            case LZ_LIGHTS:
+                gLight(&d, put_light(10, 250, 10, -100, -60, 20), 1);
+                gNumLights(&d, 1);
+                gLight(&d, put_light(90, 90, 90, 0, 0, 0), 2);
+                gVtx(&d, vb + 48, 3, 3);
+                break;
+            case LZ_POINT_MMTX:
+                gMoveMem(&d, put_mtx(mv2), 64, G_MV_MMTX, 0);
+                break;
+            case LZ_UCODE:
+                gLoadUcode(&d, ucode_addr(gspF3DZEX2_NoN_PosLight_fifoTextStart), 0);
+                gGeom(&d, 0, G_SHADE | G_SHADING_SMOOTH); // (the reload made shading flat)
+                break;
+            case LZ_S2DEX:
+                gLoadUcode(&d, ucode_addr(gspS2DEX2_fifoTextStart), 0);
+                gLoadUcode(&d, ucode_addr(gspF3DZEX2_NoN_PosLight_fifoTextStart), 0);
+                gGeom(&d, 0, G_SHADE | G_SHADING_SMOOTH);
+                break;
+            case LZ_ZSCREEN:
+                gModifyVtx(&d, 1, G_MWO_POINT_ZSCREEN, 0x01000000);
+                break;
+            case LZ_VTX_STATE:
+                gFog(&d, 700, 100);
+                gTexture(&d, 0xFFFF, 0x0100, 0, 0, 1);
+                gGeom(&d, G_LIGHTING, G_TEXTURE_GEN);
+                gVtx(&d, vb + 48, 3, 3);
+                break;
+            default:
+                break;
+        }
+    }
+    gTri1(&d, 0, 1, 2);
+    gEnd(&d);
+    run(&d);
+    memset(out, 0, 3 * sizeof(GfxVtx));
+    if (gTriCount == 1) {
+        memcpy(out, gTris[0].v, 3 * sizeof(GfxVtx));
+    }
+}
+
+static void test_lazy_attributes(void) {
+    static const char* const names[LZ_COUNT] = {
+        "modelview load", "modelview pop", "fog", "texture scale", "geometry mode", "texgen", "lights",
+        "point light, modelview", "point light, G_MV_MMTX", "F3DZEX2 reload", "S2DEX2 and back", "G_MODIFYVTX z",
+        "G_VTX with other state",
+    };
+    int kase, i;
+
+    for (kase = 0; kase < LZ_COUNT; kase++) {
+        GfxVtx want[3], got[3];
+        bool same = true;
+
+        lazy_case(kase, false, want);
+        lazy_case(kase, true, got);
+        CHECK(want[0].a != 0 || want[0].r != 0, "lazy attributes, %s: the triangle was drawn", names[kase]);
+        for (i = 0; i < 3; i++) {
+            same = same && got[i].r == want[i].r && got[i].g == want[i].g && got[i].b == want[i].b &&
+                   got[i].a == want[i].a && got[i].s == want[i].s && got[i].t == want[i].t;
+        }
+        CHECK(same, "lazy attributes, %s: rgba %02X%02X%02X%02X st %g %g, as right after G_VTX: %02X%02X%02X%02X %g %g",
+              names[kase], got[1].r, got[1].g, got[1].b, got[1].a, got[1].s, got[1].t, want[1].r, want[1].g,
+              want[1].b, want[1].a, want[1].s, want[1].t);
+    }
+
+    // G_MODIFYVTX of a color waiting for its attributes: the written color wins, as on the RSP
+    {
+        Dl d = dl_new(32);
+        uint32_t vb = vtx_buf(3);
+        M4 p, mv;
+
+        m_perspective(p, 60.0, 4.0 / 3.0, 10.0, 4000.0);
+        m_translate(mv, 0.0, 0.0, -600.0);
+        setup(&d, p, mv);
+        for (i = 0; i < 3; i++) {
+            vtx_set(vb, i, -100 + 100 * i, -50 + 80 * (i == 1), 0, 0, 0, 10, 20, 30, 40);
+        }
+        gVtx(&d, vb, 3, 0);
+        gModifyVtx(&d, 2, G_MWO_POINT_RGBA, 0x11223344);
+        gTri1(&d, 0, 1, 2);
+        gEnd(&d);
+        run(&d);
+        CHECK(gTriCount == 1 && gTris[0].v[2].r == 0x11 && gTris[0].v[2].a == 0x44 && gTris[0].v[0].r == 10,
+              "G_MODIFYVTX color of a waiting vertex");
+    }
+}
+
 static void test_stats(void) {
     int i, before = gLogCount;
 
@@ -1908,8 +2076,21 @@ int main(void) {
     test_bad_pointers();
     test_stats();
     test_s2dex();
+    test_lazy_attributes();
     test_fuzz();
+#if GFX_VTX_CHECK
+    {
+        // gfx_rsp.c built with -DGFX_VTX_CHECK=1 also ran the original eager vertex pipeline at every G_VTX and
+        // compared the lazily computed attributes with it (in all the tests above, the fuzz test's random state
+        // changes included)
+        extern uint32_t gfx_rsp_vtx_check_failures(void);
 
-    printf("gfx_rsp / gfx_s2dex host test: %d checks, %d failures\n", gChecks, gFailures);
+        CHECK(gfx_rsp_vtx_check_failures() == 0, "lazy vertex attributes equal the eager pipeline's (%u differ)",
+              (unsigned int)gfx_rsp_vtx_check_failures());
+    }
+#endif
+
+    printf("gfx_rsp / gfx_s2dex host test%s: %d checks, %d failures\n", GFX_VTX_CHECK ? " (vertex check build)" : "",
+           gChecks, gFailures);
     return gFailures != 0;
 }
