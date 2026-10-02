@@ -38,5 +38,7 @@ void Gc_TraceFrame(void);
 void Gc_TraceGameStateEnd(void);
 /** GC_AUTOSTART builds: true while Start should be held on controller 1 (title screen only). */
 s32 Gc_AutoStartPressed(void);
+/** Cutscene flag set by a cutscene script (title logo debugging). */
+void Gc_TraceCutsceneFlag(s16 flag);
 
 #endif

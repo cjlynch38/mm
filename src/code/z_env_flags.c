@@ -1,4 +1,7 @@
 #include "global.h"
+#ifdef TARGET_GC
+#include "gc_game.h"
+#endif
 
 void CutsceneFlags_UnsetAll(PlayState* play) {
     u8 i;
@@ -14,6 +17,9 @@ void CutsceneFlags_Set(PlayState* play, s16 flag) {
     s16 mask = 1 << bit;
 
     play->cutsceneFlags[index] |= mask;
+#ifdef TARGET_GC
+    Gc_TraceCutsceneFlag(flag);
+#endif
 }
 
 void CutsceneFlags_Unset(PlayState* play, s16 flag) {

@@ -4,6 +4,7 @@
  */
 #include "ultra64.h"
 #include "stdbool.h"
+#include "z64save.h"
 #include "gc_bridge.h"
 #include "gc_game.h"
 #include "gc_options.h"
@@ -19,6 +20,7 @@ static s32 sCurGameState = -1;
 static u32 sFrames;
 static u32 sFramesSinceReport;
 static OSTime sReportTime;
+static u32 sCutsceneFlagsLogged; // flags already logged in this gamestate (cutscenes set them every frame)
 
 static const char* Gc_GameStateName(s32 index) {
     if ((index >= 0) && (index < (s32)(sizeof(sGameStateNames) / sizeof(sGameStateNames[0])))) {
@@ -32,7 +34,14 @@ void Gc_TraceGameStateStart(s32 index, u32 size) {
     sFrames = 0;
     sFramesSinceReport = 0;
     sReportTime = osGetTime();
-    gc_log("gamestate %d %s start (%u bytes)", (int)index, Gc_GameStateName(index), (unsigned)size);
+    sCutsceneFlagsLogged = 0;
+    if (index == GC_GAMESTATE_PLAY) {
+        gc_log("gamestate %d %s start (%u bytes): entrance %04X, scene layer %d, cutscene %04X", (int)index,
+               Gc_GameStateName(index), (unsigned)size, (unsigned)gSaveContext.save.entrance,
+               (int)gSaveContext.sceneLayer, (unsigned)gSaveContext.save.cutsceneIndex);
+    } else {
+        gc_log("gamestate %d %s start (%u bytes)", (int)index, Gc_GameStateName(index), (unsigned)size);
+    }
 }
 
 void Gc_TraceFrame(void) {
@@ -57,6 +66,13 @@ void Gc_TraceFrame(void) {
 void Gc_TraceGameStateEnd(void) {
     gc_log("gamestate %d %s end after %u frames", (int)sCurGameState, Gc_GameStateName(sCurGameState),
            (unsigned)sFrames);
+}
+
+void Gc_TraceCutsceneFlag(s16 flag) {
+    if ((flag >= 0) && (flag < 32) && !(sCutsceneFlagsLogged & (1u << flag))) {
+        sCutsceneFlagsLogged |= 1u << flag;
+        gc_log("%s frame %u: cutscene flag %d set", Gc_GameStateName(sCurGameState), (unsigned)sFrames, (int)flag);
+    }
 }
 
 /**
