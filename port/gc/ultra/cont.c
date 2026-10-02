@@ -23,6 +23,7 @@
  *   main stick scaled by 0.8 and clamped to the N64 range
  */
 #include "gc_ultra_internal.h"
+#include "gc_game.h"
 #include "stdbool.h"
 
 #define GC_CONT_STICK_NUM 4 // main stick scale 4/5 = 0.8: GC about +-100 -> N64 about +-80
@@ -217,6 +218,11 @@ void osContGetReadData(OSContPad* data) {
             data->button = 0;
             data->stick_x = 0;
             data->stick_y = 0;
+        }
+
+        // Unattended test builds (make GC_AUTOSTART=1) press Start on the title screen
+        if ((i == 0) && Gc_AutoStartPressed()) {
+            data->button |= START_BUTTON;
         }
     }
 }

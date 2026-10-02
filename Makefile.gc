@@ -8,6 +8,7 @@
 # See port/gc/README.md.
 
 MAKEFLAGS += --no-builtin-rules
+.DEFAULT_GOAL := all
 SHELL = /usr/bin/env bash
 .SHELLFLAGS = -o pipefail -c
 
@@ -94,6 +95,20 @@ PORT_OGC_C   := $(wildcard port/gc/ogc/*.c)
 PORT_O_FILES := $(foreach f,$(PORT_GAME_C:.c=.o) $(PORT_OGC_C:.c=.o),$(BUILD_DIR)/$f)
 
 DEP_FILES := $(GAME_O_FILES:.o=.d) $(PORT_O_FILES:.o=.d)
+
+#### Build options ####
+
+# make -f Makefile.gc GC_AUTOSTART=1: press Start automatically on the title screen (unattended test runs).
+# Options are written to gc_options.h, which only changes (and triggers rebuilds) when an option does.
+GC_AUTOSTART ?= 0
+GC_OPTIONS_H := $(BUILD_DIR)/generated/gc_options.h
+
+$(GC_OPTIONS_H): FORCE
+	@mkdir -p $(@D)
+	@printf '#define GC_AUTOSTART %d\n' $(GC_AUTOSTART) > $@.tmp; cmp -s $@.tmp $@ && rm -f $@.tmp || mv -f $@.tmp $@
+
+$(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o: $(GC_OPTIONS_H)
+$(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o: GAME_CPPFLAGS += -I$(BUILD_DIR)/generated
 
 #### Per-file settings (mirror the N64 Makefile) ####
 

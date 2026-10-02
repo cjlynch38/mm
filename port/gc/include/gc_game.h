@@ -36,5 +36,7 @@ extern GcFaultArea gGcFaultArea;
 void Gc_TraceGameStateStart(s32 index, u32 size);
 void Gc_TraceFrame(void);
 void Gc_TraceGameStateEnd(void);
+/** GC_AUTOSTART builds: true while Start should be held on controller 1 (title screen only). */
+s32 Gc_AutoStartPressed(void);
 
 #endif

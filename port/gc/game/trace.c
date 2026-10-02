@@ -3,8 +3,13 @@
  * with graphics stubbed can be followed in the on-screen console and in sd:/mmgcport/log.txt.
  */
 #include "ultra64.h"
+#include "stdbool.h"
 #include "gc_bridge.h"
 #include "gc_game.h"
+#include "gc_options.h"
+
+#define GC_GAMESTATE_PLAY 3
+#define GC_GAMESTATE_FILE_SELECT 5
 
 static const char* const sGameStateNames[] = {
     "Setup", "MapSelect", "ConsoleLogo", "Play", "TitleSetup", "FileSelect", "DayTelop",
@@ -52,4 +57,24 @@ void Gc_TraceFrame(void) {
 void Gc_TraceGameStateEnd(void) {
     gc_log("gamestate %d %s end after %u frames", (int)sCurGameState, Gc_GameStateName(sCurGameState),
            (unsigned)sFrames);
+}
+
+/**
+ * GC_AUTOSTART builds: during the title demo (Play before File Select was ever reached), tap Start for a
+ * few frames every 2 seconds, so unattended runs reach File Select. Never presses anything afterwards.
+ */
+s32 Gc_AutoStartPressed(void) {
+#if GC_AUTOSTART
+    static s32 sReachedFileSelect = false;
+
+    if (sCurGameState == GC_GAMESTATE_FILE_SELECT) {
+        sReachedFileSelect = true;
+    }
+    if (sReachedFileSelect || (sCurGameState != GC_GAMESTATE_PLAY) || (sFrames < 60)) {
+        return false;
+    }
+    return (sFrames % 40) < 4;
+#else
+    return false;
+#endif
 }
