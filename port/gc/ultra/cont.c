@@ -220,9 +220,24 @@ void osContGetReadData(OSContPad* data) {
             data->stick_y = 0;
         }
 
-        // Unattended test builds (make GC_AUTOSTART=1) press Start on the title screen
-        if ((i == 0) && Gc_AutoStartPressed()) {
-            data->button |= START_BUTTON;
+        if (i == 0) {
+            u16 scriptButtons;
+            s8 scriptStickX;
+            s8 scriptStickY;
+            s32 scriptStickSet;
+
+            // Unattended test builds: GC_AUTOSTART=1 presses Start on the title screen, GC_AUTOSTART=2
+            // plays the input script (port/gc/game/input_script.c) on top of the real pad
+            if (Gc_AutoStartPressed()) {
+                data->button |= START_BUTTON;
+            }
+            if (Gc_InputScriptGet(&scriptButtons, &scriptStickX, &scriptStickY, &scriptStickSet)) {
+                data->button |= scriptButtons;
+                if (scriptStickSet) {
+                    data->stick_x = scriptStickX;
+                    data->stick_y = scriptStickY;
+                }
+            }
         }
     }
 }

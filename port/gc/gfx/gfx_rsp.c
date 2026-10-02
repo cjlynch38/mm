@@ -1170,6 +1170,10 @@ void gfx_rsp_reset(void) {
     gfx_s2dex_reset();
 }
 
+#ifdef GFX_TEX_FAIL_TRACE
+uint32_t gGfxDiagPc[2]; /* command being run, and the return address of the innermost DL call */
+#endif
+
 void gfx_rsp_run(uint32_t dlAddr) {
     uint32_t stack[DL_STACK_MAX];
     int sp = 0;
@@ -1194,6 +1198,10 @@ void gfx_rsp_run(uint32_t dlAddr) {
         p = (const uint8_t*)((uintptr_t)pc + RAM_BIAS);
         w0 = rd32(p);
         w1 = rd32(p + 4);
+#ifdef GFX_TEX_FAIL_TRACE
+        gGfxDiagPc[0] = pc;
+        gGfxDiagPc[1] = (sp > 0) ? stack[sp - 1] : 0;
+#endif
         pc += 8;
         op = w0 >> 24;
 

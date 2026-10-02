@@ -55,6 +55,7 @@ typedef struct {
     uint16_t rows;       /* LOADBLOCK: 64-bit RAM words; LOADTILE: rows; LOADTLUT: palette entries */
     uint32_t src;        /* resolved RAM address of the first texel or palette entry */
     uint32_t stride;     /* LOADTILE: RAM bytes between rows */
+    uint32_t seq;        /* sLoadSeq of this load: the replayed TMEM applies the loads newer than it holds */
 } TmemLoad;
 
 /* Conversions: N64 format/size (and TLUT mode) -> GX format */
@@ -162,8 +163,12 @@ static TmemLoad sLoads[TMEM_MAX_LOADS]; /* oldest first */
 static int sNumLoads;
 static uint32_t sTmemGen = 1; /* changes with every load */
 
+static uint32_t sLoadSeq; /* loads recorded since boot */
+
 static uint8_t sVTmem[TMEM_BYTES] __attribute__((aligned(32))); /* replayed TMEM (slow path) */
-static uint32_t sVTmemGen;
+static uint32_t sVTmemGen;  /* sTmemGen it was brought up to date for */
+static uint32_t sVTmemSeq;  /* it holds the loads up to this sLoadSeq... */
+static bool sVTmemValid;    /* ...unless false: rebuild it from the task's loads */
 
 static uint8_t sScratch[TEX_SCRATCH_BYTES] __attribute__((aligned(32)));
 static uint8_t sPalScratch[256 * 2];
@@ -291,6 +296,7 @@ static void tmem_add(TmemLoad* ld, uint32_t start, uint32_t bytes) {
         memmove(&sLoads[0], &sLoads[1], (TMEM_MAX_LOADS - 1) * sizeof(TmemLoad));
         n--;
     }
+    ld->seq = ++sLoadSeq;
     sLoads[n++] = *ld;
     sNumLoads = n;
     sTmemGen++;
@@ -449,16 +455,29 @@ static void vtmem_replay(const TmemLoad* ld) {
     }
 }
 
+/* Bring the replayed TMEM up to date. Loads only add to it, in order: the records are oldest first, and tmem_add
+ * drops a record only when a newer load overwrites all of it (or, with the list full, the oldest one, which stays
+ * in the image if a build replayed it, as it would in the RDP's TMEM). So only the loads since the last build are
+ * replayed. The name entry keyboard binds a tile through this path for each of its 65 characters with one new load
+ * in between: replaying every load each time made its tasks take 20 ms instead of 4 (30 fps instead of 60).
+ * A rebuild from scratch happens per task and after the renderer wrote RAM that loads may have read. */
 static void vtmem_build(void) {
     int i;
 
     if (sVTmemGen == sTmemGen) {
         return;
     }
-    memset(sVTmem, 0, sizeof(sVTmem));
-    for (i = 0; i < sNumLoads; i++) {
-        vtmem_replay(&sLoads[i]);
+    if (!sVTmemValid) {
+        memset(sVTmem, 0, sizeof(sVTmem));
+        sVTmemSeq = 0;
+        sVTmemValid = true;
     }
+    for (i = 0; i < sNumLoads; i++) {
+        if (sLoads[i].seq > sVTmemSeq) {
+            vtmem_replay(&sLoads[i]);
+        }
+    }
+    sVTmemSeq = sLoadSeq;
     sVTmemGen = sTmemGen;
 }
 
@@ -1707,6 +1726,7 @@ void gfx_tex_init(void) {
 void gfx_tex_reset(void) {
     sNumLoads = 0;
     sTmemGen++;
+    sVTmemValid = false;
     sMemo[0].valid = sMemo[1].valid = false;
 }
 
@@ -1722,6 +1742,7 @@ void gfx_tex_ram_written(uint32_t addr, uint32_t bytes) {
 
     /* The replayed TMEM is rebuilt from RAM; textures read from the range are hashed again at their next bind */
     sVTmemGen = 0;
+    sVTmemValid = false;
     for (e = sLruHead; e >= 0; e = sEntries[e].lruNext) {
         TexEntry* en = &sEntries[e];
         const TexKey* k = &en->key;

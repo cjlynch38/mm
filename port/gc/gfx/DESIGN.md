@@ -320,3 +320,12 @@ makes it fit.
 - time per task
 - each unknown opcode, once
 `make -f Makefile.gc GC_RENDERER=0` keeps the M2 text console as the display.
+
+Texture binds that fail (the "failed" count of the `gfx_tex:` line; such draws sample white) can be
+traced in a build of their own with `GFX_CFLAGS='$(OGC_CFLAGS) -Iport/gc/gfx -Iport/gc/ogc
+-Ibuild/gc-<name>/generated -DGFX_TEX_FAIL_TRACE'`: every distinct failing bind is logged with its tile,
+combiner, othermodes, the last G_SETTIMG, the display list command and the return address of the
+innermost DL call. On the way from the title to Clock Town the only failures are the skybox's: in the
+scenes with SKYBOX_2 (SPOT00, which is the title's and the opening's, and the Lost Woods) Skybox_Setup
+loads no textures, but Skybox_Draw still draws the faces, with G_SETTIMG addresses from a NULL segment
+(the N64 reads low RDRAM there); the room's opaque geometry covers them.

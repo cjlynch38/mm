@@ -124,21 +124,36 @@ On the console side (see `tests/sd_probe/source/main.c` for working code):
 Select. `GC_AUTOSTART=2` plays a scripted controller 1 instead
 (`game/input_script.c`): title -> File Select -> a new file (name entry) ->
 the prologue (the Lost Woods as human Link, the Clock Tower's underground as
-Deku Link with its Deku flower glides, the Happy Mask Salesman) -> Clock Town,
-where it opens the pause menu and walks a tour South -> East -> North -> South
-Clock Town while the three days pass, through the moon's fall and the restart
-of the cycle. The script is a table of steps conditioned on the gamestate,
-scene, room, frames, message boxes, cutscenes, player control and form; the
-active step is logged (`script: ...`), and `trace.c` logs scene and room
-changes, message ids, cutscenes and a player status line every second. The
+Deku Link with its Deku flower glides, the Happy Mask Salesman) -> Clock Town.
+On the first morning it explores South Clock Town first: the HUD, every page
+of the pause menu, the stick held in four directions, a spin attack, a talk
+with one of Mutoh's carpenters. Then it opens the pause menu on every arrival
+in South Clock Town and walks a tour South -> West -> South -> East (the first
+time through the Treasure Chest Shop's door and back) -> North -> the Great
+Fairy's fountain -> North -> South Clock Town (about 150 s a round) while the
+three days pass, through the moon's fall and the restart of the cycle. The
+script is a table of steps conditioned on the gamestate, scene, room, frames,
+message boxes, cutscenes, player control and form; the active step is logged
+(`script: ...`), and `trace.c` logs scene and room changes, message ids,
+cutscenes and a status line every second (player, camera, time). The
 coordinates come from the scenes' collision data in
 `extracted/n64-us/assets/scenes/`.
+
+The script asks for screenshots where it wants one: it logs `@shot <n>-<tag>`
+and holds the picture still, and `run_dolphin.ps1` screenshots the render
+window as soon as the line arrives, to `<screenshot>-<n>-<tag>.png` (the HUD,
+the four pause pages, the walk, the spin, the carpenter's message box, the
+shop's inside).
 
 ```bash
 make -f Makefile.gc -j$(nproc) GC_AUTOSTART=2
 port/gc/tools/run_dolphin.sh build/gc-n64-us/mm-gc.dol -Seconds 120 \
     -ExtraConfig Dolphin.Core.EmulationSpeed=0 -ScreenshotEvery 10
 ```
+
+`BUILD_DIR=build/gc-<name>` on the make line builds in a directory of its own,
+so that another build with other options (another workflow, another
+`GC_AUTOSTART`) cannot replace the DOL between the build and the run.
 
 With `Dolphin.Core.EmulationSpeed=0` (no speed limit) Dolphin runs the game 6-8
 times faster than real time: Clock Town is reached after about 80 s, the whole

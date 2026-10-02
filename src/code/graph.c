@@ -267,7 +267,13 @@ void Graph_ExecuteAndDraw(GraphicsContext* gfxCtx, GameState* gameState) {
     gameState->unk_A3 = 0;
     Graph_SetNextGfxPool(gfxCtx);
 
+#ifdef TARGET_GC
+    Gc_TraceUpdateBegin();
+#endif
     GameState_Update(gameState);
+#ifdef TARGET_GC
+    Gc_TraceUpdateEnd();
+#endif
 
     OPEN_DISPS(gfxCtx);
 
@@ -397,7 +403,7 @@ void Graph_ThreadEntry(void* arg) {
 
         bzero(gameState, size);
 #ifdef TARGET_GC
-        Gc_TraceGameStateStart(ovl - gGameStateOverlayTable, size);
+        Gc_TraceGameStateStart(ovl - gGameStateOverlayTable, size, gameState);
 #endif
         GameState_Init(gameState, ovl->init, &gfxCtx);
 

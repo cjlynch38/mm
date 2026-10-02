@@ -41,6 +41,10 @@ to the memory card when there is no SD card, which Dolphin never has).
 <screenshot>-<t>s.png (t = seconds since the start), to follow a run as a sequence.
 With -ExtraConfig 'Dolphin.Core.EmulationSpeed=0' (no speed limit) the game runs several
 times faster than real time; the Gecko log's timestamps stay in game time.
+The game can also ask for a screenshot: a Gecko log line containing "@shot <tag>"
+(letters, digits, '_', '.', '-') screenshots the render window as soon as the line
+arrives, to <screenshot>-<tag>.png (the GC_AUTOSTART=2 input script does this at the
+places it wants to show, and holds the picture still for a moment).
 
 Exit codes: 0 ok, 1 setup error, 2 Dolphin showed a dialog (error/warning),
 3 Dolphin exited before the time was up, 4 Dolphin had to be killed.
@@ -122,7 +126,9 @@ public static class MmgcWin {
         return sb.ToString();
     }
 
-    // PW_RENDERFULLCONTENT (2) is needed for the D3D render window.
+    // PW_RENDERFULLCONTENT (2) is needed for the D3D render window. The capture comes back with alpha 0 on the
+    // pixels the game drew pure black (0,0,0), so image viewers showed them as white shapes (on the left of the
+    // area title bar, for example); the image is saved opaque, colors as captured.
     public static string Capture(IntPtr h, string path) {
         RECT r;
         if (!GetWindowRect(h, out r)) return "GetWindowRect failed";
@@ -135,6 +141,12 @@ public static class MmgcWin {
                 g.ReleaseHdc(hdc);
                 if (!ok) return "PrintWindow failed";
             }
+            var data = bmp.LockBits(new Rectangle(0, 0, w, ht), ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+            var px = new int[w * ht];
+            Marshal.Copy(data.Scan0, px, 0, px.Length);
+            for (int i = 0; i < px.Length; i++) px[i] |= unchecked((int)0xFF000000);
+            Marshal.Copy(px, 0, data.Scan0, px.Length);
+            bmp.UnlockBits(data);
             bmp.Save(path, ImageFormat.Png);
         }
         return null;
@@ -336,14 +348,18 @@ $proc = Start-Process -FilePath $DolphinExe -ArgumentList $argLine -PassThru
 $clock = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Gecko capture runs in its own runspace so the main loop can watch for dialogs.
-$gecko = [hashtable]::Synchronized(@{ Stop = $NoGecko.IsPresent; Port = 0; Bytes = 0; Error = 'disabled (-NoGecko)' })
+$gecko = [hashtable]::Synchronized(@{ Stop = $NoGecko.IsPresent; Port = 0; Bytes = 0; Error = 'disabled (-NoGecko)';
+    Shots = 0; ShotErrors = '' })
 $geckoPs = [PowerShell]::Create()
 [void]$geckoPs.AddScript({
-    param($state, $ports, $procId, $path)
+    param($state, $ports, $procId, $path, $shotBase)
     if ($state.Stop) { return }
     $state.Error = $null
     $out = [System.IO.File]::Open($path, 'Create', 'Write', 'ReadWrite')
     $client = $null
+    # A log line with "@shot <tag>" screenshots the render window at once, to <shotBase>-<tag>.png (the game
+    # holds the picture still for a moment after logging the line; see port/gc/game/input_script.c)
+    $pending = ''
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds(20)
         while (-not $client -and -not $state.Stop -and [DateTime]::UtcNow -lt $deadline) {
@@ -366,6 +382,25 @@ $geckoPs = [PowerShell]::Create()
                 $out.Write($buf, 0, $n)
                 $out.Flush()
                 $state.Bytes += $n
+                $text = $pending + [System.Text.Encoding]::ASCII.GetString($buf, 0, $n)
+                $cut = $text.LastIndexOf("`n")
+                if ($cut -lt 0) {
+                    $pending = $text
+                } else {
+                    $pending = $text.Substring($cut + 1)
+                    if ($text.IndexOf('@shot ', 0, $cut) -ge 0) {
+                        foreach ($m in [regex]::Matches($text.Substring(0, $cut), '@shot ([A-Za-z0-9_.-]+)')) {
+                            $render = [IntPtr]::Zero
+                            foreach ($h in [MmgcWin]::Windows($procId, $true)) {
+                                if ([MmgcWin]::Title($h) -like 'Dolphin*|*') { $render = $h; break }
+                            }
+                            $err = 'no render window'
+                            if ($render -ne [IntPtr]::Zero) { $err = [MmgcWin]::Capture($render, "$shotBase-$($m.Groups[1].Value).png") }
+                            if ($err) { $state.ShotErrors += "$($m.Groups[1].Value): $err; " } else { $state.Shots++ }
+                        }
+                    }
+                }
+                if ($pending.Length -gt 8192) { $pending = '' }
             } elseif ($state.Stop) {
                 break
             }
@@ -376,7 +411,8 @@ $geckoPs = [PowerShell]::Create()
         $out.Dispose()
         if ($client) { $client.Close() }
     }
-}).AddArgument($gecko).AddArgument($GeckoPorts).AddArgument($proc.Id).AddArgument($GeckoLog)
+}).AddArgument($gecko).AddArgument($GeckoPorts).AddArgument($proc.Id).AddArgument($GeckoLog).AddArgument(
+    (Join-Path ([System.IO.Path]::GetDirectoryName($Screenshot)) ([System.IO.Path]::GetFileNameWithoutExtension($Screenshot))))
 $geckoHandle = $geckoPs.BeginInvoke()
 
 $status = 0
@@ -523,5 +559,8 @@ if (Test-Path -LiteralPath $dolphinLog) {
 }
 
 Say ''
+if ($gecko.Shots -gt 0 -or $gecko.ShotErrors) {
+    Say "run_dolphin: $($gecko.Shots) screenshots requested by the log (@shot)$(if ($gecko.ShotErrors) { ", failed: $($gecko.ShotErrors)" })"
+}
 Say "run_dolphin: exit $status"
 exit $status

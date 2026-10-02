@@ -132,9 +132,14 @@ void __gcIoWrite(u32 addr, u32 data) {
 }
 
 // Game-side hooks the device files call, as weak no-ops (a test may define its own): the GC_AUTOSTART
-// Start press (port/gc/game/trace.c) and the software RSP tasks run by osSpTaskStartGo (port/gc/audio,
+// Start press (port/gc/game/trace.c), the input script, and the software RSP tasks run by osSpTaskStartGo (port/gc/audio,
 // port/gc/game/njpeg_cpu.c; port/gc/ultra/task_weak.c has the same defaults)
 __attribute__((weak)) s32 Gc_AutoStartPressed(void) {
+    return false;
+}
+
+// The GC_AUTOSTART=2 input script (port/gc/game/input_script.c): never drives the controller here
+__attribute__((weak)) s32 Gc_InputScriptGet(u16* buttons, s8* stickX, s8* stickY, s32* stickSet) {
     return false;
 }
 

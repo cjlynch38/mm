@@ -623,6 +623,31 @@ static void gx_bind(int index, int tile) {
     if (gfx_tex_bind(tile & 7, texMap, b) && b->valid) {
         return;
     }
+#ifdef GFX_TEX_FAIL_TRACE
+    // Diagnostic build (GFX_CFLAGS += -DGFX_TEX_FAIL_TRACE): every distinct failing bind, with the display list
+    // command (pc) and the return address of the innermost DL call, to find what draws it
+    {
+        extern uint32_t gGfxDiagPc[2];
+        static uint32_t sSeen[256];
+        static int sNumSeen;
+        const GfxTile* t = &gGfxRdp.tiles[tile & 7];
+        uint32_t key = gGfxDiagPc[0] ^ (gGfxRdp.combineLo * 31) ^ ((uint32_t)index << 30) ^ (t->tmem << 20);
+        int i;
+
+        for (i = 0; i < sNumSeen && sSeen[i] != key; i++) {
+        }
+        if (i == sNumSeen && sNumSeen < 256) {
+            sSeen[sNumSeen++] = key;
+            gc_log("gfx diag: bind fail TEXEL%d tile %d fmt %u siz %u tmem %03X line %u size %u..%u x %u..%u "
+                   "timg %08X combine %06X %08X H %08X L %08X tex %d/%d pc %08X ret %08X", index, tile & 7, t->fmt,
+                   t->siz, t->tmem, t->line, t->uls >> 2, t->lrs >> 2, t->ult >> 2, t->lrt >> 2,
+                   (unsigned int)gGfxRdp.texImageAddr, (unsigned int)gGfxRdp.combineHi,
+                   (unsigned int)gGfxRdp.combineLo, (unsigned int)gGfxRdp.otherModeH,
+                   (unsigned int)gGfxRdp.otherModeL, gGfxRsp.textureOn, gGfxRsp.textureTile,
+                   (unsigned int)gGfxDiagPc[0], (unsigned int)gGfxDiagPc[1]);
+        }
+    }
+#endif
     // Unresolvable tile (nothing loaded): sample opaque white
     if (sLogBindCount < LOG_LIMIT) {
         const GfxTile* t = &gGfxRdp.tiles[tile & 7];

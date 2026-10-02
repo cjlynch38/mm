@@ -1,7 +1,8 @@
 /**
  * libultra 1 Mbit FlashRAM driver (osFlash*) for the GameCube, replacing src/code/osFlash.c.
  *
- * The flash chip is a 128 KiB RAM image (erased bytes read 0xFF) loaded from SD with
+ * The flash chip is a 128 KiB RAM image (erased bytes read 0xFF) loaded from the save storage (SD card or
+ * memory card, see port/gc/ogc/bridge_save.c) with
  * gc_save_load() by osFlashInit(). It reports itself as a Macronix "C" part
  * (0x11118001 / FLASH_VERSION_MX_C), which SysFlashrom_CheckFlashType() accepts.
  *
@@ -107,11 +108,11 @@ static void FlashWriterMain(void* arg) {
             // SD writes can fail transiently. Without a retry the save would only reach SD with the
             // game's next save, and would be lost if the console were switched off before that.
             retries++;
-            gc_log("flash: writing the save to SD failed; retry %d of %d in 1 s", (int)retries,
+            gc_log("flash: storing the save failed; retry %d of %d in 1 s", (int)retries,
                    GC_FLASH_PERSIST_RETRIES);
             FlashNotifyWriter();
         } else {
-            gc_log("flash: writing the save to SD failed; retrying after the next change");
+            gc_log("flash: storing the save failed; retrying after the next change");
             retries = 0;
         }
     }
@@ -128,7 +129,7 @@ static void FlashMarkDirty(void) {
  */
 void __gcFlashFlush(void) {
     if (sFlashInitialized && FlashPersist()) {
-        gc_log("flash: writing the save to SD failed");
+        gc_log("flash: storing the save failed");
     }
 }
 
@@ -158,16 +159,16 @@ OSPiHandle* osFlashInit(void) {
 
     loadResult = gc_save_load(sFlashImage, FLASH_SIZE);
     if (loadResult == 0) {
-        gc_log("flash: save loaded from SD");
+        gc_log("flash: save loaded");
     } else {
         memset(sFlashImage, 0xFF, FLASH_SIZE);
         if (loadResult > 0) {
-            gc_log("flash: no save on SD, starting with an erased flash");
+            gc_log("flash: no save yet, starting with an erased flash");
         } else {
             // The bridge returns > 0 for "no save file" and < 0 for errors (no SD card, read
             // failure). Persisting an erased image would replace a save that may still be intact.
             sFlashPersistBroken = true;
-            gc_log("flash: could not load the save; saves made in this session will NOT be written to SD");
+            gc_log("flash: could not load the save; saves made in this session will NOT be stored");
         }
     }
     sFlashStatus = 0;

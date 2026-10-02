@@ -33,14 +33,33 @@ typedef struct {
 extern GcFaultArea gGcFaultArea;
 #define GC_FAULT_FB_ADDRESS ((void*)gGcFaultArea.framebuffer)
 
-/** Bring-up tracing (port/gc/game/trace.c), called from Graph_ThreadEntry. */
-void Gc_TraceGameStateStart(s32 index, u32 size);
+/** Bring-up tracing (port/gc/game/trace.c), called from Graph_ThreadEntry. `gameState` is the new
+ *  GameState (allocated and zeroed, not initialised yet). */
+void Gc_TraceGameStateStart(s32 index, u32 size, void* gameState);
 void Gc_TraceFrame(void);
 void Gc_TraceGameStateEnd(void);
-/** GC_AUTOSTART builds: true while Start should be held on controller 1 (title screen only). */
+/** Around GameState_Update in Graph_ExecuteAndDraw: the game's logic and display list building per frame. */
+void Gc_TraceUpdateBegin(void);
+void Gc_TraceUpdateEnd(void);
+/** The running GameState (NULL between gamestates), its gGameStateOverlayTable index (-1 before the first
+ *  one) and the frames it has run. Game thread only. */
+void* Gc_TraceCurGameState(s32* index, u32* frames);
+/** The GC_AUTOSTART build option: 0 off, 1 press Start on the title screen, 2 play the input script. */
+s32 Gc_AutoStartMode(void);
+/** GC_AUTOSTART=1 builds: true while Start should be held on controller 1 (title screen only). */
 s32 Gc_AutoStartPressed(void);
 /** Cutscene flag set by a cutscene script (title logo debugging). */
 void Gc_TraceCutsceneFlag(s16 flag);
+
+/**
+ * GC_AUTOSTART=2 builds: scripted controller input (port/gc/game/input_script.c).
+ * Gc_InputScriptFrame runs on the game thread after every frame and decides the input for the next ones;
+ * Gc_InputScriptGet is called by osContGetReadData (any thread) for controller 1 and returns true while
+ * the script drives the controller, with the N64 buttons to press and the stick (stickSet false: leave
+ * the stick alone).
+ */
+void Gc_InputScriptFrame(void);
+s32 Gc_InputScriptGet(u16* buttons, s8* stickX, s8* stickY, s32* stickSet);
 
 /** The RSP JPEG task (M_NJPEGTASK, z_jpeg.c's njpgdspMain) on the CPU (port/gc/game/njpeg_cpu.c), run by
  *  osSpTaskStartGo: the macroblocks of task->t.data_ptr's JpegTaskData become RGBA5551 tiles in place. */

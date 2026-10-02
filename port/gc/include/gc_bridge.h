@@ -200,4 +200,9 @@ void gc_gfx_present(const void* framebuffer);
 /** Start the game: libultra init, then bootproc(). Returns once the game threads are running. */
 void gc_ultra_boot(void);
 
+/** What the game was doing, for the exception log (port/gc/ogc/exc_hook.c; implemented in port/gc/game/trace.c):
+ *  the running gamestate (gGameStateOverlayTable index, -1 if none) and its frame count, and in Play the
+ *  scene, room and entrance (-1/-1/0 otherwise). Only reads memory, so it is safe in exception context. */
+void gc_game_crash_info(int* gameState, unsigned int* frames, int* scene, int* room, unsigned int* entrance);
+
 #endif

@@ -605,14 +605,17 @@ static void FlashWrite(OSMesgQueue* mq, u32 pageNum, const u8* src, u32 pageCoun
     }
 }
 
-/** Wait until gc_save_store has been called `attempts` times in total; returns the ms waited. */
-static unsigned int WaitForStoreAttempts(int attempts, unsigned int timeoutMs) {
-    unsigned int start = mock_now_ms();
-
+/** Wait until gc_save_store has been called `attempts` times in total; returns the ms since `start`. */
+static unsigned int WaitForStoreAttemptsSince(unsigned int start, int attempts, unsigned int timeoutMs) {
     while ((mock_now_ms() - start < timeoutMs) && (mock_save_store_attempts() < attempts)) {
         mock_sleep_ms(10);
     }
     return mock_now_ms() - start;
+}
+
+/** Wait until gc_save_store has been called `attempts` times in total; returns the ms waited. */
+static unsigned int WaitForStoreAttempts(int attempts, unsigned int timeoutMs) {
+    return WaitForStoreAttemptsSince(mock_now_ms(), attempts, timeoutMs);
 }
 
 static void TestFlash(void) {
@@ -627,6 +630,7 @@ static void TestFlash(void) {
     int attempts0;
     unsigned int changedAt;
     unsigned int waited;
+    unsigned int changeMs;
     u32 i;
 
     gc_log("== flash (%s)", ScenarioName());
@@ -734,10 +738,12 @@ static void TestFlash(void) {
         CHECK_EQ(mock_save_stores(), stores0 + 2);
 
         // A failed SD write is retried a second later, not only after the game's next save
+        // (timed from before the write: on a loaded host the test thread can resume well after FlashWrite's change)
         attempts0 = mock_save_store_attempts();
         mock_save_fail_next(1);
+        changeMs = mock_now_ms();
         FlashWrite(&mq, 0x300, sFlashData, 1);
-        waited = WaitForStoreAttempts(attempts0 + 2, 6000);
+        waited = WaitForStoreAttemptsSince(changeMs, attempts0 + 2, 6000);
         gc_log("flash: stored after one failed write, %u ms after the change", waited);
         CHECK_EQ(mock_save_store_attempts(), attempts0 + 2);
         CHECK_EQ(mock_save_stores(), stores0 + 3);
