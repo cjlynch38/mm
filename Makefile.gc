@@ -1,0 +1,127 @@
+# Native GameCube build of Majora's Mask (devkitPPC + libogc).
+#
+#   make            # first: the normal N64 build must exist (build/n64-us)
+#   make -f Makefile.gc -j$(nproc)
+#
+# This file is independent of the N64 Makefile, which stays untouched so the
+# matching build is unaffected. GameCube-specific source lives in port/gc/.
+# See port/gc/README.md.
+
+MAKEFLAGS += --no-builtin-rules
+SHELL = /usr/bin/env bash
+.SHELLFLAGS = -o pipefail -c
+
+VERSION        := n64-us
+N64_BUILD_DIR  := build/$(VERSION)
+BUILD_DIR      := build/gc-$(VERSION)
+EXTRACTED_DIR  := extracted/$(VERSION)
+N64_ELF        := $(N64_BUILD_DIR)/mm-$(VERSION).elf
+
+DEVKITPRO ?= /opt/devkitpro
+DEVKITPPC ?= $(DEVKITPRO)/devkitPPC
+PREFIX    := $(DEVKITPPC)/bin/powerpc-eabi-
+CC        := $(PREFIX)gcc
+AS        := $(PREFIX)as
+SIZE      := $(PREFIX)size
+PYTHON    := .venv/bin/python3
+SHIFTJIS_CONV := $(PYTHON) tools/buildtools/shiftjis_conv.py
+
+ifeq ($(wildcard $(N64_ELF)),)
+$(error $(N64_ELF) not found. Run the normal N64 build first ("make init" or "make"))
+endif
+
+#### Flags ####
+
+# Game translation units: compiled against the decomp's own headers and libc,
+# never against libogc headers (types and names such as Mtx, Vtx, gu* clash).
+GAME_CPPFLAGS := -nostdinc -Iinclude -Iinclude/libc -Isrc -I$(N64_BUILD_DIR) -I. -I$(EXTRACTED_DIR) \
+                 -Iport/gc/include -include port/gc/include/gc_prelude.h \
+                 -D_LANGUAGE_C -DF3DEX_GBI_2 -DF3DEX_GBI_PL -DGBI_DOWHILE -DMM_VERSION=N64_US \
+                 -DNON_MATCHING -DAVOID_UB -DTARGET_GC -DGEKKO
+
+GAME_CFLAGS := -mcpu=750 -meabi -mhard-float -G0 -O2 -std=gnu17 \
+               -funsigned-char -fno-strict-aliasing -fwrapv -ffp-contract=off \
+               -fno-aggressive-loop-optimizations -fno-delete-null-pointer-checks \
+               -fno-common -ffreestanding -fbuiltin -fno-builtin-sinf -fno-builtin-cosf \
+               -fno-function-sections -fno-data-sections -fno-toplevel-reorder -fno-ipa-icf \
+               -fno-asynchronous-unwind-tables -ftrivial-auto-var-init=zero
+
+GAME_WARNINGS := -Wno-unknown-pragmas -Wno-multichar -Wno-builtin-declaration-mismatch
+
+#### Object list ####
+
+# Every object the N64 spec links, minus what the GameCube replaces:
+#  - overlay relocation tables, ROM header/IPL, RSP microcode, MIPS-gcc helpers
+#  - assets / baserom segments (read from the user's ROM at runtime)
+#  - libultra OS/IO/voice/debug (replaced by port/gc/ultra) and all MIPS .s files
+#  - libc pieces provided by newlib, MIPS-only loaders, flash driver (shimmed)
+SPEC_O_FILES := $(shell gcc -E -P -xc -fno-dollars-in-identifiers -DMM_VERSION=N64_US -I. spec/spec \
+                  | sed -e 's|$$(BUILD_DIR)|$(N64_BUILD_DIR)|g' \
+                  | sed -n -E 's/^[ \t]*include[ \t]*"([a-zA-Z0-9/_.-]+\.o)"/\1/p' \
+                  | sed -e 's|^$(N64_BUILD_DIR)/||')
+
+GC_EXCLUDE := %_reloc.o src/makerom/% rsp/% src/gcc_fix/% assets/% baserom/% \
+              src/libultra/os/% src/libultra/io/% src/libultra/voice/% src/libultra/debug/% \
+              src/libultra/mgu/% src/libultra/gu/sqrtf.o src/libultra/gu/libm_vals.o \
+              src/libultra/libc/string.o src/libultra/libc/ldiv.o src/libultra/libc/ll.o \
+              src/libultra/libc/llcvt.o src/libultra/libc/bzero.o src/libultra/libc/bcmp.o \
+              src/libultra/libc/bcopy.o \
+              src/boot/libc/% src/boot/libm/fmodf.o src/boot/libc64/fp.o \
+              src/boot/libu64/loadfragment.o src/boot/libu64/loadfragment2.o \
+              src/code/kanread.o src/code/osFlash.o \
+              src/audio/code_8019AE40.o src/audio/code_8019AEC0.o \
+              src/audio/lib/aisetnextbuf.o src/audio/lib/stack.o
+
+GAME_O_REL   := $(filter-out $(GC_EXCLUDE),$(SPEC_O_FILES))
+GAME_O_FILES := $(addprefix $(BUILD_DIR)/,$(GAME_O_REL)) \
+                $(BUILD_DIR)/assets/audio/sequence_font_table.o
+
+SHIFTJIS_C_FILES := src/audio/voice_external.c src/code/z_message.c src/code/z_message_nes.c
+SHIFTJIS_O_FILES := $(foreach f,$(SHIFTJIS_C_FILES:.c=.o),$(BUILD_DIR)/$f)
+
+DEP_FILES := $(GAME_O_FILES:.o=.d)
+
+#### Per-file settings (mirror the N64 Makefile) ####
+
+$(BUILD_DIR)/src/boot/build.o: GAME_CPPFLAGS += -DBUILD_CREATOR="\"zelda@srd44\"" -DBUILD_DATE="\"00-07-31\"" -DBUILD_TIME="\"17:04:16\""
+$(BUILD_DIR)/src/audio/lib/seqplayer.o: GAME_CPPFLAGS += -DMML_VERSION=MML_VERSION_MM
+$(BUILD_DIR)/src/audio/tables/sequence_table.o: GAME_CPPFLAGS += -Iinclude/tables
+
+#### Targets ####
+
+.PHONY: all objs sizes clean
+all: objs
+
+objs: $(GAME_O_FILES)
+	@echo "Compiled $(words $(GAME_O_FILES)) game objects into $(BUILD_DIR)"
+
+# Code size per area, for the memory budget
+sizes: $(GAME_O_FILES)
+	@for area in src/boot src/code src/audio src/libultra src/buffers src/dmadata src/overlays/actors \
+	              src/overlays/effects src/overlays/gamestates src/overlays/kaleido_scope src/overlays/fbdemos; do \
+	    files=$$(echo $(GAME_O_FILES) | tr ' ' '\n' | grep "^$(BUILD_DIR)/$$area/"); \
+	    [ -n "$$files" ] || continue; \
+	    $(SIZE) -t $$files | tail -1 | awk -v a=$$area '{printf "%-28s text %9d  data %8d  bss %8d\n", a, $$1, $$2, $$3}'; \
+	done; \
+	$(SIZE) -t $(GAME_O_FILES) | tail -1 | awk '{printf "%-28s text %9d  data %8d  bss %8d\n", "TOTAL", $$1, $$2, $$3}'
+
+clean:
+	rm -rf $(BUILD_DIR)
+
+#### Rules ####
+
+$(SHIFTJIS_O_FILES): $(BUILD_DIR)/src/%.o: src/%.c
+	@mkdir -p $(@D)
+	$(SHIFTJIS_CONV) -o $(@:.o=.enc.c) $<
+	$(CC) -c $(GAME_CPPFLAGS) $(GAME_CFLAGS) $(GAME_WARNINGS) -fexec-charset=euc-jp -MMD -MP -MT $@ -o $@ $(@:.o=.enc.c)
+
+$(BUILD_DIR)/src/%.o: src/%.c
+	@mkdir -p $(@D)
+	$(CC) -c $(GAME_CPPFLAGS) $(GAME_CFLAGS) $(GAME_WARNINGS) -fexec-charset=euc-jp -MMD -MP -o $@ $<
+
+$(BUILD_DIR)/assets/audio/sequence_font_table.o: $(N64_BUILD_DIR)/assets/audio/sequence_font_table.s
+	@mkdir -p $(@D)
+	sed -e 's/.half /.2byte /' $< > $(@:.o=.ppc.s)
+	$(AS) -o $@ $(@:.o=.ppc.s)
+
+-include $(DEP_FILES)

@@ -93,7 +93,14 @@ int _Printf(PrintCallback pfn, void* arg, const char* fmt, va_list ap) {
             s++;
         }
 
+#ifdef TARGET_GC
+        // va_list is an array type on PowerPC, so the `ap` parameter has decayed to a pointer to the
+        // va_list state and `&ap` is not a `va_list*`. Reinterpret the pointer so _Putfld advances
+        // the caller's state in place, as on MIPS.
+        _Putfld(&x, (va_list*)ap, *s, ac);
+#else
         _Putfld(&x, &ap, *s, ac);
+#endif
 
         x.width -= x.n0 + x.nz0 + x.n1 + x.nz1 + x.n2 + x.nz2;
 

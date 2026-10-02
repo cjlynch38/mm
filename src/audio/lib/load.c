@@ -1246,7 +1246,12 @@ void AudioLoad_Init(void* heap, size_t heapSize) {
 
     // Set all of gAudioCtx to 0
     audioCtxPtr = (u8*)&gAudioCtx;
+    //! @bug Clears sizeof(gAudioCtx) + 1 bytes, overwriting the first byte after gAudioCtx.
+#ifdef AVOID_UB
+    for (j = sizeof(gAudioCtx); j > 0; j--) {
+#else
     for (j = sizeof(gAudioCtx); j >= 0; j--) {
+#endif
         *audioCtxPtr++ = 0;
     }
 
