@@ -3,8 +3,22 @@
 Native GameCube build of Majora's Mask: the decomp's C source compiled for the
 GameCube's PowerPC CPU with devkitPPC and libogc. This is not an emulator.
 
-Status: **Milestone 2 in progress.** All game code compiles for PowerPC. Linking
-and the libultra shim are next.
+## Status
+
+Verified in Dolphin 2609. Real-hardware testing (PicoBoot + Swiss + SD2SP2) is pending for
+everything past Milestone 0.
+
+| Milestone | State |
+|---|---|
+| 0. Toolchain | Done; a test DOL runs on hardware (SD2SP2 read/write verified) |
+| 1. Matching N64 build | Done |
+| 2. Main loop on GameCube | Done: libultra on libogc threads; title → File Select at the N64's 20 fps |
+| 3. Renderer | Done (first pass): F3DZEX2 and S2DEX2 display lists interpreted on the CPU and drawn with GX. The N64 logo, title screen, attract cutscenes, gameplay and HUD render, with framebuffer effects (motion blur, VisMono). |
+| 4. Audio | Done: MM's audio microcode runs on the CPU, bit-exact against the real microcode, with AI DMA output at 32 kHz |
+| 5. Disc and memory | Done: bootable disc image built locally from your ROM with our own apploader; hot ROM data is cached in ARAM; saves go to SD or the memory card |
+| 6. Polish | Not started: controller mapping review, performance on hardware, hi-res framebuffer (Bombers' Notebook) |
+
+`port/gc/tools/run_host_tests.sh` builds and runs every host test and test DOL.
 
 ## Requirements
 
@@ -103,6 +117,40 @@ On the console side (see `tests/sd_probe/source/main.c` for working code):
   A when the run has one: `run_dolphin.sh ... -MemCard C:\path\card.raw`
   (Dolphin names the file `card.USA.59.raw`, a 59-block card). Without
   `-MemCard` the script leaves slot A empty, so every run starts without a save.
+
+### Unattended runs: the input script
+
+`make -f Makefile.gc GC_AUTOSTART=1` taps Start on the title screen until File
+Select. `GC_AUTOSTART=2` plays a scripted controller 1 instead
+(`game/input_script.c`): title -> File Select -> a new file (name entry) ->
+the prologue (the Lost Woods as human Link, the Clock Tower's underground as
+Deku Link with its Deku flower glides, the Happy Mask Salesman) -> Clock Town,
+where it opens the pause menu and walks a tour South -> East -> North -> South
+Clock Town while the three days pass, through the moon's fall and the restart
+of the cycle. The script is a table of steps conditioned on the gamestate,
+scene, room, frames, message boxes, cutscenes, player control and form; the
+active step is logged (`script: ...`), and `trace.c` logs scene and room
+changes, message ids, cutscenes and a player status line every second. The
+coordinates come from the scenes' collision data in
+`extracted/n64-us/assets/scenes/`.
+
+```bash
+make -f Makefile.gc -j$(nproc) GC_AUTOSTART=2
+port/gc/tools/run_dolphin.sh build/gc-n64-us/mm-gc.dol -Seconds 120 \
+    -ExtraConfig Dolphin.Core.EmulationSpeed=0 -ScreenshotEvery 10
+```
+
+With `Dolphin.Core.EmulationSpeed=0` (no speed limit) Dolphin runs the game 6-8
+times faster than real time: Clock Town is reached after about 80 s, the whole
+first cycle takes about 8 minutes. Log timestamps stay in game time.
+`-ScreenshotEvery <n>` adds a screenshot every n seconds (wall time).
+
+Crashes: `ogc/exc_hook.c` logs every unhandled CPU exception (kind, registers,
+DAR/DSISR, return addresses, gamestate/scene/room) before libogc's panic dump;
+resolve the addresses with
+`powerpc-eabi-addr2line -f -e build/gc-n64-us/mm-gc.elf <addresses>`.
+In Dolphin a data access to an unmapped address usually shows an "Invalid read"
+dialog instead (run_dolphin exit code 2, with the dialog's text).
 
 ### Real hardware
 
