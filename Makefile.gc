@@ -23,6 +23,7 @@ PREFIX    := $(DEVKITPPC)/bin/powerpc-eabi-
 CC        := $(PREFIX)gcc
 AS        := $(PREFIX)as
 SIZE      := $(PREFIX)size
+OBJCOPY   := $(PREFIX)objcopy
 PYTHON    := .venv/bin/python3
 SHIFTJIS_CONV := $(PYTHON) tools/buildtools/shiftjis_conv.py
 
@@ -47,6 +48,14 @@ GAME_CFLAGS := -mcpu=750 -meabi -mhard-float -G0 -O2 -std=gnu17 \
                -fno-asynchronous-unwind-tables -ftrivial-auto-var-init=zero
 
 GAME_WARNINGS := -Wno-unknown-pragmas -Wno-multichar -Wno-builtin-declaration-mismatch
+
+# Platform layer code compiled with the game's headers (port/gc/ultra, port/gc/game)
+PORT_WARNINGS := -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers
+
+# Platform code that talks to libogc (port/gc/ogc): libogc headers, never the game's.
+MACHDEP    := -DGEKKO -mogc -mcpu=750 -meabi -mhard-float
+OGC_CFLAGS := $(MACHDEP) -O2 -std=gnu17 -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing \
+              -I$(DEVKITPRO)/libogc/include -Iport/gc/include
 
 #### Object list ####
 
@@ -79,7 +88,12 @@ GAME_O_FILES := $(addprefix $(BUILD_DIR)/,$(GAME_O_REL)) \
 SHIFTJIS_C_FILES := src/audio/voice_external.c src/code/z_message.c src/code/z_message_nes.c
 SHIFTJIS_O_FILES := $(foreach f,$(SHIFTJIS_C_FILES:.c=.o),$(BUILD_DIR)/$f)
 
-DEP_FILES := $(GAME_O_FILES:.o=.d)
+# Platform layer (port/gc). ultra/ and game/ use the game's headers; ogc/ uses libogc's.
+PORT_GAME_C  := $(wildcard port/gc/ultra/*.c port/gc/game/*.c)
+PORT_OGC_C   := $(wildcard port/gc/ogc/*.c)
+PORT_O_FILES := $(foreach f,$(PORT_GAME_C:.c=.o) $(PORT_OGC_C:.c=.o),$(BUILD_DIR)/$f)
+
+DEP_FILES := $(GAME_O_FILES:.o=.d) $(PORT_O_FILES:.o=.d)
 
 #### Per-file settings (mirror the N64 Makefile) ####
 
@@ -87,10 +101,18 @@ $(BUILD_DIR)/src/boot/build.o: GAME_CPPFLAGS += -DBUILD_CREATOR="\"zelda@srd44\"
 $(BUILD_DIR)/src/audio/lib/seqplayer.o: GAME_CPPFLAGS += -DMML_VERSION=MML_VERSION_MM
 $(BUILD_DIR)/src/audio/tables/sequence_table.o: GAME_CPPFLAGS += -Iinclude/tables
 
+# Drop the weak sinf/cosf aliases (#pragma weak) so newlib/libogc never bind to the N64 versions
+POSTPROCESS_OBJ := @:
+$(BUILD_DIR)/src/libultra/gu/sinf.o: POSTPROCESS_OBJ = $(OBJCOPY) --strip-symbol=sinf $@
+$(BUILD_DIR)/src/libultra/gu/cosf.o: POSTPROCESS_OBJ = $(OBJCOPY) --strip-symbol=cosf $@
+
 #### Targets ####
 
-.PHONY: all objs sizes clean
-all: objs
+.PHONY: all objs port sizes clean
+all: objs port
+
+port: $(PORT_O_FILES)
+	@echo "Compiled $(words $(PORT_O_FILES)) platform objects"
 
 objs: $(GAME_O_FILES)
 	@echo "Compiled $(words $(GAME_O_FILES)) game objects into $(BUILD_DIR)"
@@ -118,6 +140,15 @@ $(SHIFTJIS_O_FILES): $(BUILD_DIR)/src/%.o: src/%.c
 $(BUILD_DIR)/src/%.o: src/%.c
 	@mkdir -p $(@D)
 	$(CC) -c $(GAME_CPPFLAGS) $(GAME_CFLAGS) $(GAME_WARNINGS) -fexec-charset=euc-jp -MMD -MP -o $@ $<
+	$(POSTPROCESS_OBJ)
+
+$(BUILD_DIR)/port/gc/ogc/%.o: port/gc/ogc/%.c
+	@mkdir -p $(@D)
+	$(CC) -c $(OGC_CFLAGS) -MMD -MP -o $@ $<
+
+$(BUILD_DIR)/port/gc/%.o: port/gc/%.c
+	@mkdir -p $(@D)
+	$(CC) -c $(GAME_CPPFLAGS) $(GAME_CFLAGS) $(GAME_WARNINGS) $(PORT_WARNINGS) -MMD -MP -o $@ $<
 
 $(BUILD_DIR)/assets/audio/sequence_font_table.o: $(N64_BUILD_DIR)/assets/audio/sequence_font_table.s
 	@mkdir -p $(@D)
