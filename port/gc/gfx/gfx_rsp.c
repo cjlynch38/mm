@@ -74,11 +74,13 @@ extern uintptr_t gGfxHostRamBias;
 #define RAM_BASE 0x80000000u
 #define RAM_SIZE 0x01800000u // GameCube MEM1
 
-/* Paired-single code paths (Gekko) */
+/* Paired-single code paths (Gekko); -DRSP_PAIRED=0 builds the C paths instead */
+#ifndef RSP_PAIRED
 #if defined(__PPC__) && defined(GEKKO) && !defined(GFX_HOST_TEST)
 #define RSP_PAIRED 1
 #else
 #define RSP_PAIRED 0
+#endif
 #endif
 /* GQR values (load and store halves alike): type in bits 0-2 of each half, scale in bits 8-13. The GQRs are global:
  * libogc's thread switches keep each thread's paired-single halves but not its GQRs (it only relies on GQR0 = 0,
@@ -91,6 +93,84 @@ extern uintptr_t gGfxHostRamBias;
 
 #ifndef GFX_VTX_CHECK
 #define GFX_VTX_CHECK 0
+#endif
+#ifndef GFX_FRAME_HASH
+#define GFX_FRAME_HASH 0
+#endif
+
+#if GFX_FRAME_HASH
+/* Hash build (-DGFX_FRAME_HASH=1): per task, for each skeleton (the G_MTX loads from segment 0x0D after the game
+ * points that segment at an actor's limb matrices), FNV hashes of the raw matrices, of the raw vertices loaded under
+ * them and of the clip positions computed from them. Logged for the first FH_FRAMES frames of each Play scene, they
+ * can be compared line by line between the console and Dolphin (cutscene animation is deterministic): different raw
+ * matrices mean the game computed something else, the same raw data with different positions means the vertex math
+ * differs. */
+#define FH_GROUPS 8
+#define FH_FRAMES 1500
+typedef struct {
+    uint32_t seg, mtx, vin, vout;
+    uint16_t nMtx, nVtx;
+} FhGroup;
+static FhGroup sFh[FH_GROUPS];
+static int sFhCount;    /* skeletons this task */
+static int sFhCur = -1; /* skeleton of the last segment 0x0D write, -1 when the table is full */
+static bool sFhInSkel;  /* the modelview was last loaded from segment 0x0D */
+static int sFhScene = -1;
+static unsigned int sFhEntrance;
+
+static uint32_t fh_hash(uint32_t h, const void* p, uint32_t bytes) {
+    const uint8_t* b = p;
+    uint32_t i;
+
+    for (i = 0; i + 4 <= bytes; i += 4) {
+        uint32_t w;
+
+        memcpy(&w, b + i, 4);
+        h = (h ^ w) * 16777619u;
+    }
+    return h;
+}
+
+static void fh_segment(uint32_t seg) {
+    FhGroup* g;
+
+    sFhInSkel = false;
+    if (sFhCount >= FH_GROUPS) {
+        sFhCur = -1;
+        return;
+    }
+    sFhCur = sFhCount++;
+    g = &sFh[sFhCur];
+    g->seg = seg;
+    g->mtx = g->vin = g->vout = 2166136261u;
+    g->nMtx = g->nVtx = 0;
+}
+
+void gfx_rsp_frame_hash_log(void) {
+    char line[400];
+    int gs, scene, room, i, len;
+    unsigned int frames, entrance;
+
+    gc_game_crash_info(&gs, &frames, &scene, &room, &entrance);
+    if (gs != 3 || sFhCount == 0 || frames > FH_FRAMES) {
+        return;
+    }
+    if (scene != sFhScene || entrance != sFhEntrance) {
+        sFhScene = scene;
+        sFhEntrance = entrance;
+    }
+    len = snprintf(line, sizeof(line), "fh %02X/%04X f%u:", (unsigned int)scene, entrance, frames);
+    for (i = 0; i < sFhCount && len < (int)sizeof(line) - 48; i++) {
+        const FhGroup* g = &sFh[i];
+
+        if (g->nMtx < 4) {
+            continue;
+        }
+        len += snprintf(line + len, sizeof(line) - len, " %u/%u %08X %08X %08X", g->nMtx, g->nVtx,
+                        (unsigned int)g->mtx, (unsigned int)g->vin, (unsigned int)g->vout);
+    }
+    gc_log("%s", line);
+}
 #endif
 
 #define VTX_COUNT 32
@@ -715,6 +795,15 @@ static void rsp_mtx(uint32_t w0, uint32_t w1) {
         return;
     }
     mtx_from_raw(m, src);
+#if GFX_FRAME_HASH
+    if (!(params & G_MTX_PROJECTION)) {
+        sFhInSkel = (w1 >> 24) == 0x0D && sFhCur >= 0;
+        if (sFhInSkel) {
+            sFh[sFhCur].mtx = fh_hash(sFh[sFhCur].mtx, src, 64);
+            sFh[sFhCur].nMtx++;
+        }
+    }
+#endif
     if (params & G_MTX_PROJECTION) {
         if (params & G_MTX_LOAD) {
             memcpy(sRsp.p, m, sizeof(m));
@@ -1443,6 +1532,17 @@ static void rsp_vertices(uint32_t w0, uint32_t w1) {
     for (i = 0; i < n; i++) {
         sVtxIn[v0 + i] = in + 16 * i;
     }
+#if GFX_FRAME_HASH
+    if (sFhInSkel) {
+        FhGroup* g = &sFh[sFhCur];
+
+        g->vin = fh_hash(g->vin, in, 16 * (uint32_t)n);
+        for (i = 0; i < n; i++) {
+            g->vout = fh_hash(g->vout, &sVtx[v0 + i].x, 16);
+        }
+        g->nVtx += (uint16_t)n;
+    }
+#endif
     // The second vertex of each pair of the load (light colors: col instead of colc)
     sVtxOdd = (sVtxOdd & ~mask) | ((((v0 & 1) ? 0x55555555u : 0xAAAAAAAAu)) & mask);
     sPending |= mask;
@@ -1717,6 +1817,11 @@ static void rsp_moveword(uint32_t w0, uint32_t w1) {
                 break;
             }
             gGfxSegments[ofs >> 2] = w1;
+#if GFX_FRAME_HASH
+            if ((ofs >> 2) == 0x0D) {
+                fh_segment(w1);
+            }
+#endif
             break;
         case G_MW_FOG:
             gGfxRsp.fogMultiplier = (int16_t)(w1 >> 16);
@@ -1888,6 +1993,11 @@ void gfx_rsp_reset(void) {
     sRsp.lightsValid = true;
     sRsp.perspNorm = 0xFFFF;
     memset(gGfxSegments, 0, sizeof(gGfxSegments));
+#if GFX_FRAME_HASH
+    sFhCount = 0;
+    sFhCur = -1;
+    sFhInSkel = false;
+#endif
     memset(&gGfxRsp, 0, sizeof(gGfxRsp));
     gGfxRsp.geometryMode = G_CLIPPING;
     memset(sVtx, 0, sizeof(sVtx));

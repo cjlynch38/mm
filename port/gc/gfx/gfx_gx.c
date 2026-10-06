@@ -37,7 +37,7 @@
 
 #define GX_FIFO_SIZE (256 * 1024)
 #ifndef XFB_SLOTS
-#define XFB_SLOTS 3 /* -DXFB_SLOTS=2 tests the low-memory path */
+#define XFB_SLOTS 4 /* -DXFB_SLOTS=2 tests the low-memory path */
 #endif
 #define XFB_SLOTS_MIN 2
 /* 1: a task ends without waiting for GX; the display copy is fenced with a draw sync token (gfx_gx_present) and the
@@ -47,6 +47,9 @@
 #endif
 #ifndef GFX_VTX_CHECK
 #define GFX_VTX_CHECK 0
+#endif
+#ifndef GFX_SHADOW_PROBE
+#define GFX_SHADOW_PROBE 0
 #endif
 #define BATCH_TRIS 128
 #define BATCH_VERTS (BATCH_TRIS * 3)
@@ -987,12 +990,88 @@ static inline bool gx_fits_persp(const GfxVtx* v) {
     return fabsf(v->z - (sProjA * v->w + sProjB)) <= PERSP_FIT_TOLERANCE * (fabsf(v->w) + 1.0f);
 }
 
+#if GFX_SHADOW_PROBE
+/* Probe build (-DGFX_SHADOW_PROBE=1): the EFB color under the first actor shadows of each scene, before and after
+ * the shadow is drawn (GX_PeekARGB after GX_DrawDone), with the inputs that make it. Shadows are the triangles drawn
+ * with the blender's FOG_SHADE_A cycle, decal z and a black primitive color (SETUPDL_44). */
+static int sProbeScene = -1;
+static int sProbeLeft;
+static unsigned int sProbeLastFrame;
+
+static bool gx_probe_shadow(int* ex, int* ey, const GfxVtx* const vtx[3]) {
+    u32 l = gGfxRdp.otherModeL;
+    float sx = gGfxRsp.viewportScale[0] * 0.25f, sy = gGfxRsp.viewportScale[1] * 0.25f;
+    float tx = gGfxRsp.viewportTrans[0] * 0.25f, ty = gGfxRsp.viewportTrans[1] * 0.25f;
+    float x = 0.0f, y = 0.0f;
+    int gs, scene, room, i;
+    unsigned int frames, entrance;
+
+    if (((l >> 30) & 3) != G_BL_CLR_FOG || ((l >> 26) & 3) != 2 || (l & 0x0C00) != 0x0C00 ||
+        (gGfxRdp.primColor & 0xFFFFFF00) != 0) {
+        return false;
+    }
+    gc_game_crash_info(&gs, &frames, &scene, &room, &entrance);
+    if (gs != 3 || frames < 40) {
+        // Play only, after the fade-in
+        return false;
+    }
+    if (scene != sProbeScene) {
+        sProbeScene = scene;
+        sProbeLeft = 6;
+        sProbeLastFrame = 0;
+    }
+    if (sProbeLeft <= 0 || (sProbeLastFrame != 0 && frames - sProbeLastFrame < 10)) {
+        return false;
+    }
+    for (i = 0; i < 3; i++) {
+        if (!(vtx[i]->w > 0.0f)) {
+            return false;
+        }
+        x += vtx[i]->x / vtx[i]->w;
+        y += vtx[i]->y / vtx[i]->w;
+    }
+    if (sx == 0.0f || sy == 0.0f) {
+        sx = tx = GFX_N64_WIDTH / 2;
+        sy = ty = GFX_N64_HEIGHT / 2;
+    }
+    *ex = (int)((tx + sx * x / 3.0f) * sScale);
+    *ey = (int)((ty - sy * y / 3.0f) * sScale);
+    if (*ex < 0 || *ey < 0 || *ex >= GFX_EFB_WIDTH || *ey >= GFX_EFB_HEIGHT) {
+        return false;
+    }
+    sProbeLastFrame = frames;
+    return true;
+}
+
+static void gx_probe_log(int ex, int ey, GXColor before, GXColor after, const GfxVtx* const vtx[3]) {
+    int gs, scene, room;
+    unsigned int frames, entrance;
+
+    gc_game_crash_info(&gs, &frames, &scene, &room, &entrance);
+    gc_log("probe shadow: scene %02X frame %u EFB (%d,%d) before %02X%02X%02X after %02X%02X%02X; prim %08X fog %08X "
+           "env %08X; vtx rgba %08X %08X %08X; z/w %d %d %d (x1000); combine %06X %08X; mode H %08X L %08X; geo %08X",
+           (unsigned int)scene, frames, ex, ey, before.r, before.g, before.b, after.r, after.g, after.b,
+           (unsigned int)gGfxRdp.primColor, (unsigned int)gGfxRdp.fogColor, (unsigned int)gGfxRdp.envColor,
+           ((u32)vtx[0]->r << 24) | ((u32)vtx[0]->g << 16) | ((u32)vtx[0]->b << 8) | vtx[0]->a,
+           ((u32)vtx[1]->r << 24) | ((u32)vtx[1]->g << 16) | ((u32)vtx[1]->b << 8) | vtx[1]->a,
+           ((u32)vtx[2]->r << 24) | ((u32)vtx[2]->g << 16) | ((u32)vtx[2]->b << 8) | vtx[2]->a,
+           (int)(vtx[0]->z / vtx[0]->w * 1000.0f), (int)(vtx[1]->z / vtx[1]->w * 1000.0f),
+           (int)(vtx[2]->z / vtx[2]->w * 1000.0f), (unsigned int)gGfxRdp.combineHi, (unsigned int)gGfxRdp.combineLo,
+           (unsigned int)gGfxRdp.otherModeH, (unsigned int)gGfxRdp.otherModeL, (unsigned int)gGfxRsp.geometryMode);
+}
+#endif
+
 static void gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
     const GfxVtx* vtx[3] = { v0, v1, v2 };
     BatchVtx* out;
     bool cpu;
     int i;
     Target target = gx_target(false);
+#if GFX_SHADOW_PROBE
+    bool probe = false;
+    int probeX = 0, probeY = 0;
+    GXColor before = { 0, 0, 0, 0 }, after = { 0, 0, 0, 0 };
+#endif
 
     if (target == TARGET_CANVAS) {
         // Any pixel inside the scissor, partly covered
@@ -1023,6 +1102,16 @@ static void gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
     if (sVMode != (cpu ? VMODE_NDC : VMODE_PERSP)) {
         gx_set_vmode(cpu ? VMODE_NDC : VMODE_PERSP);
     }
+#if GFX_SHADOW_PROBE
+    if (target == TARGET_FRAME && gx_probe_shadow(&probeX, &probeY, vtx)) {
+        probe = true;
+        gfx_gx_flush();
+        GX_DrawDone();
+        GX_PeekARGB((u16)probeX, (u16)probeY, &before);
+        // Over black (a fade, a letterbox) the probe tells nothing: try again 10 frames later
+        probe = before.r + before.g + before.b >= 24;
+    }
+#endif
 
     // (flat shading is applied by gfx_rsp: it keeps per-vertex alpha, as the microcode does)
     out = gx_batch_alloc(3);
@@ -1050,6 +1139,15 @@ static void gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
     if (target == TARGET_FRAME) {
         sColorClean = sDepthClean = false;
     }
+#if GFX_SHADOW_PROBE
+    if (probe) {
+        gfx_gx_flush();
+        GX_DrawDone();
+        GX_PeekARGB((u16)probeX, (u16)probeY, &after);
+        gx_probe_log(probeX, probeY, before, after, vtx);
+        sProbeLeft--;
+    }
+#endif
 }
 
 void gfx_gx_triangle(const GfxVtx* v0, const GfxVtx* v1, const GfxVtx* v2) {
@@ -1542,8 +1640,10 @@ static void gx_log_stats(u64 now) {
 }
 
 /* A slot that is neither on screen nor about to be (libogc's current framebuffer is the one latched at
- * the last retrace, the next one is latched at the coming retrace): the one already holding this
- * framebuffer, else the least recently used. Marked busy, so the VI thread cannot present it. */
+ * the last retrace, the next one is latched at the coming retrace): the least recently used. With 4 slots that is
+ * never the slot that left the screen at the last retrace, which a late retrace interrupt could leave the VI still
+ * scanning out (at 60 fps the frame two swaps back, which holds the same N64 framebuffer, is that slot). Marked
+ * busy, so the VI thread cannot present it. */
 static int gx_pick_slot(u32 key) {
     void* current;
     void* next;
@@ -1559,10 +1659,6 @@ static int gx_pick_slot(u32 key) {
     for (i = 0; i < sSlotCount; i++) {
         if (sSlots[i].busy || i == sPresented || sSlots[i].xfb == current || sSlots[i].xfb == next) {
             continue;
-        }
-        if (sSlots[i].key == key) {
-            slot = i;
-            break;
         }
         if (slot < 0 || sSlots[i].stamp < sSlots[slot].stamp) {
             slot = i;

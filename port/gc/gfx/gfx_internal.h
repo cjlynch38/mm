@@ -113,6 +113,8 @@ void gfx_rsp_reset(void);
 void gfx_rsp_run(uint32_t dlAddr);
 /** Log statistics every few seconds (called by gfx_task.c after each task). */
 void gfx_rsp_stats_frame(void);
+/** Hash build (-DGFX_FRAME_HASH=1): log the task's per-skeleton hashes (gfx_rsp.c). */
+void gfx_rsp_frame_hash_log(void);
 
 /* ================================================================================================ */
 /* RDP state (gfx_rdp.c owns it; gfx_tex.c, gfx_tev.c and gfx_gx.c read it)                         */

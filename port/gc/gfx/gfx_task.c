@@ -91,6 +91,9 @@ void gc_gfx_run_task(unsigned int dlist) {
 #endif
     gfx_gx_task_end();
     gfx_rsp_stats_frame();
+#if defined(GFX_FRAME_HASH) && GFX_FRAME_HASH
+    gfx_rsp_frame_hash_log();
+#endif
 }
 
 void gc_gfx_present(const void* framebuffer) {
