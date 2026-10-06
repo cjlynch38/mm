@@ -5,7 +5,7 @@
  * a floor crossing the near plane, a perspective cube drawn front faces first (the depth test must
  * hide the back faces), interpenetrating triangles, a decal, a triangle that takes the CPU path,
  * primitive-depth rectangles, plain and flipped texture rectangles, an N64 orthographic projection,
- * geometry closer than the near plane (F3DZEX2 NoN draws it with z clamped), a G_ZS_PRIM triangle and
+ * geometry closer than the near plane (F3DZEX2 NoN draws it), a G_ZS_PRIM triangle and
  * rectangle at the largest primitive depth, and FILL-mode markers on the cube corners as projected with
  * N64 math on the CPU.
  *
@@ -284,11 +284,14 @@ static void eye_tri(const float e[3][3], u8 r, u8 g, u8 b) {
     gfx_gx_triangle(&v[0], &v[1], &v[2]);
 }
 
-/* Window depth (24-bit) of an N64 NDC z through the standard viewport */
-static u32 depth24(float ndcZ) {
-    float d = (ndcZ * 511.0f + 511.0f) / 1023.0f;
+/* EFB depth (24-bit) of an N64 window depth (gfx_internal.h) */
+static u32 efb24(float d) {
+    return (u32)((d + GFX_DEPTH_UNDER) / (1 + GFX_DEPTH_UNDER) * 16777215.0f + 0.5f);
+}
 
-    return (u32)(d * 16777215.0f + 0.5f);
+/* EFB depth (24-bit) of an N64 NDC z through the standard viewport */
+static u32 depth24(float ndcZ) {
+    return efb24((ndcZ * 511.0f + 511.0f) / 1023.0f);
 }
 
 /* ============================================================================================== */
@@ -453,7 +456,7 @@ static const GXColor kLavender = { 200, 140, 255, 255 };
 /* Primitive depth is the RDP's 15-bit z: the RSP's screen z (0..G_MAXZ) shifted left by 5 */
 #define PRIM_Z_BEHIND 32439 /* window depth 0.99 */
 #define PRIM_Z_FRONT 16383  /* window depth 0.5 */
-#define PRIM_DEPTH24(z) ((u32)((z) / (32.0f * 1023.0f) * 16777215.0f + 0.5f))
+#define PRIM_DEPTH24(z) efb24((z) / (32.0f * 1023.0f))
 
 /* Step 11: eye-space triangle 7 units from the eye, closer than the near plane (10) */
 static const float kNearTri[3][3] = { { -5.0f, 2.2f, -7.0f }, { -3.0f, 2.2f, -7.0f }, { -4.0f, 3.8f, -7.0f } };
@@ -583,8 +586,8 @@ static void draw_scene(u32 fb, float cubeAngle) {
         gfx_gx_triangle(&v[0], &v[1], &v[2]);
     }
 
-    // 11. F3DZEX2 NoN draws geometry between the eye and the near plane, its screen z clamped to 0: a
-    //     triangle at w = 7 (near 10) must be drawn, at depth 0
+    // 11. F3DZEX2 NoN draws geometry between the eye and the near plane: a triangle at w = 7 (near 10) must be
+    //     drawn, in front of everything at the near plane and beyond
     gfx_gx_set_projection((const float(*)[4])sVP);
     tev(TEV_SHADE, true, true, false);
     eye_tri(kNearTri, kPink.r, kPink.g, kPink.b);
@@ -727,13 +730,15 @@ static void run_checks(void) {
     check_color("1-cycle fill rect", 280, 215, kOrange, 2);
     check_color("N64 ortho triangle", 30, 220, kOrthoColor, 2);
 
-    // NoN: closer than the near plane, still drawn with depth clamped to 0 (perspective and ortho)
+    // NoN: closer than the near plane, still drawn: perspective at its own depth (below the N64 near plane's
+    // depth 0), ortho through the CPU path with ndc clamped to -1 (depth 0)
     eye_to_screen(&sx, &sy, (kNearTri[0][0] + kNearTri[1][0] + kNearTri[2][0]) / 3.0f,
                   (kNearTri[0][1] + kNearTri[1][1] + kNearTri[2][1]) / 3.0f, kNearTri[0][2]);
+    eye_to_clip(c, kNearTri[0][0], kNearTri[0][1], kNearTri[0][2]);
     check_color("triangle closer than the near plane", sx, sy, kPink, 2);
-    check_depth("its depth (clamped to 0)", sx, sy, 0, 0);
+    check_depth("its depth (in front of the near plane)", sx, sy, depth24(c[2] / c[3]), 256);
     check_color("ortho triangle in front of near (CPU)", 80, 220, kLavender, 2);
-    check_depth("its depth (clamped to 0)", 80, 220, 0, 0);
+    check_depth("its depth (N64 depth 0)", 80, 220, efb24(0.0f), 2);
 
     // Primitive depth at 0x7FFF: triangle (clamped to the viewport's far end) and rectangle (window depth 1)
     eye_to_screen(&sx, &sy, (kZPrimTri[0][0] + kZPrimTri[1][0] + kZPrimTri[2][0]) / 3.0f,

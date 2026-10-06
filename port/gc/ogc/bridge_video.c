@@ -1,10 +1,10 @@
 /**
  * Video: one external framebuffer in the TV's preferred mode, with libogc's text console drawn into
  * it. The console is the display until the GX renderer (port/gc/gfx) shows its first frame through
- * gc_ogc_video_show_frame(); from then on the renderer's XFBs are shown and the console keeps being
- * written (gc_log also goes to the USB Gecko / SD log) but is not visible. gc_halt brings the
- * console back for good with gc_ogc_video_show_console(). The VI service thread of the libultra
- * shim paces itself with gc_video_wait_vsync().
+ * gc_ogc_video_show_frame(); from then on the renderer's XFBs are shown and gc_log stops writing to
+ * the console (it still goes to the USB Gecko / SD log). gc_halt brings the console back for good
+ * with gc_ogc_video_show_console(). The VI service thread of the libultra shim paces itself with
+ * gc_video_wait_vsync().
  */
 #include <gccore.h>
 #include <ogc/machine/processor.h>
@@ -89,6 +89,10 @@ int gc_ogc_video_show_frame(void* xfb) {
         gc_log("video: the renderer owns the display now (console output continues in the log)");
     }
     return 1;
+}
+
+int gc_ogc_video_console_visible(void) {
+    return !sRendererOwns || sConsoleForced;
 }
 
 void gc_ogc_video_show_console(void) {

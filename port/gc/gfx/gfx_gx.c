@@ -11,10 +11,11 @@
  * Depth: GX clip space keeps z in [-w, 0] (GX clips outside it) and the viewport maps z/w to window
  * depth (z/w) * (far - near) + far, so window depth grows with distance as on the N64, and the depth
  * test is LEQUAL against a buffer cleared to GX_MAX_Z24. The N64 window depth
- * (ndc * vscale[2] + vtrans[2]) / G_MAXZ is reproduced exactly by submitting
- * z_gx = GX_ZK * (ndc - 1) * w and deriving the GX viewport near/far from the N64 viewport's z scale and
- * translation (gx_viewport_n64). GX_ZK < 1/2 puts GX's near clip plane closer to the eye than the N64's
- * (see GX_NDC_NEAR); the far clip plane is the N64's, which F3DZEX2 also clips against.
+ * d = (ndc * vscale[2] + vtrans[2]) / G_MAXZ is reproduced exactly, as the EFB depth
+ * (d + GFX_DEPTH_UNDER) / (1 + GFX_DEPTH_UNDER) (gfx_internal.h), by submitting z_gx = GX_ZK * (ndc - 1) * w and
+ * deriving the GX viewport near/far from the N64 viewport's z scale and translation (gx_viewport_n64).
+ * GX_ZK < 1/2 puts GX's near clip plane closer to the eye than the N64's (see GX_NDC_NEAR), at EFB depth 0; the
+ * far clip plane is the N64's, which F3DZEX2 also clips against.
  *
  * CPU/GPU overlap: a task ends after queueing the EFB -> XFB copy and a draw sync token behind it, without waiting
  * for GX. GX finishes the frame while the game runs its next frame; gfx_gx_present shows the XFB once the token has
@@ -50,9 +51,14 @@
 #define BATCH_TRIS 128
 #define BATCH_VERTS (BATCH_TRIS * 3)
 
-/* Decal surfaces are drawn this much (window depth, 0..1) toward the viewer: GX has no polygon offset.
- * 2^-16 is 256 steps of the 24-bit depth buffer, about 1.5 units at 1000 units from a 10-unit near plane. */
-#define DECAL_BIAS (1.0f / 65536.0f)
+/* Decal surfaces are drawn this much (EFB depth, 0..1) toward the viewer: GX has no polygon offset.
+ * 2^-GFX_DECAL_BIAS_SHIFT: 2^-16 is 256 steps of the 24-bit depth buffer, about 6 units at 1000 units from a
+ * 10-unit near plane. The viewport moves its far end by it, so a decal's bias shrinks to 0 at the near clip plane
+ * (no depth goes below 0) and is 3/4 of it and more beyond the N64's near plane. */
+#ifndef GFX_DECAL_BIAS_SHIFT
+#define GFX_DECAL_BIAS_SHIFT 16
+#endif
+#define DECAL_BIAS (1.0f / (float)(1u << GFX_DECAL_BIAS_SHIFT))
 
 /* Persp vertices whose z leaves the fitted plane z = a*w + b by more than this (relative to w) cannot
  * be drawn through the GX perspective matrix; they are divided on the CPU instead. */
@@ -61,10 +67,9 @@
 /* N64 NDC z at which GX clips near. F3DZEX2 NoN does not clip at the near plane (ndc -1): it clips at
  * w = 0 and clamps the vertex screen z to 0. GX always clips at z_gx = -w, so z_gx is scaled down to put
  * that plane closer to the eye: ndc = 1 - 2n/w for a projection with near n (and a far plane far away), so
- * ndc -7 is n/4. Window depth for ndc in [-1, 1] is unchanged; between the two near planes it is below
- * 0 and ends up clamped to 0, close to the N64's clamp (Dolphin, checked by gfx_gx_test; to be checked
- * on hardware). */
-#define GX_NDC_NEAR (-7.0f)
+ * ndc -7 is n/4. Its N64 window depth through the standard viewport, -GFX_DEPTH_UNDER, is EFB depth 0: geometry
+ * between the two near planes keeps its order in depth, in front of everything beyond the N64's near plane. */
+#define GX_NDC_NEAR (-(2.0f * GFX_DEPTH_UNDER + 1.0f))
 #define GX_ZK (1.0f / (1.0f - GX_NDC_NEAR)) /* z_gx / w = GX_ZK * (ndc - 1), so ndc 1 (far) is z_gx = 0 */
 
 #define STATS_INTERVAL_MS 5000
@@ -253,6 +258,7 @@ static void gx_base_state(void) {
 
 void gfx_gx_init(void) {
     u32 xfbSize;
+    u32 scan;
     f32 yScale;
     Mtx identity;
     int i;
@@ -337,8 +343,10 @@ void gfx_gx_init(void) {
     GX_Flush();
     sReady = true;
     sStatsStart = gettime();
+    scan = sMode->viTVMode & 3;
     gc_log("gfx: GX ready, FIFO %u KB, %d XFBs of %u KB (%ux%u, %s)", GX_FIFO_SIZE / 1024, sSlotCount, xfbSize / 1024,
-           sMode->fbWidth, sMode->xfbHeight, (sMode->viTVMode & VI_NON_INTERLACE) ? "progressive" : "interlaced");
+           sMode->fbWidth, sMode->xfbHeight,
+           (scan == VI_INTERLACE) ? "interlaced" : (scan == VI_NON_INTERLACE) ? "240p" : "progressive");
 }
 
 bool gfx_gx_ready(void) {
@@ -388,9 +396,9 @@ static void gx_load_viewport(float x, float y, float w, float h, float n, float 
 }
 
 /* The N64 viewport (G_MV_VIEWPORT) scaled to the EFB. Window depth: GX gives (z_gx/w) * (f - n) + f with
- * z_gx/w = GX_ZK * (ndc - 1), the N64 gives (ndc * sz + tz) / G_MAXZ, so f = (sz + tz) / G_MAXZ and
- * f - n = sz / (GX_ZK * G_MAXZ). The standard viewport (sz = tz = G_MAXZ / 2) gives f = 1022/1023, and
- * window depth 0 at ndc -1 as on the N64. */
+ * z_gx/w = GX_ZK * (ndc - 1), the N64 gives (ndc * sz + tz) / G_MAXZ, so in N64 terms f = (sz + tz) / G_MAXZ and
+ * f - n = sz / (GX_ZK * G_MAXZ), both then taken to EFB depth. The standard viewport (sz = tz = G_MAXZ / 2) gives
+ * N64 depth 0 at ndc -1 as on the N64, and EFB depth 0 (N64 depth -GFX_DEPTH_UNDER) at GX's near plane. */
 static void gx_n64_viewport_z(float* sz, float* tz) {
     *sz = gGfxRsp.viewportScale[2];
     *tz = gGfxRsp.viewportTrans[2];
@@ -415,8 +423,9 @@ static void gx_viewport_n64(float bias) {
     gx_n64_viewport_z(&sz, &tz);
     f = (tz + sz) / (float)G_MAXZ;
     n = f - sz / (GX_ZK * (float)G_MAXZ);
-    gx_load_viewport((tx - sx) * sScale, (ty - sy) * sScale, 2.0f * sx * sScale, 2.0f * sy * sScale, n - bias,
-                     f - bias);
+    f = (f + GFX_DEPTH_UNDER) * (1.0f / (1 + GFX_DEPTH_UNDER));
+    n = (n + GFX_DEPTH_UNDER) * (1.0f / (1 + GFX_DEPTH_UNDER));
+    gx_load_viewport((tx - sx) * sScale, (ty - sy) * sScale, 2.0f * sx * sScale, 2.0f * sy * sScale, n, f - bias);
 }
 
 static void gx_set_vmode(VMode mode) {
@@ -437,9 +446,10 @@ static void gx_set_vmode(VMode mode) {
             gx_viewport_n64(bias);
             break;
         case VMODE_SCREEN:
-            // N64 screen pixels in, y down; z is the window depth 0..1
+            // N64 screen pixels in, y down; z is the N64 window depth 0..1, which the viewport takes to EFB depth
             gx_load_proj(GX_ORTHOGRAPHIC, 2.0f / GFX_N64_WIDTH, -1.0f, -2.0f / GFX_N64_HEIGHT, 1.0f, 1.0f, -1.0f);
-            gx_load_viewport(0, 0, GFX_N64_WIDTH * sScale, GFX_N64_HEIGHT * sScale, 0.0f - bias, 1.0f - bias);
+            gx_load_viewport(0, 0, GFX_N64_WIDTH * sScale, GFX_N64_HEIGHT * sScale,
+                             (float)GFX_DEPTH_UNDER / (1 + GFX_DEPTH_UNDER) - bias, 1.0f - bias);
             break;
         default:
             break;

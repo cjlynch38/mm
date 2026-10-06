@@ -69,6 +69,8 @@ static void* reset_callback_thread(void* arg) {
         LWP_SemWait(sCallbackSem);
         gc_log("Reset: button pressed (press again to restart the console)");
         sResetCallback();
+        // The log file gets the lines up to the reset (a second press restarts without writing it)
+        gc_ogc_log_flush();
     }
     return NULL;
 }

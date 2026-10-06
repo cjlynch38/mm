@@ -99,13 +99,18 @@ struct _gx_rmodeobj* gc_ogc_video_mode(void);
  *  display from the console to the renderer, which also makes osViBlack effective. Returns 0 without
  *  changing anything once gc_halt has brought the console back. */
 int gc_ogc_video_show_frame(void* xfb);
+/** Nonzero while the text console is on screen: before the renderer's first frame and after gc_halt. */
+int gc_ogc_video_console_visible(void);
 
 /* bridge_log.c */
 /** Set up logging; also detects a USB Gecko in slot B, which then gets a copy of every line. */
 void gc_ogc_log_init(void);
 int gc_ogc_log_gecko(void);
-/** Create (truncate) the log file on SD and write the lines logged so far into it. */
+/** Create (truncate) the log file on SD and start the log writer thread, which writes the lines logged so far and
+ *  then every few seconds what was logged since. */
 void gc_ogc_log_open_file(const char* path);
+/** Write every line logged so far to the log file now (waits for the SD card). */
+void gc_ogc_log_flush(void);
 /** Nonzero once gc_halt() has been called. */
 int gc_ogc_halted(void);
 

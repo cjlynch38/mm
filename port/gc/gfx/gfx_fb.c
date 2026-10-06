@@ -1228,15 +1228,16 @@ void gfx_fb_sync_ram(const void* addr, uint32_t bytes) {
 /* Depth                                                                                          */
 /* ============================================================================================== */
 
-/* GX window depth (24 bits; gfx_gx.c makes it the N64's screen z / G_MAXZ) as an N64 z-buffer value: the RDP's
- * 18-bit z (screen z << 8) compressed to a 3-bit exponent (leading ones) and an 11-bit mantissa, dz 0. Never drawn
- * pixels give the game's clear value (G_MAXFBZ), which the lens flare test looks for. */
+/* EFB depth (24 bits; gfx_internal.h: the N64's screen z / G_MAXZ, shifted and scaled) as an N64 z-buffer value:
+ * the RDP's 18-bit z (screen z << 8) compressed to a 3-bit exponent (leading ones) and an 11-bit mantissa, dz 0.
+ * Never drawn pixels give the game's clear value (G_MAXFBZ), which the lens flare test looks for. */
 static inline u16 fb_n64_depth(u32 d) {
     u32 z, e;
 
     if (d >= 0xFFFFFF) {
         return 0xFFFC;
     }
+    d = gfx_depth24_to_n64(d);
     z = ((d >> 4) * G_MAXZ) >> 12;
     e = __builtin_clz(~(z << 14));
     if (e >= 7) {

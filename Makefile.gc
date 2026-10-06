@@ -58,8 +58,11 @@ MACHDEP    := -DGEKKO -mogc -mcpu=750 -meabi -mhard-float
 OGC_CFLAGS := $(MACHDEP) -O2 -std=gnu17 -Wall -Wextra -Wno-unused-parameter -fno-strict-aliasing \
               -I$(DEVKITPRO)/libogc/include -Iport/gc/include
 
-# The renderer (port/gc/gfx): libogc headers too; gfx_gx.c also uses the ogc-internal gc_ogc.h (video mode)
-GFX_CFLAGS := $(OGC_CFLAGS) -Iport/gc/gfx -Iport/gc/ogc
+# The renderer (port/gc/gfx): libogc headers too; gfx_gx.c also uses the ogc-internal gc_ogc.h (video mode).
+# GFX_DEFS adds renderer test switches, e.g. GFX_DEFS="-DGFX_LAZY_SYNC=0 -DGFX_DECAL_BIAS_SHIFT=14" (use a separate
+# BUILD_DIR: objects are not rebuilt when it changes).
+GFX_DEFS   ?=
+GFX_CFLAGS := $(OGC_CFLAGS) -Iport/gc/gfx -Iport/gc/ogc $(GFX_DEFS)
 
 #### Object list ####
 

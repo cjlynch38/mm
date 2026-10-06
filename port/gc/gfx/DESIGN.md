@@ -91,14 +91,18 @@ As implemented (verified by port/gc/tests/gfx_gx_test, which reads the EFB back)
 - Perspective: submit `(x, y, -w)`; GX matrix p00 = p11 = 1, p22 = k (1 - a), p23 = k b, so GX's
   z_clip = k (z - w), with k = 1/8 (GX_ZK). The GX viewport's far comes from the N64 viewport z,
   far = (vtrans.z + vscale.z) / G_MAXZ (1022/1023 for the standard viewport), and
-  far - near = vscale.z / (k G_MAXZ). GX window depth then equals the N64's
-  (ndc * vscale.z + vtrans.z) / G_MAXZ exactly (the test measures 0 difference at 24 bits).
+  far - near = vscale.z / (k G_MAXZ), both taken to EFB depth as below. The EFB depth then holds the
+  N64's d = (ndc * vscale.z + vtrans.z) / G_MAXZ exactly as (d + 3) / 4 (GFX_DEPTH_UNDER = 3; the test
+  measures at most 1 step of difference at 24 bits); gfx_fb.c turns it back into d for the z-buffer in RAM.
 - Near plane: F3DZEX2 "NoN" does not clip at the near plane; it clips at w = 0 and clamps each vertex's
   screen z to 0. GX always clips at z_clip = -w, which with k = 1/8 is N64 ndc -7 (a quarter of the
-  near distance) instead of -1, so geometry between n/4 and n is drawn; its window depth is below 0 and
-  is clamped to 0 (Dolphin; to be checked on hardware: without that clamp those pixels would get a
-  wrong depth). Geometry closer than n/4 still disappears. Both clip at the far plane (F3DZEX2 clips
-  against it too).
+  near distance) instead of -1, so geometry between n/4 and n is drawn, in front of everything at or
+  beyond n. Geometry closer than n/4 still disappears. Both clip at the far plane (F3DZEX2 clips
+  against it too). GX's near plane, N64 depth -3, is EFB depth 0, so every vertex depth GX computes
+  (also where it clips a triangle at its near plane) is within 0..1. The first version kept EFB depth
+  = N64 depth, down to -3 at GX's near plane: Dolphin clamps that per pixel and draws it right, but on
+  the console decals flickered on floors passing under the camera and actors were cut by scenery
+  (that this remap fixes it is still to be confirmed on the console).
 - A triangle whose vertices leave the fitted plane z = a*w + b (non-affine modelview, forced matrix)
   is divided on the CPU (counted as "via CPU" in the stats), as are G_ZS_PRIM triangles (z = the
   primitive depth, clamped to the viewport's depth range) and orthographic projections. The CPU path
@@ -107,7 +111,8 @@ As implemented (verified by port/gc/tests/gfx_gx_test, which reads the EFB back)
   window depth = z / (32 G_MAXZ), clamped to 1 (0x7FFF is just past G_MAXZ).
 - Rectangles are drawn in N64 screen pixels through an orthographic matrix and the full EFB
   viewport; their window depth is the primitive depth with G_ZS_PRIM, else 0.
-- Decal bias: GX viewport near/far moved by 2^-16 (256 steps of the 24-bit buffer).
+- Decal bias: the GX viewport's far end moved by 2^-16 (256 steps of the 24-bit buffer); the near end
+  stays, so no depth goes below 0.
 
 ## Combiner and blender (gfx_tev.c)
 

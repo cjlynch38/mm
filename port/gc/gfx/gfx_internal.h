@@ -38,6 +38,21 @@
 #define GFX_EFB_WIDTH (GFX_N64_WIDTH * GFX_SCALE)
 #define GFX_EFB_HEIGHT (GFX_N64_HEIGHT * GFX_SCALE)
 
+/* Depth: the EFB holds the N64 window depth d (screen z / G_MAXZ, 0 at the near plane, 1 at the far plane) as
+ * (d + GFX_DEPTH_UNDER) / (1 + GFX_DEPTH_UNDER). GX draws geometry closer than the N64's near plane, as F3DZEX2 NoN
+ * does, down to the d of GX's own near plane, -GFX_DEPTH_UNDER (gfx_gx.c); this keeps every vertex depth GX
+ * computes in 0..1. Dolphin clamps an out of range depth per pixel and draws such triangles right; on the console,
+ * depth went wrong across triangles that reached below the near plane while their depth was d itself (decals
+ * flickering on floors that pass under the camera, actors cut by the scenery behind them). */
+#define GFX_DEPTH_UNDER 3
+/* N64 window depth of a 24-bit EFB depth, as 24 bits (below the N64 near plane: 0) */
+static inline uint32_t gfx_depth24_to_n64(uint32_t z24) {
+    uint32_t under = GFX_DEPTH_UNDER * 0xFFFFFFu;
+    uint32_t d = z24 * (1 + GFX_DEPTH_UNDER);
+
+    return (d > under) ? d - under : 0;
+}
+
 /* ================================================================================================ */
 /* Addresses (gfx_rsp.c)                                                                            */
 /* ================================================================================================ */

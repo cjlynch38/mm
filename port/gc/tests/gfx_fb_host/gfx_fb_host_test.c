@@ -919,14 +919,18 @@ static void test_served_until_drawn(void) {
     CHECK(sRamBinds == binds, "done: nothing bound from RAM (%d binds)", sRamBinds - binds);
 }
 
-/* N64 depth value of a 24-bit window depth: the 18-bit z (screen z << 8, screen z = depth * G_MAXZ) with a 3-bit
- * exponent counting its leading ones (at most 7) and the 11 bits after them */
+/* N64 depth value of a 24-bit EFB depth, which holds the N64 window depth d as (d + GFX_DEPTH_UNDER) /
+ * (1 + GFX_DEPTH_UNDER): d (0 in front of the near plane) as the 18-bit z (screen z << 8, screen z = d * G_MAXZ)
+ * with a 3-bit exponent counting its leading ones (at most 7) and the 11 bits after them */
 static uint16_t ref_n64_depth(uint32_t d) {
+    uint64_t n64;
     uint32_t z, e = 0;
 
     if (d >= 0xFFFFFF) {
         return 0xFFFC;
     }
+    n64 = (uint64_t)d * (1 + GFX_DEPTH_UNDER);
+    d = (n64 > (uint64_t)GFX_DEPTH_UNDER * 0xFFFFFF) ? (uint32_t)(n64 - (uint64_t)GFX_DEPTH_UNDER * 0xFFFFFF) : 0;
     z = ((d >> 4) * G_MAXZ) >> 12;
     while (e < 7 && (z & (0x20000u >> e))) {
         e++;
