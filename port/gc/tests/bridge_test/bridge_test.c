@@ -672,6 +672,7 @@ static void test_saves(void) {
     remove(sPath);
     remove(GC_SD_DIR "/bridge_test.fla.bak");
     remove(GC_SD_DIR "/bridge_test.fla.tmp");
+    remove(GC_SD_DIR "/bridge_test.fla.spare");
 
     r = gc_save_load(buf, SAVE_SIZE);
     check(r == 1, "load without a file returns 1 (%d)", r);
@@ -684,15 +685,49 @@ static void test_saves(void) {
     fill(expect, 2);
     check(gc_save_store(expect, SAVE_SIZE) == 0, "store B");
     check(size_of(GC_SD_DIR "/bridge_test.fla.bak") == SAVE_SIZE, "A kept as .bak");
-    check(size_of(GC_SD_DIR "/bridge_test.fla.tmp") < 0, "no .tmp left behind");
     memset(buf, 0, SAVE_SIZE);
     check(gc_save_load(buf, SAVE_SIZE) == 0 && memcmp(buf, expect, SAVE_SIZE) == 0, "load returns B");
 
+    // The third store completes the set; from the fourth on the files keep their clusters (st_ino is the first
+    // cluster on libfat): a store allocates nothing
+    fill(expect, 3);
+    check(gc_save_store(expect, SAVE_SIZE) == 0, "store C");
+    check(size_of(GC_SD_DIR "/bridge_test.fla.tmp") == SAVE_SIZE && size_of(GC_SD_DIR "/bridge_test.fla.spare") < 0,
+          "after 3 stores: .tmp kept for the next store, no .spare");
+    {
+        unsigned long before[3];
+        unsigned long after[3];
+        static const char* const names[3] = { GC_SD_DIR "/bridge_test.fla", GC_SD_DIR "/bridge_test.fla.bak",
+                                               GC_SD_DIR "/bridge_test.fla.tmp" };
+        struct stat st;
+        unsigned long sumBefore = 0;
+        unsigned long sumAfter = 0;
+
+        for (i = 0; i < 3; i++) {
+            before[i] = (stat(names[i], &st) == 0) ? (unsigned long)st.st_ino : 0;
+            sumBefore += before[i];
+        }
+        fill(expect, 4);
+        check(gc_save_store(expect, SAVE_SIZE) == 0, "store D");
+        for (i = 0; i < 3; i++) {
+            after[i] = (stat(names[i], &st) == 0) ? (unsigned long)st.st_ino : 0;
+            sumAfter += after[i];
+        }
+        check(after[0] == before[2] && after[1] == before[0] && after[2] == before[1] && sumAfter == sumBefore &&
+                  before[0] != 0,
+              "store D wrote .tmp in place and rotated the names (first clusters %lu %lu %lu -> %lu %lu %lu)",
+              before[0], before[1], before[2], after[0], after[1], after[2]);
+    }
+    memset(buf, 0, SAVE_SIZE);
+    check(gc_save_load(buf, SAVE_SIZE) == 0 && memcmp(buf, expect, SAVE_SIZE) == 0, "load returns D");
+
     remove(sPath);
-    fill(expect, 1);
+    fill(expect, 3);
     memset(buf, 0, SAVE_SIZE);
     check(gc_save_load(buf, SAVE_SIZE) == 0 && memcmp(buf, expect, SAVE_SIZE) == 0,
-          "with the save gone, load recovers A from .bak");
+          "with the save gone, load recovers C from .bak");
+    remove(GC_SD_DIR "/bridge_test.fla.bak");
+    remove(GC_SD_DIR "/bridge_test.fla.tmp");
 
     f = fopen(sPath, "wb");
     if (f != NULL) {

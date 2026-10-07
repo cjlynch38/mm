@@ -7,6 +7,7 @@
 #ifndef GC_OGC_H
 #define GC_OGC_H
 
+#include <stdio.h>
 #include "gc_bridge.h"
 
 /* Files. The ROM is <root>/mmgcport/baserom.z64 on the SD card (sd:), on the disc in the drive
@@ -64,6 +65,13 @@ void gc_ogc_print_memory_map(void);
 const char* gc_ogc_sd_mount(void);
 /** Nonzero once an SD card is mounted as sd: (the log file and saves need it). */
 int gc_ogc_sd_mounted(void);
+/** Mount another DISC_INTERFACE as sd:, through the same lock as an SD adapter (the sd_ramdisk test runs libfat on
+ *  a RAM disk this way in Dolphin, which has no GameCube SD card). 0 on success. */
+struct DISC_INTERFACE_STRUCT;
+int gc_ogc_sd_mount_iface(const struct DISC_INTERFACE_STRUCT* iface);
+/** Tests: unmount sd: (the next mount reads the volume afresh, as a reboot does). Close every file on sd: and drop
+ *  every GcSdRaw first; refused while img: is mounted. 0 on success. */
+int gc_ogc_sd_unmount(void);
 /** argv[0] as the loader passed it ("dvd:/" from the port's apploader; Swiss passes the path of
  *  the DOL or disc image it started), or NULL. */
 const char* gc_ogc_boot_path(void);
@@ -86,6 +94,17 @@ int gc_ogc_card_mounted(void);
 /** gc_save_load/gc_save_store on the memory card (same return values). */
 int gc_ogc_card_save_load(void* dst, unsigned int size);
 int gc_ogc_card_save_store(const void* src, unsigned int size);
+/** A file on the SD card read with raw sector reads, which never wait for libfat */
+typedef struct GcSdRaw GcSdRaw;
+/** Map the SD card file `path` ("sd:/...", open as `file` through libfat) to its sectors, and check raw reads
+ *  against libfat's. Logs which way the file will be read; NULL if through libfat. */
+GcSdRaw* gc_ogc_sd_raw_open(const char* path, FILE* file);
+/** Read [offset, offset + size) of a raw file (any alignment). 0 on success. */
+int gc_ogc_sd_raw_read(GcSdRaw* raw, unsigned int offset, void* dst, unsigned int size);
+unsigned int gc_ogc_sd_raw_size(const GcSdRaw* raw);
+/** Raw reads of the disc image file mounted as img: (set up at the first call, which then also serves libiso9660's
+ *  reads of the image), or NULL if the image is read through libfat. */
+GcSdRaw* gc_ogc_image_raw(void);
 
 /* bridge_video.c */
 void gc_ogc_video_init(void);

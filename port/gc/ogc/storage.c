@@ -26,7 +26,9 @@
  * sd:/mmgcport/mm-gc.iso (for loaders that do not pass the image's path, e.g. Swiss's BS2 boot).
  *
  * Reads from dvd: go through bridge_rom.c's direct DVD path (DVD_ReadPrio at the file's sector, which
- * libiso9660 reports as st_ino); everything else is plain stdio.
+ * libiso9660 reports as st_ino). A ROM on the SD card (baserom.z64, or the disc image file) is read with raw sector
+ * reads (gc_ogc_sd_raw_*, below), never through libfat, so that the game never waits for a libfat operation (the log
+ * writer's or a save's). Everything else is plain stdio.
  * (The dev-disc reader follows port/gc/tests/sd_probe, written with the harness.)
  */
 #include <gccore.h>
@@ -40,10 +42,12 @@
 #include <sdcard/gcsd.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "fat_map.h"
 #include "gc_ogc.h"
 
 /* DVD_Mount never returns on a console without a drive, hence the async mount with a timeout */
@@ -112,6 +116,109 @@ static const struct {
 static int sSdMounted;
 static int sSdDevice = -1;
 
+/*
+ * Every SD card command, libfat's and the raw reads' (below), goes through sSdLocked: it forwards to the adapter's
+ * DISC_INTERFACE under sSdMutex, at most SD_LOCK_SECTORS sectors per hold. libogc's SD driver keeps its per-slot
+ * state in globals and is not reentrant, so this lock is what lets raw reads run beside libfat. libfat itself holds
+ * its volume lock for whole file operations, and finding a free cluster (for a new file, or a file that grows) can
+ * keep one going for tens of seconds on a large, full card (FatFs reads the FAT from where it last allocated, or
+ * from a truncated file's old first cluster); the raw reads never take that lock, only this one, which libfat
+ * releases after each command. libogc 3's mutexes pass on priority: the log writer, at idle priority, runs at a
+ * waiting reader's priority while it holds sSdMutex.
+ */
+#define SD_LOCK_SECTORS 64
+
+static mutex_t sSdMutex = LWP_MUTEX_NULL;
+static const DISC_INTERFACE* sSdIface; /* the adapter's interface */
+
+static bool sd_locked_startup(void) {
+    bool ok;
+
+    LWP_MutexLock(sSdMutex);
+    ok = sSdIface->startup();
+    LWP_MutexUnlock(sSdMutex);
+    return ok;
+}
+
+static bool sd_locked_is_inserted(void) {
+    bool ok;
+
+    LWP_MutexLock(sSdMutex);
+    ok = sSdIface->isInserted();
+    LWP_MutexUnlock(sSdMutex);
+    return ok;
+}
+
+static bool sd_locked_read(sec_t sector, sec_t count, void* buffer) {
+    unsigned char* dst = buffer;
+
+    while (count != 0) {
+        sec_t n = (count < SD_LOCK_SECTORS) ? count : SD_LOCK_SECTORS;
+        bool ok;
+
+        LWP_MutexLock(sSdMutex);
+        ok = sSdIface->readSectors(sector, n, dst);
+        LWP_MutexUnlock(sSdMutex);
+        if (!ok) {
+            return false;
+        }
+        sector += n;
+        count -= n;
+        dst += n * FAT_MAP_SECTOR_SIZE;
+    }
+    return true;
+}
+
+static bool sd_locked_write(sec_t sector, sec_t count, const void* buffer) {
+    const unsigned char* src = buffer;
+
+    while (count != 0) {
+        sec_t n = (count < SD_LOCK_SECTORS) ? count : SD_LOCK_SECTORS;
+        bool ok;
+
+        LWP_MutexLock(sSdMutex);
+        ok = sSdIface->writeSectors(sector, n, src);
+        LWP_MutexUnlock(sSdMutex);
+        if (!ok) {
+            return false;
+        }
+        sector += n;
+        count -= n;
+        src += n * FAT_MAP_SECTOR_SIZE;
+    }
+    return true;
+}
+
+static bool sd_locked_clear_status(void) {
+    bool ok;
+
+    LWP_MutexLock(sSdMutex);
+    ok = sSdIface->clearStatus();
+    LWP_MutexUnlock(sSdMutex);
+    return ok;
+}
+
+static bool sd_locked_shutdown(void) {
+    bool ok;
+
+    LWP_MutexLock(sSdMutex);
+    ok = sSdIface->shutdown();
+    LWP_MutexUnlock(sSdMutex);
+    return ok;
+}
+
+/* ioType and features are the adapter's, filled in by gc_ogc_sd_mount */
+static DISC_INTERFACE sSdLocked = {
+    0,
+    0,
+    sd_locked_startup,
+    sd_locked_is_inserted,
+    sd_locked_read,
+    sd_locked_write,
+    sd_locked_clear_status,
+    sd_locked_shutdown,
+};
+
 /* The SD device the boot path names, so a program started from an SD Gecko finds its card first */
 static int sd_preferred_device(void) {
     const char* path = gc_ogc_boot_path();
@@ -127,12 +234,32 @@ static int sd_preferred_device(void) {
     return 0;
 }
 
+static int sd_lock_init(void) {
+    if (sSdMutex == LWP_MUTEX_NULL && LWP_MutexInit(&sSdMutex, false) != 0) {
+        sSdMutex = LWP_MUTEX_NULL;
+        gc_log("SD: cannot create the SD card lock");
+        return -1;
+    }
+    return 0;
+}
+
+/* Mount `iface` as sd: behind sSdLocked. 1 on success. */
+static int sd_mount_locked(const DISC_INTERFACE* iface) {
+    sSdIface = iface;
+    sSdLocked.ioType = iface->ioType;
+    sSdLocked.features = iface->features;
+    return fatMountSimple("sd", &sSdLocked);
+}
+
 const char* gc_ogc_sd_mount(void) {
     int first = sd_preferred_device();
     int k;
 
     if (sSdMounted) {
-        return sSdDevices[sSdDevice].name;
+        return (sSdDevice >= 0) ? sSdDevices[sSdDevice].name : "SD card";
+    }
+    if (sd_lock_init() != 0) {
+        return NULL;
     }
     for (k = 0; k < SD_DEVICES; k++) {
         int i = (k == 0) ? first : (k <= first ? k - 1 : k);
@@ -142,7 +269,7 @@ const char* gc_ogc_sd_mount(void) {
             gc_log("SD: slot B skipped (USB Gecko)");
             continue;
         }
-        if (fatMountSimple("sd", sSdDevices[i].iface)) {
+        if (sd_mount_locked(sSdDevices[i].iface)) {
             sSdMounted = 1;
             sSdDevice = i;
             gc_log("SD: mounted the card in the %s as sd:", sSdDevices[i].name);
@@ -153,8 +280,206 @@ const char* gc_ogc_sd_mount(void) {
     return NULL;
 }
 
+int gc_ogc_sd_mount_iface(const struct DISC_INTERFACE_STRUCT* iface) {
+    if (sSdMounted || sd_lock_init() != 0 || !sd_mount_locked(iface)) {
+        return -1;
+    }
+    sSdMounted = 1;
+    gc_log("SD: mounted a test volume as sd:");
+    return 0;
+}
+
 int gc_ogc_sd_mounted(void) {
     return sSdMounted;
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Raw reads of a file on the SD card                                                             */
+/* ---------------------------------------------------------------------------------------------- */
+
+/*
+ * A file that never changes while the game runs (the ROM, or the disc image holding it) is mapped once to the runs
+ * of sectors it occupies (fat_map.c: the volume's boot sector, the directories, the file's cluster chain), and then
+ * read with sSdLocked's sector reads. Before the map is used, reads through it are compared with libfat's reads of
+ * the same file: its start and end, ranges spread over it at odd offsets and sizes, and ranges across the first
+ * runs' boundaries. On any difference, error or unsupported layout the file is read through libfat as before. The
+ * boot log has one line per file saying which way it is read.
+ */
+#define SD_RAW_FILES 8
+#define SD_RAW_MAX_EXTENTS 4096
+#define SD_RAW_MAP_SECTORS 8
+#define SD_RAW_CHECK_SIZE 0x1000
+#define SD_RAW_CHECK_RANGES 24
+
+struct GcSdRaw {
+    char path[256];
+    FatExtent* ext;
+    unsigned int count;
+    unsigned int size;
+};
+
+static GcSdRaw sRaw[SD_RAW_FILES];
+static int sRawCount;
+static mutex_t sRawMutex = LWP_MUTEX_NULL; /* sRawBounce */
+static unsigned char sRawBounce[FAT_MAP_SECTOR_SIZE] __attribute__((aligned(32)));
+
+static int raw_read_sectors(void* ctx, uint32_t sector, uint32_t count, void* dst) {
+    return sd_locked_read(sector, count, dst) ? 0 : -1;
+}
+
+int gc_ogc_sd_raw_read(GcSdRaw* raw, unsigned int offset, void* dst, unsigned int size) {
+    int ret;
+
+    if (offset > raw->size || size > raw->size - offset) {
+        return -1;
+    }
+    LWP_MutexLock(sRawMutex);
+    ret = fat_map_read(raw->ext, raw->count, raw_read_sectors, NULL, offset, dst, size, sRawBounce);
+    LWP_MutexUnlock(sRawMutex);
+    return ret;
+}
+
+unsigned int gc_ogc_sd_raw_size(const GcSdRaw* raw) {
+    return raw->size;
+}
+
+static unsigned int min_uint(unsigned int a, unsigned int b) {
+    return (a < b) ? a : b;
+}
+
+/* Compare raw reads with libfat's reads of `file`. The number of ranges compared, or -1 with *why. */
+static int raw_check(GcSdRaw* raw, FILE* file, const char** why) {
+    unsigned int offsets[SD_RAW_CHECK_RANGES];
+    unsigned int sizes[SD_RAW_CHECK_RANGES];
+    unsigned char* mine = malloc(SD_RAW_CHECK_SIZE);
+    unsigned char* theirs = malloc(SD_RAW_CHECK_SIZE);
+    unsigned int size = raw->size;
+    int count = 0;
+    int i;
+
+    if (mine == NULL || theirs == NULL) {
+        free(mine);
+        free(theirs);
+        *why = "no memory for the check";
+        return -1;
+    }
+    // Start and end
+    offsets[count] = 0;
+    sizes[count++] = min_uint(size, SD_RAW_CHECK_SIZE);
+    offsets[count] = size - min_uint(size, SD_RAW_CHECK_SIZE);
+    sizes[count++] = min_uint(size, SD_RAW_CHECK_SIZE);
+    // Spread over the file, at odd offsets and sizes (partial first and last sectors)
+    for (i = 1; i < 8; i++) {
+        unsigned int at = (unsigned int)((u64)size * i / 8) + 37 * i;
+
+        if (at < size) {
+            offsets[count] = at;
+            sizes[count++] = min_uint(size - at, 3000 + 111 * i);
+        }
+    }
+    // Across run boundaries
+    for (i = 1; i < (int)raw->count && count < SD_RAW_CHECK_RANGES; i++) {
+        unsigned int at = raw->ext[i].offset - min_uint(raw->ext[i].offset, 700);
+
+        offsets[count] = at;
+        sizes[count++] = min_uint(size - at, 1400);
+    }
+
+    *why = NULL;
+    for (i = 0; i < count && *why == NULL; i++) {
+        if (sizes[i] == 0) {
+            continue;
+        }
+        if (gc_ogc_sd_raw_read(raw, offsets[i], mine, sizes[i]) != 0) {
+            *why = "a raw read failed";
+        } else if (fseek(file, (long)offsets[i], SEEK_SET) != 0 || fread(theirs, 1, sizes[i], file) != sizes[i]) {
+            clearerr(file);
+            *why = "libfat cannot read the file";
+        } else if (memcmp(mine, theirs, sizes[i]) != 0) {
+            *why = "raw reads differ from libfat's";
+        }
+    }
+    free(mine);
+    free(theirs);
+    return (*why == NULL) ? count : -1;
+}
+
+GcSdRaw* gc_ogc_sd_raw_open(const char* path, FILE* file) {
+    u64 t0 = gettime();
+    GcSdRaw* raw = &sRaw[sRawCount];
+    unsigned char* scratch = NULL;
+    const char* why = NULL;
+    uint32_t cluster = 0;
+    uint32_t size = 0;
+    uint32_t count = 0;
+    struct stat st;
+    FatMap map;
+    int checked = 0;
+    int i;
+
+    for (i = 0; i < sRawCount; i++) {
+        if (strcmp(sRaw[i].path, path) == 0) {
+            return &sRaw[i];
+        }
+    }
+    memset(&map, 0, sizeof(map));
+    if (!sSdMounted || strncmp(path, "sd:/", 4) != 0) {
+        why = "not a file on the SD card";
+    } else if (sRawCount == SD_RAW_FILES) {
+        why = "too many raw files";
+    } else if (sRawMutex == LWP_MUTEX_NULL && LWP_MutexInit(&sRawMutex, false) != 0) {
+        sRawMutex = LWP_MUTEX_NULL;
+        why = "cannot create the raw read lock";
+    } else if ((scratch = malloc(SD_RAW_MAP_SECTORS * FAT_MAP_SECTOR_SIZE)) == NULL) {
+        why = "no memory";
+    } else if (fstat(fileno(file), &st) != 0) {
+        why = "libfat cannot stat the file";
+    }
+    if (why == NULL) {
+        why = fat_map_mount(&map, raw_read_sectors, NULL, scratch, SD_RAW_MAP_SECTORS);
+    }
+    if (why == NULL) {
+        why = fat_map_find(&map, path + 3, &cluster, &size);
+    }
+    // libfat reports the first cluster as st_ino: the same file on the same volume
+    if (why == NULL && (off_t)size != st.st_size) {
+        why = "its size differs from libfat's";
+    }
+    if (why == NULL && st.st_ino != 0 && st.st_ino != cluster) {
+        why = "its first cluster differs from libfat's";
+    }
+    if (why == NULL) {
+        why = fat_map_extents(&map, cluster, size, NULL, 0, &count);
+    }
+    if (why == NULL && count > SD_RAW_MAX_EXTENTS) {
+        why = "the file has too many fragments";
+    }
+    if (why == NULL && size == 0) {
+        why = "the file is empty";
+    }
+    if (why == NULL && (raw->ext = gc_mem_alloc(count * sizeof(FatExtent), 32)) == NULL) {
+        why = "no memory for the map";
+    }
+    if (why == NULL) {
+        why = fat_map_extents(&map, cluster, size, raw->ext, count, &count);
+    }
+    if (why == NULL) {
+        snprintf(raw->path, sizeof(raw->path), "%s", path);
+        raw->count = count;
+        raw->size = size;
+        checked = raw_check(raw, file, &why);
+    }
+    free(scratch);
+    if (why != NULL) {
+        gc_log("SD: %s: read through libfat (no raw reads: %s)", path, why);
+        return NULL;
+    }
+    sRawCount++;
+    gc_log("SD: %s: raw sector reads, %u extent%s (FAT%d, %u-byte clusters, volume at sector %u); %d ranges match "
+           "libfat (%u ms)",
+           path, count, (count == 1) ? "" : "s", map.type, fat_map_cluster_size(&map), map.volume, checked,
+           (unsigned int)ticks_to_millisecs(gettime() - t0));
+    return raw;
 }
 
 /* ---------------------------------------------------------------------------------------------- */
@@ -291,7 +616,10 @@ int gc_ogc_disc_mount(void) {
 /* ---------------------------------------------------------------------------------------------- */
 
 static FILE* sImageFile;
+static char sImagePath[256];
 static int sImageMounted;
+static int sImageRawTried;
+static GcSdRaw* sImageRaw; /* raw reads of the image file, once gc_ogc_image_raw has set them up */
 
 static bool image_startup(void) {
     return sImageFile != NULL;
@@ -306,6 +634,17 @@ static bool image_read_sectors(sec_t sector, sec_t numSectors, void* buffer) {
     size_t size = (size_t)numSectors * DISC_SECTOR_SIZE;
     size_t got;
 
+    if (sImageRaw != NULL) {
+        u64 offset = (u64)sector * DISC_SECTOR_SIZE;
+        unsigned int imageSize = gc_ogc_sd_raw_size(sImageRaw);
+        unsigned int n = (offset < imageSize) ? min_uint(imageSize - (unsigned int)offset, size) : 0;
+
+        if (n == 0 || gc_ogc_sd_raw_read(sImageRaw, (unsigned int)offset, buffer, n) == 0) {
+            memset((unsigned char*)buffer + n, 0, size - n);
+            return true;
+        }
+        gc_log("Image: raw read of sector %u failed; trying libfat", (unsigned int)sector);
+    }
     if (sImageFile == NULL || fseek(sImageFile, (long)sector * DISC_SECTOR_SIZE, SEEK_SET) != 0) {
         return false;
     }
@@ -363,8 +702,31 @@ int gc_ogc_image_mount(const char* path) {
         return -1;
     }
     sImageMounted = 1;
+    snprintf(sImagePath, sizeof(sImagePath), "%s", path);
     gc_log("Image: %s (%.6s, '%s') mounted read-only as img:", path, (const char*)header,
            ISO9660_GetVolumeLabel("img"));
+    return 0;
+}
+
+GcSdRaw* gc_ogc_image_raw(void) {
+    if (sImageMounted && !sImageRawTried) {
+        sImageRawTried = 1;
+        sImageRaw = gc_ogc_sd_raw_open(sImagePath, sImageFile);
+    }
+    return sImageRaw;
+}
+
+/* Tests only: unmount sd: (not while img: is mounted on it) */
+int gc_ogc_sd_unmount(void) {
+    if (!sSdMounted || sImageMounted) {
+        return -1;
+    }
+    fatUnmount("sd");
+    sSdMounted = 0;
+    sSdDevice = -1;
+    // The raw maps were of that volume (their extent arrays are not returned)
+    sRawCount = 0;
+    gc_log("SD: unmounted sd:");
     return 0;
 }
 

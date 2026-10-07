@@ -1270,6 +1270,42 @@ static void test_tmem(void) {
     compare_tile(1, GX_TEXMAP1, GX_TF_I8, NULL);
     test_end();
 
+    /* gameplay_keep's gSunDL: two 64x64 I4 images (day, then evening right after it) drawn in three pieces, each
+     * a 64x32 or 64x17 I8 LOADBLOCK at 32-byte-row offsets 0, 31 and 47 (byte offsets 992 and 1504, half of an I8
+     * row), day at TMEM 0 and evening at 0x100 for TEXEL1. The RDP samples the I4 bytes as I8, so the sun comes
+     * out in bands on the N64 too; the textures must be those I8 views, the last piece reading into the evening
+     * image. */
+    test_begin("sun DL: I4 images loaded as I8 pieces");
+    a = ram_random(2 * 2048 + 1024); /* the evening's last piece reads 544 bytes past it (the sun's display lists) */
+    for (i = 0; i < 3; i++) {
+        static const int kOffset[3] = { 0, 992, 1504 };
+        int h = (i == 0) ? 32 : 17;
+
+        task_begin();
+        dp_set_cycle(G_CYC_2CYCLE);
+        load_texture_block(K0(a) + kOffset[i], G_IM_FMT_I, G_IM_SIZ_8b, 64, h, 0, G_TX_CLAMP, G_TX_CLAMP, 6, 5, 0, 0);
+        load_multi_block(K0(a) + 2048 + kOffset[i], 0x100, 1, G_IM_FMT_I, G_IM_SIZ_8b, 64, h, 0, G_TX_CLAMP,
+                         G_TX_CLAMP, 6, 5, 0, 0, false);
+        slow0 = slow_binds();
+        compare_tile(0, GX_TEXMAP0, GX_TF_I8, NULL);
+        compare_tile(1, GX_TEXMAP1, GX_TF_I8, NULL);
+        CHECK(slow_binds() == slow0, "sun piece %d took the slow path", i);
+        CHECK(gLoaded[0].w == 64 && gLoaded[0].h == h && gLoaded[1].w == 64 && gLoaded[1].h == h,
+              "sun piece %d: %dx%d and %dx%d", i, gLoaded[0].w, gLoaded[0].h, gLoaded[1].w, gLoaded[1].h);
+        /* I8 texel (x, y) is byte x of the 64-byte row y: I4 texels 2x % 64 and the next of I4 row 2y + (x >= 32) */
+        for (y = 0; y < h; y++) {
+            for (x = 0; x < 64; x += 9) {
+                uint8_t got[4];
+
+                gx_texel(&gLoaded[0], x, y, got);
+                CHECK(got[0] == gRam[a + kOffset[i] + y * 64 + x], "sun piece %d texel (%d,%d)", i, x, y);
+                gx_texel(&gLoaded[1], x, y, got);
+                CHECK(got[0] == gRam[a + 2048 + kOffset[i] + y * 64 + x], "evening piece %d texel (%d,%d)", i, x, y);
+            }
+        }
+    }
+    test_end();
+
     test_begin("loadtile read from an odd row");
     task_begin();
     a = ram_random(32 * 16 * 2);

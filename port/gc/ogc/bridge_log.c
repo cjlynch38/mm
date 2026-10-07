@@ -259,6 +259,10 @@ void gc_ogc_log_open_file(const char* path) {
     FILE* file;
 
     mkdir(GC_SD_DIR, 0777); // usually exists already; the error is not interesting
+    // Remove rather than truncate: FatFs looks for the clusters of a truncated file from its old first cluster on,
+    // which on a full card meant searching the FAT for ~37 s, holding libfat (saves waited). A new file starts at
+    // the volume's next-free hint instead.
+    remove(path);
     file = fopen(path, "w");
     if (file == NULL) {
         gc_log("log: cannot create %s; logging to the screen only", path);

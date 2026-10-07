@@ -1783,6 +1783,36 @@ void Environment_Update(PlayState* play, EnvironmentContext* envCtx, LightContex
     }
 }
 
+#ifdef TARGET_GC
+/**
+ * gSunDL as it was meant to be. gSun1-3Tex and gSunEvening1-3Tex are pieces of two 64x64 I4 images (rows 0-31, 31-47
+ * and 47-63), but gSunDL loads them as I8, so the N64 draws each piece as two squashed half-suns, cut into bands, and
+ * the last evening piece reads display list bytes past its image. Loaded as I4, the three pieces join into the round
+ * sun of the art. The vertices and everything else are gSunDL's.
+ */
+static Gfx sSunDL[] = {
+    gsSPMatrix(0x01000000, G_MTX_NOPUSH | G_MTX_MUL | G_MTX_MODELVIEW),
+    gsDPPipeSync(),
+    gsDPLoadTextureBlock_4b(gSun1Tex, G_IM_FMT_I, 64, 32, 0, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 6,
+                            5, G_TX_NOLOD, G_TX_NOLOD),
+    gsDPLoadMultiBlock_4b(gSunEvening1Tex, 0x0100, 1, G_IM_FMT_I, 64, 32, 0, G_TX_NOMIRROR | G_TX_CLAMP,
+                          G_TX_NOMIRROR | G_TX_CLAMP, 6, 5, G_TX_NOLOD, G_TX_NOLOD),
+    gsSPVertex(gameplay_keepVtx_07ACF8, 12, 0),
+    gsSP2Triangles(0, 1, 2, 0, 2, 1, 3, 0),
+    gsDPLoadTextureBlock_4b(gSun2Tex, G_IM_FMT_I, 64, 17, 0, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 6,
+                            5, G_TX_NOLOD, G_TX_NOLOD),
+    gsDPLoadMultiBlock_4b(gSunEvening2Tex, 0x0100, 1, G_IM_FMT_I, 64, 17, 0, G_TX_NOMIRROR | G_TX_CLAMP,
+                          G_TX_NOMIRROR | G_TX_CLAMP, 6, 5, G_TX_NOLOD, G_TX_NOLOD),
+    gsSP2Triangles(4, 5, 6, 0, 6, 5, 7, 0),
+    gsDPLoadTextureBlock_4b(gSun3Tex, G_IM_FMT_I, 64, 17, 0, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 6,
+                            5, G_TX_NOLOD, G_TX_NOLOD),
+    gsDPLoadMultiBlock_4b(gSunEvening3Tex, 0x0100, 1, G_IM_FMT_I, 64, 17, 0, G_TX_NOMIRROR | G_TX_CLAMP,
+                          G_TX_NOMIRROR | G_TX_CLAMP, 6, 5, G_TX_NOLOD, G_TX_NOLOD),
+    gsSP2Triangles(8, 9, 10, 0, 10, 9, 11, 0),
+    gsSPEndDisplayList(),
+};
+#endif
+
 void Environment_DrawSun(PlayState* play) {
     if (!play->envCtx.sunDisabled) {
         OPEN_DISPS(play->state.gfxCtx);
@@ -1804,7 +1834,11 @@ void Environment_DrawSun(PlayState* play) {
             Matrix_Scale(sSunScale, sSunScale, sSunScale, MTXMODE_APPLY);
             MATRIX_FINALIZE_AND_LOAD(POLY_OPA_DISP++, play->state.gfxCtx);
             Gfx_SetupDL54_Opa(play->state.gfxCtx);
+#ifdef TARGET_GC
+            gSPDisplayList(POLY_OPA_DISP++, sSunDL);
+#else
             gSPDisplayList(POLY_OPA_DISP++, gSunDL);
+#endif
         }
 
         CLOSE_DISPS(play->state.gfxCtx);

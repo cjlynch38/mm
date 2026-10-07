@@ -179,6 +179,12 @@ Use the obvious shortcuts to save stages: B = 0, C = 0, C = 1, A = B, and so on.
   source, with LRU eviction inside a fixed budget (GFX_TEX_CACHE_SIZE, about 2 MiB, from
   gc_mem_alloc). Textures must be 32-byte aligned; flush the CPU data cache after conversion
   (DCFlushRange) and invalidate the GX texture cache (GX_InvalidateTexAll) when entries are reused.
+- **The game's own texture mistakes are drawn as the RDP draws them.** gameplay_keep's gSunDL (the daytime
+  sun; OoT has the same list) loads its 64x64 I4 day and evening images in three pieces with I8 tiles. The RDP
+  reads each 64-byte row as 64 I8 texels (two I4 rows side by side), the second and third pieces start half an
+  I8 row in (992 and 1504 bytes), and the evening TEXEL1 of the last piece reads 544 bytes of the display lists
+  after the image. So the sun is drawn in bands on the N64 too (gfx_tex_host test "sun DL"); fixing it is a
+  change to the game's display list, not to the renderer.
 
 ## Frames and video (gfx_gx.c, gfx_task.c)
 

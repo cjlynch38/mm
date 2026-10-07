@@ -254,10 +254,29 @@ pass the image's path.
 - **`dvd:` reads.** `dvd:` is mounted with libiso9660, and `bridge_rom.c`
   reads the ROM's sectors directly with `DVD_ReadPrio`.
 - **`img:` reads.** `img:` is the image file on the SD card, mounted with
-  libiso9660 through a `DISC_INTERFACE` that reads the file with libfat.
+  libiso9660 through a `DISC_INTERFACE` that reads the file itself.
   Swiss's DVD emulation patches the DVD functions of Nintendo SDK programs,
   which it finds by signature. It never patches a libogc program, so this port
   reads the image file itself.
+- **SD card reads bypass libfat.** A ROM on the SD card (`baserom.z64`, or the
+  disc image) is read with raw sector reads, never through libfat. libfat
+  (FatFs) holds one lock for whole file operations, and a write that needs a
+  new cluster (a new file, or a file that grows) can hold it for tens of
+  seconds on a large, full card while FatFs reads the FAT for a free one: the
+  first save after boot once froze the game for 35 s that way. At boot `ogc/fat_map.c` maps the file to the sectors it occupies
+  (boot sector or MBR, directories with long names, cluster chain), and
+  `ogc/storage.c` compares raw reads with libfat's reads of the same file
+  (start, end, ranges spread over it and across fragment boundaries). On any
+  difference, error or unsupported layout the file is read through libfat as
+  before. One log line says which:
+  - `SD: sd:/mmgcport/mm-gc.iso: raw sector reads, 1 extent (FAT32, 32768-byte clusters, volume at sector 8192); 9 ranges match libfat (12 ms)`
+  - `SD: sd:/mmgcport/mm-gc.iso: read through libfat (no raw reads: <reason>)`
+
+  Every SD command, libfat's and the raw reads', goes through one short lock
+  (libogc's SD driver is not reentrant), held for at most 64 sectors at a time.
+  libogc 3's mutexes pass on priority, so the idle-priority log writer cannot
+  hold up a ROM read. Build with `GC_ROM_FLAGS=-DGC_ROM_SD_RAW=0` to read
+  through libfat only.
 - **No ROM found.** The halt screen lists what was tried and why each source
   failed.
 
@@ -265,9 +284,46 @@ pass the image's path.
 
 | Storage at boot | Where saves go |
 |---|---|
-| SD card | `SD:/mmgcport/mm.fla`, as before (`log.txt` next to it) |
+| SD card | `SD:/mmgcport/mm.fla`, with `mm.fla.bak` and `mm.fla.tmp` (`log.txt` next to them) |
 | No SD card, memory card in slot A (else slot B, unless a USB Gecko is there) | File `mmgcport_flash` (game code `GMME`, maker `00`). It takes 17 blocks: one header block with the comment "Majora's Mask (GC port) / Flash save, 128 KB", then the 128 KB flash image. A Memory Card 59 has room. |
 | Neither | Not kept |
+
+**SD card saves** (`ogc/bridge_save.c`, `ogc/save_rotation.c`):
+
+- **Files.** `mm.fla` holds the newest save, `mm.fla.bak` the one before,
+  `mm.fla.tmp` the one before that. All are the plain 128 KB flash image.
+- **Stores.** The flash writer thread writes the new save over `mm.fla.tmp` in
+  place and syncs it, then renames `.bak` to `.spare`, `mm.fla` to `.bak`,
+  `.tmp` to `mm.fla` and `.spare` to `.tmp`. Once the three files exist a store
+  allocates no clusters, so it never makes FatFs search the FAT for free space.
+  The first three stores on a card create the files. The log says
+  `save: wrote sd:/mmgcport/mm.fla (131072 bytes, in place, N ms)`, or
+  `new file` for those. N includes any wait for libfat (next point).
+- **Waiting for the log.** A store still needs libfat's lock, so it waits
+  while another libfat user searches the FAT. While `bridge_log.c` creates the
+  log with `fopen(path, "w")` over the old one, the log does that once per
+  boot: truncating a file makes FatFs search for free clusters from the
+  file's old first cluster on, so the new log refills the old one's first
+  clusters, and the write that grows it past them searches from there. On the
+  user's 128 GB card (4 KB clusters) the log's first 3 clusters sit in an old
+  hole followed by about 10.7 million used FAT entries: a search of about 37 s,
+  starting about 21 s after boot. A save, or a reset's save and log flush,
+  waits for it; the game does not, since its ROM reads are raw. Removing the
+  old log before creating the new one avoids the search: FatFs then starts
+  from FSINFO's next-free hint, which it keeps current itself.
+  `tests/sd_ramdisk` shows both on a FAT32 RAM disk laid out like that card.
+- **Power cuts.** Whatever step a power cut interrupts, a complete save
+  remains, and the next boot loads the newest complete one. `mm.fla.spare`
+  exists only during the renames and tells the loader that `mm.fla.tmp` holds
+  the new save. The next store finishes renames that a power cut interrupted.
+  A rename cut short can leave two names on one cluster chain. The store then
+  renames one of them to `mm.fla.dup1` (`.dup2`, ...) and never deletes it.
+  Run a disk check on a PC (chkdsk, fsck.fat) before deleting such a file.
+- **Earlier builds.** Their `mm.fla` and `mm.fla.bak` load as before. The first
+  store adds `mm.fla.tmp`. The host test `tests/sd_host` cuts the power at
+  every step of a store, from every start state, and checks all of this.
+
+**Memory card saves:**
 
 - **Writes.** A store writes only the 8 KB card blocks that changed. MM keeps
   each save twice, in separate 8 KB-aligned flash areas, so a power cut damages
@@ -321,7 +377,7 @@ the reads:
 | Resident ranges, loaded at boot | `0x20700-0x5E06E0`: audio data (5.75 MiB), which the audio thread streams. `0x65C9E0-0xA684D0` (4.05 MiB): `link_animetion` (read every gameplay frame), the item, map and message statics, the yar archives and the message data. | ARAM |
 | Block cache | 8 blocks of up to 64 KB | MEM1 |
 | File cache | Whole files of the ROM's dmadata table (objects, scenes, rooms and so on). The least recently used file is evicted first. Files are stored in 2 KB pages. | The rest of ARAM, 6.2 MiB |
-| Disc | The SD card through libfat. On `dvd:` (the disc image or the dev disc), the file's sectors are read directly with `DVD_ReadPrio`. | |
+| Disc | On the SD card (`baserom.z64` or the disc image file), the file's sectors are read with raw sector reads, bypassing libfat (see "SD card reads bypass libfat" above). On `dvd:` (the disc image or the dev disc), they are read directly with `DVD_ReadPrio`. | |
 
 - **Cache misses.** A miss inside a file reads the whole file from the disc in
   one sequential read and copies it to ARAM. Later loads of that file come

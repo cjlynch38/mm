@@ -36,10 +36,12 @@ endif
 
 # Game translation units: compiled against the decomp's own headers and libc,
 # never against libogc headers (types and names such as Mtx, Vtx, gu* clash).
+# GAME_DEFS adds test switches to the game code, like GFX_DEFS below (use a separate BUILD_DIR).
+GAME_DEFS     ?=
 GAME_CPPFLAGS := -nostdinc -Iinclude -Iinclude/libc -Isrc -I$(N64_BUILD_DIR) -I. -I$(EXTRACTED_DIR) \
                  -Iport/gc/include -include port/gc/include/gc_prelude.h \
                  -D_LANGUAGE_C -DF3DEX_GBI_2 -DF3DEX_GBI_PL -DGBI_DOWHILE -DMM_VERSION=N64_US \
-                 -DNON_MATCHING -DAVOID_UB -DTARGET_GC -DGEKKO
+                 -DNON_MATCHING -DAVOID_UB -DTARGET_GC -DGEKKO $(GAME_DEFS)
 
 GAME_CFLAGS := -mcpu=750 -meabi -mhard-float -G0 -O2 -std=gnu17 \
                -funsigned-char -fno-strict-aliasing -fwrapv -ffp-contract=off \

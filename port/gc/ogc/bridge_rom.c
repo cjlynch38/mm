@@ -28,7 +28,11 @@
  *     sequential read) into blocks and copies it to ARAM; any other miss reads the 64 KB-aligned
  *     block. On dvd: (the disc image or the Dolphin dev disc) the ROM's sectors are read with
  *     DVD_ReadPrio straight into the block (libiso9660 would split every read into 32 KB pieces
- *     through its own buffer); anything else with fseek/fread, unbuffered, so 32-byte aligned
+ *     through its own buffer). On the SD card (sd:/mmgcport/baserom.z64, or img: inside the disc
+ *     image file there) they are read with raw sector reads (storage.c, gc_ogc_sd_raw_read), so a
+ *     read never waits for a libfat operation of another thread: a save that allocates clusters can
+ *     hold libfat's volume lock for tens of seconds on a large, full card. Anything else, or a file
+ *     whose raw reads failed the check at boot, with fseek/fread, unbuffered, so 32-byte aligned
  *     buffers get the data by DMA.
  *
  * Locks and ARAM rules:
@@ -84,6 +88,12 @@
  * 0: always fread. */
 #ifndef GC_ROM_DVD_DIRECT
 #define GC_ROM_DVD_DIRECT 1
+#endif
+
+/* 1: when the ROM is on the SD card (sd:, or img: inside a disc image file on the card), read it with raw sector
+ * reads that bypass libfat (after checking them against libfat at boot). 0: always fread. */
+#ifndef GC_ROM_SD_RAW
+#define GC_ROM_SD_RAW 1
 #endif
 
 /* Largest file the file cache takes; bigger ones are read in 64 KB blocks */
@@ -284,6 +294,11 @@ static s64 sDvdBase;
 static dvdcmdblk sDvdBlock;
 #endif
 
+#if GC_ROM_SD_RAW
+static GcSdRaw* sSdRaw; /* non-NULL: disc reads are raw SD reads of this file at sSdRawBase + offset */
+static unsigned int sSdRawBase;
+#endif
+
 /* The dmadata files, sorted by start (empty until a ROM is open) */
 static RomFile* sFiles;
 static unsigned int sFileCount;
@@ -427,7 +442,7 @@ static int file_read(unsigned int offset, void* dst, unsigned int size) {
 static int disc_read(unsigned int offset, unsigned char* dst, unsigned int size, ReadCtx* ctx) {
     u64 t0 = gettime();
     u64 dt;
-    int ret;
+    int ret = 1; /* 1: not read yet */
 
 #if GC_ROM_DVD_DIRECT
     // DI DMA: 32-byte aligned buffer and length, offset in 4-byte units. Every caller's buffer is a
@@ -435,15 +450,25 @@ static int disc_read(unsigned int offset, unsigned char* dst, unsigned int size,
     if (sDvdDirect && ((unsigned int)dst & 31) == 0 && (size & 31) == 0 && (offset & 3) == 0) {
         s32 got = DVD_ReadPrio(&sDvdBlock, dst, size, sDvdBase + offset, 2);
 
-        ret = (got == (s32)size) ? 0 : -1;
-        if (ret != 0) {
+        if (got == (s32)size) {
+            ret = 0;
+        } else {
             gc_log("ROM: DVD read of %u bytes at %08X returned %d (drive status %d); trying the file", size, offset,
                    (int)got, (int)DVD_GetDriveStatus());
-            ret = file_read(offset, dst, size);
         }
-    } else
+    }
 #endif
-    {
+#if GC_ROM_SD_RAW
+    // Raw sector reads take only the SD card's command lock, never libfat's volume lock
+    if (sSdRaw != NULL) {
+        if (gc_ogc_sd_raw_read(sSdRaw, sSdRawBase + offset, dst, size) == 0) {
+            ret = 0;
+        } else {
+            gc_log("ROM: raw SD read of %u bytes at %08X failed; trying the file", size, offset);
+        }
+    }
+#endif
+    if (ret != 0) {
         ret = file_read(offset, dst, size);
     }
 
@@ -484,6 +509,43 @@ static void dvd_direct_setup(const char* path, FILE* file, const unsigned char* 
     sDvdDirect = 1;
     gc_log("ROM: reading the disc directly (DVD_ReadPrio from disc offset %08llX, sector %u)",
            (unsigned long long)base, (unsigned int)st.st_ino);
+}
+#endif
+
+#if GC_ROM_SD_RAW
+/* ROM on the SD card: sd:/... is mapped itself; img:/... lies in the disc image file, at its ISO9660 sector
+ * (libiso9660 reports it as st_ino). Check that a raw read there returns the header just read through the file.
+ * Caller holds the ROM mutex. */
+static void sd_raw_setup(const char* path, FILE* file, const unsigned char* header) {
+    struct stat st;
+    GcSdRaw* raw;
+    unsigned int base = 0;
+
+    sSdRaw = NULL;
+    if (strncmp(path, "sd:", 3) == 0) {
+        raw = gc_ogc_sd_raw_open(path, file);
+    } else if (strncmp(path, "img:", 4) == 0) {
+        raw = gc_ogc_image_raw();
+        if (raw != NULL && (fstat(fileno(file), &st) != 0 || st.st_ino == 0)) {
+            gc_log("ROM: no sector number for %s in the image; reading through the file system", path);
+            raw = NULL;
+        }
+        base = (raw != NULL) ? (unsigned int)st.st_ino * ISO_SECTOR_SIZE : 0;
+    } else {
+        return;
+    }
+    if (raw == NULL) {
+        return; // storage.c logged why
+    }
+    if (base > gc_ogc_sd_raw_size(raw) || gc_ogc_sd_raw_size(raw) - base < sRomSize ||
+        gc_ogc_sd_raw_read(raw, base, sCacheMem, 0x40) != 0 || memcmp(sCacheMem, header, 0x40) != 0) {
+        gc_log("ROM: a raw read at %08X of the SD card file does not match %s; reading through the file system", base,
+               path);
+        return;
+    }
+    sSdRaw = raw;
+    sSdRawBase = base;
+    gc_log("ROM: reading the SD card directly (raw sector reads from file offset %08X)", base);
 }
 #endif
 
@@ -1588,6 +1650,9 @@ const char* gc_ogc_rom_open(const char* path) {
     sRomSize = (unsigned int)size;
 #if GC_ROM_DVD_DIRECT
     dvd_direct_setup(path, file, header);
+#endif
+#if GC_ROM_SD_RAW
+    sd_raw_setup(path, file, header);
 #endif
     files_load();
     cache_reset();
