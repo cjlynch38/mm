@@ -5,8 +5,14 @@ GameCube's PowerPC CPU with devkitPPC and libogc. This is not an emulator.
 
 ## Status
 
-Verified in Dolphin 2609. Real-hardware testing (PicoBoot + Swiss + SD2SP2) is pending for
-everything past Milestone 0.
+Verified in Dolphin 2609, where two full three-day cycles have been played unattended.
+
+Real hardware (PicoBoot + Swiss + SD2SP2, component cables at 480p), 2026-10-06:
+- Setup: the DOL boots from the SD card and reads the ROM from `mm-gc.iso` on the same card.
+- Verified: the N64 logo, the title screen, File Select and the opening cutscene; Clock Town at
+  20 fps with sound and no audio underruns; saves on the SD card.
+- Not yet tested on the console: booting `mm-gc.iso` itself from Swiss, the pause menu, longer
+  play.
 
 | Milestone | State |
 |---|---|
@@ -175,6 +181,9 @@ dialog instead (run_dolphin exit code 2, with the dialog's text).
 3. In Swiss, browse to `sd:/mmgcport/` and start the DOL.
 4. The platform layer logs to `SD:/mmgcport/log.txt` (`sd_probe` writes
    `probe_log.txt`). Power off and read the file on the PC.
+   - `GC_AUTOSTART=2` builds (the input script) log to `log-autoplay.txt` instead, and save to
+     `mm-autoplay.fla`. The script starts a new file, so it never touches the player's
+     `mm.fla`.
 
 Or use the disc image (next section): it needs no separate ROM file.
 

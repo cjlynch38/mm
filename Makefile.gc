@@ -122,9 +122,11 @@ $(GC_OPTIONS_H): FORCE
 GC_OPTIONS_GAME_O := $(BUILD_DIR)/port/gc/ultra/cont.o $(BUILD_DIR)/port/gc/game/trace.o \
                      $(BUILD_DIR)/port/gc/ultra/ai.o $(BUILD_DIR)/src/code/audio_thread_manager.o
 GC_OPTIONS_OGC_O  := $(BUILD_DIR)/port/gc/gfx/gfx_task.o
-$(GC_OPTIONS_GAME_O) $(GC_OPTIONS_OGC_O): $(GC_OPTIONS_H)
+GC_OPTIONS_PLATFORM_O := $(BUILD_DIR)/port/gc/ogc/platform.o
+$(GC_OPTIONS_GAME_O) $(GC_OPTIONS_OGC_O) $(GC_OPTIONS_PLATFORM_O): $(GC_OPTIONS_H)
 $(GC_OPTIONS_GAME_O): GAME_CPPFLAGS += -I$(BUILD_DIR)/generated
 $(GC_OPTIONS_OGC_O): GFX_CFLAGS += -I$(BUILD_DIR)/generated
+$(GC_OPTIONS_PLATFORM_O): OGC_CFLAGS += -DGC_AUTOSTART=$(GC_AUTOSTART)
 
 # make -f Makefile.gc GC_ROM_FLAGS='-DGC_ROM_TRACE=1 ...': options of the ROM reader (the GC_ROM_* macros at
 # the top of port/gc/ogc/bridge_rom.c and platform.c). Its objects rebuild when the flags change.

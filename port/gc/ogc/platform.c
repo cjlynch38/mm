@@ -73,6 +73,10 @@ void gc_ogc_boot(void) {
 #if defined(GC_ROM_CHECK) && GC_ROM_CHECK
         // Diagnostic builds keep their own log, so a normal run afterwards does not overwrite it
         gc_ogc_log_open_file(GC_SD_DIR "/log-check.txt");
+#elif defined(GC_AUTOSTART) && GC_AUTOSTART == 2 // Makefile.gc passes it to this file
+        // The input script starts a new file and saves: keep it away from the player's log and save
+        gc_ogc_log_open_file(GC_SD_DIR "/log-autoplay.txt");
+        gc_ogc_save_set_path(GC_SD_DIR "/mm-autoplay.fla");
 #else
         gc_ogc_log_open_file(GC_LOG_PATH);
 #endif
