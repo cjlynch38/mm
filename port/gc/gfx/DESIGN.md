@@ -155,6 +155,11 @@ Use the obvious shortcuts to save stages: B = 0, C = 0, C = 1, A = B, and so on.
     exactly, and keeps the passing samples passing.
   - `zero_unwritten_reads` turns these reads into ZERO. gfx_tev never loads TEVPREV or TEVREG2,
     so nothing depends on their value.
+  - Confirmed on the console the same day:
+    - dol_tev: 0 mismatches in every pass (ZERO and a konst-1 variant). Its control pass, which
+      draws the old programs, still failed the same 5 modes in the same run.
+    - In the game, the shadows are black again, Skull Kid draws whole, and the flashing bars at
+      the top of the screen are gone.
 
 ## Textures (gfx_rdp.c, gfx_tex.c)
 
