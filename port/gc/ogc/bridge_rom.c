@@ -114,6 +114,12 @@
 #define GC_ROM_TRACE 0
 #endif
 
+/* 1: gc_ogc_rom_check() reads the whole ROM back after the boot and compares it with checksums of the build
+ * machine's ROM (make -f Makefile.gc GC_ROM_CHECK=1, which generates the table) */
+#ifndef GC_ROM_CHECK
+#define GC_ROM_CHECK 0
+#endif
+
 #define CACHE_BLOCK_SIZE 0x10000
 #define CACHE_BLOCKS 8
 
@@ -1874,3 +1880,93 @@ void gc_ogc_rom_print_stats(void) {
            kb_per_second(s.discBytes, (unsigned int)ticks_to_millisecs(s.discTicks)), SLOW_MS_1, SLOW_MS_2,
            SLOW_MS_3, s.slow[0], s.slow[1], s.slow[2]);
 }
+
+#if GC_ROM_CHECK
+/* ROM self-test (GC_ROM_CHECK=1 builds, make GC_ROM_CHECK=1): read the whole ROM back through gc_rom_read, the path
+ * the game's DMA takes (resident ARAM ranges, the ARAM file cache, the disc or disc image), and compare the CRC32 of
+ * every 64 KB with a table made from the build machine's ROM (port/gc/tools/gen_rom_crc.py). A mismatch names the
+ * chunk and the dmadata files in it; each bad chunk is read a second time to tell a wrong copy (same CRC again) from
+ * a read that varies. */
+extern const unsigned int gGcRomCheckSize, gGcRomCheckChunk, gGcRomCheckCount, gGcRomCheckCrc[];
+
+static unsigned int crc32_update(unsigned int crc, const unsigned char* p, unsigned int n) {
+    static unsigned int table[256];
+    unsigned int i;
+
+    if (table[1] == 0) {
+        for (i = 0; i < 256; i++) {
+            unsigned int c = i;
+            int k;
+
+            for (k = 0; k < 8; k++) {
+                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            }
+            table[i] = c;
+        }
+    }
+    crc = ~crc;
+    for (i = 0; i < n; i++) {
+        crc = table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+/* dmadata indices of the files overlapping [start, end), as text */
+static void rom_check_files(unsigned int start, unsigned int end, char* out, unsigned int outSize) {
+    unsigned int i, len = 0;
+
+    out[0] = '\0';
+    for (i = 0; i < sFileCount && len + 8 < outSize; i++) {
+        if (sFiles[i].start < end && sFiles[i].end > start) {
+            len += (unsigned int)snprintf(out + len, outSize - len, " %u", sFiles[i].index);
+        }
+    }
+}
+
+void gc_ogc_rom_check(void) {
+    unsigned char* buf;
+    unsigned int chunk = gGcRomCheckChunk;
+    unsigned int i, bad = 0, unstable = 0;
+    u64 t0 = gettime();
+
+    if (sRomSize != gGcRomCheckSize) {
+        gc_log("ROM check: the ROM is %u bytes, the table was made for %u; skipped", sRomSize, gGcRomCheckSize);
+        return;
+    }
+    buf = gc_mem_alloc(chunk, 32);
+    if (buf == NULL) {
+        gc_log("ROM check: no memory");
+        return;
+    }
+    gc_log("ROM check: reading %u KB in %u chunks through gc_rom_read...", sRomSize / 1024, gGcRomCheckCount);
+    for (i = 0; i < gGcRomCheckCount; i++) {
+        unsigned int off = i * chunk;
+        unsigned int n = (sRomSize - off < chunk) ? sRomSize - off : chunk;
+        unsigned int crc;
+
+        if (gc_rom_read(off, buf, n) != 0) {
+            gc_log("ROM check: read error at %08X", off);
+            bad++;
+            continue;
+        }
+        crc = crc32_update(0, buf, n);
+        if (crc != gGcRomCheckCrc[i]) {
+            char files[96];
+            unsigned int crc2 = 0xFFFFFFFFu;
+
+            if (gc_rom_read(off, buf, n) == 0) {
+                crc2 = crc32_update(0, buf, n);
+            }
+            unstable += (crc2 != crc);
+            if (bad < 40) {
+                rom_check_files(off, off + n, files, sizeof(files));
+                gc_log("ROM check: BAD %08X-%08X: crc %08X, again %08X, want %08X; files%s", off, off + n, crc, crc2,
+                       gGcRomCheckCrc[i], files);
+            }
+            bad++;
+        }
+    }
+    gc_log("ROM check: %u of %u chunks wrong (%u read differently the second time), %u ms", bad, gGcRomCheckCount,
+           unstable, (unsigned int)ticks_to_millisecs(gettime() - t0));
+}
+#endif

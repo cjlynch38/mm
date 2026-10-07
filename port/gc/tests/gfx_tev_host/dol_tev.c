@@ -3,23 +3,27 @@
  * the real GX. Every random sample is an 8x8 cell: a background quad in the "framebuffer" color, then a quad
  * drawn with the state gfx_tev_apply() programmed (uniform 4x4 textures for TEXEL0/TEXEL1, vertex color as
  * shade). The EFB is then copied into a RAM texture (GX_CopyTex) and every cell is compared with the RDP
- * model (rdp_model.c). Results go to the text console and the USB Gecko.
+ * model (rdp_model.c). Results go to the text console, the USB Gecko and, on a console with an SD card in an
+ * SD2SP2 (serial port 2), sd:/mmgcport/tevtest.txt.
  *
  *   make -C port/gc/tests/gfx_tev_host dol
  *
  * The readback needs EFB copies that reach RAM. In Dolphin that means the software renderer (whose GX is
  * also the most exact) with "Store EFB Copies to Texture Only" off; port/gc/tools/run_dolphin.ps1 does not set
  * these, so run Dolphin with these extra arguments (per run, not saved):
- *   -C "Dolphin.Core.GFXBackend=Software Renderer" -C GFX.Hacks.EFBToTextureEnable=False
+ *   -C "Dolphin.Core.GFXBackend=Software Renderer" -C Graphics.Hacks.EFBToTextureEnable=False
  * With Dolphin's hardware backends the copy comes back black and the test stops at its setup check.
  */
+#include <fat.h>
 #include <gccore.h>
 #include <malloc.h>
+#include <sdcard/gcsd.h>
 #include <ogc/usbgecko.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include "gfx_internal.h"
 #include "rdp_model.h"
 #include "tev_cases.h"
@@ -40,16 +44,41 @@ typedef struct {
     C4 expect, mem;
     int tol;
     N64In in;
+    uint32_t hi, lo, cycle, modeL, geom;
+    GfxPrimKind kind;
+    bool shadeAvail;
 } Cell;
 
 static GXRModeObj* sMode;
 static void* sXfb;
 static int sGecko;
+static FILE* sFile; /* sd:/mmgcport/tevtest.txt */
 static Cell* sCells;
 static u8* sTexMem;
 static int sNumCells;
 static u8* sReadback; /* EFB as an RGBA8 texture */
 static uint32_t sRng = 0x2545F491u;
+
+/* The cells are generated once, then drawn once per mode (same inputs, same places). The first console runs
+ * (2026-10-06) failed 5 programs that read TEVPREV in stage 0 before it was written, in every mode, timing
+ * variations included; gfx_tev now reads ZERO there. The last modes draw with variants of that (gfx_tev.c
+ * GFX_TEV_TEST_HOOKS). Dolphin passes every mode. */
+enum {
+    MODE_BASE,       /* as the renderer draws */
+    MODE_BASE_AGAIN, /* the same again: are the mismatches repeatable? */
+    MODE_REVERSE,    /* cells drawn last to first: does a mismatch follow the cell or what was drawn before it? */
+    MODE_DUMMY_PRIM, /* a small quad in a spare area between the state change and the test quad */
+    MODE_KONST,      /* channels that passed unwritten TEVPREV through pass konst 1 instead of ZERO */
+    MODE_OLD,        /* control: the programs before the fix, which failed on the console (not counted) */
+    MODES
+};
+static const char* const kModeNames[MODES] = {
+    "base", "base again", "reverse order", "dummy primitive first", "konst instead of ZERO",
+    "control: programs before the fix, not counted",
+};
+extern int gGfxTevUnwrittenRead;
+static int sMode2;
+static u8* sBadCell;
 
 void gc_log(const char* fmt, ...) {
     char line[320];
@@ -71,6 +100,21 @@ void gc_log(const char* fmt, ...) {
     if (sGecko) {
         usb_sendbuffer_safe(GECKO_CHANNEL, line, n);
     }
+    if (sFile != NULL) {
+        fputs(line, sFile);
+        fflush(sFile);
+    } else {
+        SYS_Report("%s", line); // Dolphin's log (OSREPORT)
+    }
+}
+
+/* The SD card in the SD2SP2, for the result file */
+static void sd_open(void) {
+    if (!fatMountSimple("sd", &__io_gcsd2)) {
+        return;
+    }
+    mkdir("sd:/mmgcport", 0777);
+    sFile = fopen("sd:/mmgcport/tevtest.txt", "w");
 }
 
 static uint32_t rng(void) {
@@ -194,8 +238,7 @@ static void background_state(void) {
 }
 
 /* Uniform 4x4 RGBA8 texture: one tile, 16 AR pairs then 16 GB pairs */
-static void load_texture(u8* buf, C4 c, int map) {
-    GXTexObj obj;
+static void fill_texture(u8* buf, C4 c) {
     int i;
 
     for (i = 0; i < 16; i++) {
@@ -205,6 +248,11 @@ static void load_texture(u8* buf, C4 c, int map) {
         buf[32 + i * 2 + 1] = (u8)c.b;
     }
     DCFlushRange(buf, 64);
+}
+
+static void load_texture(u8* buf, int map) {
+    GXTexObj obj;
+
     GX_InitTexObj(&obj, buf, 4, 4, GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
     GX_InitTexObjLOD(&obj, GX_NEAR, GX_NEAR, 0, 0, 0, GX_FALSE, GX_FALSE, GX_ANISO_1);
     GX_LoadTexObj(&obj, map);
@@ -231,18 +279,15 @@ static C4 readback_pixel(int x, int y) {
     return c;
 }
 
-static void draw_config(const char* name, int config, uint32_t hi, uint32_t lo, uint32_t cycle, uint32_t modeL,
-                        GfxPrimKind kind, uint32_t geom, int tol) {
+static void gen_config(const char* name, int config, uint32_t hi, uint32_t lo, uint32_t cycle, uint32_t modeL,
+                       GfxPrimKind kind, uint32_t geom, int tol) {
     bool shadeAvail = (kind == GFX_PRIM_TRIANGLE) && (geom & G_SHADE);
     int s;
 
     for (s = 0; s < SAMPLES && sNumCells < MAX_CELLS; s++) {
         Cell* cell = &sCells[sNumCells];
-        int x = (sNumCells % COLS) * CELL, y = (sNumCells / COLS) * CELL;
         N64In in;
         N64Out n;
-        GfxTevInfo info;
-        C4 shade;
         int tries;
 
         /* Samples the RDP wraps or that sit on an alpha threshold are not comparable (see test_tev.c) */
@@ -266,48 +311,66 @@ static void draw_config(const char* name, int config, uint32_t hi, uint32_t lo, 
         if (tries == 100) {
             continue;
         }
-
-        background_state();
-        draw_quad(x, y, in.mem);
-
-        gGfxRdp.combineHi = hi;
-        gGfxRdp.combineLo = lo;
-        gGfxRdp.otherModeH = cycle | G_TP_PERSP | G_TF_BILERP;
-        gGfxRdp.otherModeL = modeL;
-        gGfxRdp.primColor = pack(in.prim);
-        gGfxRdp.envColor = pack(in.env);
-        gGfxRdp.fogColor = pack(in.fog);
-        gGfxRdp.blendColor = pack(in.blend);
-        gGfxRdp.primLodFrac = (uint8_t)in.primLod;
-        gGfxRdp.dirty = GFX_DIRTY_COMBINE | GFX_DIRTY_OTHERMODE | GFX_DIRTY_COLORS;
-        gGfxRsp.geometryMode = geom;
-        gfx_tev_apply(kind, &info);
-        gGfxRdp.dirty = 0;
-        load_texture(&sTexMem[sNumCells * 128], in.tex0, GX_TEXMAP0);
-        load_texture(&sTexMem[sNumCells * 128 + 64], in.tex1, GX_TEXMAP1);
-        shade = in.shade;
-        if (!shadeAvail) {
-            C4 garbage = { 77, 99, 11, 201 };
-            shade = garbage;
-        }
-        draw_quad(x, y, shade);
-
+        fill_texture(&sTexMem[sNumCells * 128], in.tex0);
+        fill_texture(&sTexMem[sNumCells * 128 + 64], in.tex1);
         cell->name = name;
         cell->config = config;
         cell->expect = n.color;
         cell->mem = in.mem;
         cell->tol = tol;
         cell->in = in;
+        cell->hi = hi;
+        cell->lo = lo;
+        cell->cycle = cycle;
+        cell->modeL = modeL;
+        cell->geom = geom;
+        cell->kind = kind;
+        cell->shadeAvail = shadeAvail;
         sNumCells++;
     }
 }
 
+static void draw_cell(int c) {
+    Cell* cell = &sCells[c];
+    int x = (c % COLS) * CELL, y = (c / COLS) * CELL;
+    GfxTevInfo info;
+    C4 shade;
+
+    background_state();
+    draw_quad(x, y, cell->mem);
+    gGfxRdp.combineHi = cell->hi;
+    gGfxRdp.combineLo = cell->lo;
+    gGfxRdp.otherModeH = cell->cycle | G_TP_PERSP | G_TF_BILERP;
+    gGfxRdp.otherModeL = cell->modeL;
+    gGfxRdp.primColor = pack(cell->in.prim);
+    gGfxRdp.envColor = pack(cell->in.env);
+    gGfxRdp.fogColor = pack(cell->in.fog);
+    gGfxRdp.blendColor = pack(cell->in.blend);
+    gGfxRdp.primLodFrac = (uint8_t)cell->in.primLod;
+    gGfxRdp.dirty = GFX_DIRTY_COMBINE | GFX_DIRTY_OTHERMODE | GFX_DIRTY_COLORS;
+    gGfxRsp.geometryMode = cell->geom;
+    gfx_tev_apply(cell->kind, &info);
+    gGfxRdp.dirty = 0;
+    load_texture(&sTexMem[c * 128], GX_TEXMAP0);
+    load_texture(&sTexMem[c * 128 + 64], GX_TEXMAP1);
+    shade = cell->in.shade;
+    if (!cell->shadeAvail) {
+        C4 garbage = { 77, 99, 11, 201 };
+        shade = garbage;
+    }
+    if (sMode2 == MODE_DUMMY_PRIM) {
+        draw_quad(0, 400, shade);
+    }
+    draw_quad(x, y, shade);
+}
+
 int main(void) {
     size_t i, v;
-    int config = 0, c, bad = 0, badConfigs = 0, lastBadConfig = -1, worst = 0;
+    int config = 0, c, bad = 0, worst = 0;
 
     video_init();
     sGecko = usb_isgeckoalive(GECKO_CHANNEL);
+    sd_open();
     gc_log("dol_tev: GX TEV programs of gfx_tev.c vs the RDP model, %d samples per mode", SAMPLES);
     sCells = calloc(MAX_CELLS, sizeof(Cell));
     sTexMem = memalign(32, MAX_CELLS * 128);
@@ -339,7 +402,7 @@ int main(void) {
         }
         if (in.r != 255 || in.g != 0 || out.r != 0) {
             gc_log("dol_tev: FAIL (drawing or the EFB copy to RAM does not work; Dolphin needs "
-                   "GFX.Hacks.EFBToTextureEnable=False)");
+                   "Graphics.Hacks.EFBToTextureEnable=False)");
             GX_CopyDisp(sXfb, GX_FALSE);
             GX_DrawDone();
             for (;;) {
@@ -354,53 +417,90 @@ int main(void) {
         for (v = 0; v < sizeof(sModeVariants) / sizeof(sModeVariants[0]); v++) {
             const ModeVariant* mv = &sModeVariants[v];
 
-            draw_config(cc->name, config++, cc->hi, cc->lo, cc->cycle,
-                        cc->cycle == G_CYC_2CYCLE ? mv->modeL2 : mv->modeL1, cc->kind, cc->geom,
-                        mv->checkAlpha ? 10 : mv->tol);
+            gen_config(cc->name, config++, cc->hi, cc->lo, cc->cycle,
+                       cc->cycle == G_CYC_2CYCLE ? mv->modeL2 : mv->modeL1, cc->kind, cc->geom,
+                       mv->checkAlpha ? 10 : mv->tol);
         }
     }
     for (i = 0; i < sizeof(sBlendCases) / sizeof(sBlendCases[0]); i++) {
         const BlendCase* bc = &sBlendCases[i];
 
-        draw_config(bc->name, config++, bc->hi, bc->lo, bc->cycle, bc->modeL, bc->kind, bc->geom, 16);
+        gen_config(bc->name, config++, bc->hi, bc->lo, bc->cycle, bc->modeL, bc->kind, bc->geom, 16);
     }
-    readback();
+    sBadCell = calloc(sNumCells, 1);
 
-    for (c = 0; c < sNumCells; c++) {
-        const Cell* cell = &sCells[c];
-        int x = (c % COLS) * CELL + CELL / 2, y = (c / COLS) * CELL + CELL / 2;
-        C4 px = readback_pixel(x, y);
-        int d;
+    for (sMode2 = 0; sMode2 < MODES; sMode2++) {
+        int modeBad = 0, modeWorst = 0;
 
-        d = abs(px.r - cell->expect.r);
-        d = abs(px.g - cell->expect.g) > d ? abs(px.g - cell->expect.g) : d;
-        d = abs(px.b - cell->expect.b) > d ? abs(px.b - cell->expect.b) : d;
-        worst = d > worst ? d : worst;
-        if (d > cell->tol) {
-            bad++;
-            if (cell->config != lastBadConfig) {
-                const N64In* in = &cell->in;
+        gGfxTevUnwrittenRead = (sMode2 == MODE_OLD) ? 0 : (sMode2 == MODE_KONST) ? 2 : 1;
+        gfx_tev_init(); // compiles the programs again
+        // The copy clears depth only with z updates on (the last cell drawn may have left them off)
+        GX_SetZMode(GX_TRUE, GX_ALWAYS, GX_TRUE);
+        GX_SetColorUpdate(GX_TRUE);
+        GX_CopyDisp(sXfb, GX_TRUE);
+        GX_DrawDone();
+        for (c = 0; c < sNumCells; c++) {
+            draw_cell((sMode2 == MODE_REVERSE) ? sNumCells - 1 - c : c);
+        }
+        readback();
 
-                badConfigs++;
-                lastBadConfig = cell->config;
-                gc_log("MISMATCH %s (config %d): GX %d %d %d, RDP %d %d %d, framebuffer %d %d %d", cell->name,
-                       cell->config, px.r, px.g, px.b, cell->expect.r, cell->expect.g, cell->expect.b, cell->mem.r,
+        for (c = 0; c < sNumCells; c++) {
+            const Cell* cell = &sCells[c];
+            int x = (c % COLS) * CELL + CELL / 2, y = (c / COLS) * CELL + CELL / 2;
+            C4 px = readback_pixel(x, y);
+            int d;
+
+            d = abs(px.r - cell->expect.r);
+            d = abs(px.g - cell->expect.g) > d ? abs(px.g - cell->expect.g) : d;
+            d = abs(px.b - cell->expect.b) > d ? abs(px.b - cell->expect.b) : d;
+            modeWorst = d > modeWorst ? d : modeWorst;
+            if (d > cell->tol) {
+                modeBad++;
+                sBadCell[c] |= (sMode2 == MODE_OLD) ? 2 : 1;
+                gc_log("M%d cell %d cfg %d %s: GX %d %d %d RDP %d %d %d fb %d %d %d", sMode2, c, cell->config,
+                       cell->name, px.r, px.g, px.b, cell->expect.r, cell->expect.g, cell->expect.b, cell->mem.r,
                        cell->mem.g, cell->mem.b);
-                gc_log("  t0 %d %d %d %d t1 %d %d %d %d shade %d %d %d %d prim %d %d %d %d env %d %d %d %d fog %d %d %d %d "
-                       "blend %d %d %d %d lod %d",
-                       in->tex0.r, in->tex0.g, in->tex0.b, in->tex0.a, in->tex1.r, in->tex1.g, in->tex1.b, in->tex1.a,
-                       in->shade.r, in->shade.g, in->shade.b, in->shade.a, in->prim.r, in->prim.g, in->prim.b,
-                       in->prim.a, in->env.r, in->env.g, in->env.b, in->env.a, in->fog.r, in->fog.g, in->fog.b,
-                       in->fog.a, in->blend.r, in->blend.g, in->blend.b, in->blend.a, in->primLod);
             }
+        }
+        gc_log("dol_tev: M%d [%s] %d cells, %d mismatching, largest difference %d", sMode2, kModeNames[sMode2],
+               sNumCells, modeBad, modeWorst);
+        if (sMode2 != MODE_OLD) {
+            bad += modeBad;
+            worst = modeWorst > worst ? modeWorst : worst;
+        }
+    }
+    gGfxTevUnwrittenRead = 1;
+    gfx_tev_init();
+
+    // The inputs of every cell that mismatched in a counted mode, and of the cell drawn before it
+    for (c = 0; c < sNumCells; c++) {
+        int k;
+
+        if (!(sBadCell[c] & 1)) {
+            continue;
+        }
+        for (k = (c > 0) ? c - 1 : c; k <= c; k++) {
+            const N64In* in = &sCells[k].in;
+
+            gc_log("%s %d cfg %d: t0 %d %d %d %d t1 %d %d %d %d shade %d %d %d %d prim %d %d %d %d env %d %d %d %d "
+                   "fog %d %d %d %d blend %d %d %d %d lod %d",
+                   (k == c) ? "IN cell" : "  prev", k, sCells[k].config, in->tex0.r, in->tex0.g, in->tex0.b,
+                   in->tex0.a, in->tex1.r, in->tex1.g, in->tex1.b, in->tex1.a, in->shade.r, in->shade.g, in->shade.b,
+                   in->shade.a, in->prim.r, in->prim.g, in->prim.b, in->prim.a, in->env.r, in->env.g, in->env.b,
+                   in->env.a, in->fog.r, in->fog.g, in->fog.b, in->fog.a, in->blend.r, in->blend.g, in->blend.b,
+                   in->blend.a, in->primLod);
         }
     }
 
     GX_CopyDisp(sXfb, GX_TRUE);
     GX_DrawDone();
-    gc_log("dol_tev: %d modes, %d cells, %d mismatching cells in %d modes, largest difference %d", config, sNumCells,
-           bad, badConfigs, worst);
+    gc_log("dol_tev: modes M0-M%d: %d mismatching cells, largest difference %d", MODE_OLD - 1, bad, worst);
     gc_log(bad == 0 ? "dol_tev: PASS" : "dol_tev: FAIL");
+    if (sFile != NULL) {
+        fclose(sFile);
+        sFile = NULL;
+        fatUnmount("sd");
+    }
 
     for (;;) {
         VIDEO_WaitVSync();

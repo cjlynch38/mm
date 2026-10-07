@@ -70,7 +70,12 @@ void gc_ogc_boot(void) {
 
     // The SD card first: the log file and saves go there, and it may hold the ROM or the disc image.
     if (gc_ogc_sd_mount() != NULL) {
+#if defined(GC_ROM_CHECK) && GC_ROM_CHECK
+        // Diagnostic builds keep their own log, so a normal run afterwards does not overwrite it
+        gc_ogc_log_open_file(GC_SD_DIR "/log-check.txt");
+#else
         gc_ogc_log_open_file(GC_LOG_PATH);
+#endif
     }
     error = gc_ogc_storage_open_rom();
     if (error != NULL) {
@@ -93,6 +98,9 @@ void gc_ogc_boot(void) {
     }
 #endif
     gc_ogc_rom_cache_init();
+#if defined(GC_ROM_CHECK) && GC_ROM_CHECK
+    gc_ogc_rom_check();
+#endif
     // After the ROM preload, so the renderer only takes memory that is really left; the console stays
     // the display until the renderer shows its first frame.
     gc_gfx_init();

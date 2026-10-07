@@ -301,6 +301,10 @@ void gfx_gx_init(void) {
 
     // EFB at 2x the N64 resolution, copied to an XFB of the TV mode (scaled vertically for 50 Hz modes)
     GX_SetPixelFmt(GX_PF_RGB8_Z24, GX_ZC_LINEAR);
+#if defined(GFX_HW_TEST) && GFX_HW_TEST
+    // Before the rest of the setup, which puts back everything the test changes
+    gfx_hw_test();
+#endif
     GX_SetCopyClear(sClearColor, GX_MAX_Z24);
     GX_SetViewport(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT, 0, 1);
     GX_SetScissor(0, 0, GFX_EFB_WIDTH, GFX_EFB_HEIGHT);

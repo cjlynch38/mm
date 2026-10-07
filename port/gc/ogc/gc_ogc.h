@@ -128,6 +128,9 @@ unsigned int gc_ogc_mem_carved(void);
 unsigned int gc_ogc_mem_top(void);
 
 /* bridge_rom.c */
+/** GC_ROM_CHECK builds: read the whole ROM back through gc_rom_read and log every 64 KB that differs from the
+ *  build machine's ROM. */
+void gc_ogc_rom_check(void);
 void gc_ogc_rom_init(void);
 /** Open and validate the ROM. Returns NULL on success, or a message for the user. */
 const char* gc_ogc_rom_open(const char* path);

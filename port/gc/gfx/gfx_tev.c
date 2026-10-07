@@ -919,6 +919,64 @@ static uint8_t lower_opbits(const TevOp* op) {
     return (op->sub ? 1 : 0) | (op->clamp ? 2 : 0) | (uint8_t)((op->dst & 0xF) << 4);
 }
 
+/* A register this program reads before one of its stages writes it: TEVPREV and TEVREG2, which
+ * gfx_tev_apply doesn't load. On the console, a program whose stage reads TEVPREV's initial value misreads
+ * the registers GX_SetTevColor loads (dol_tev, 2026-10-06): env alpha (A1) as prim alpha or prim green,
+ * prim alpha (A0) as 0, prim red as the texel alpha (black actor shadows came out red). Dolphin shows
+ * none of it. Such a read is a pass-through of a value nothing uses (an unused channel of stage 0, NOP
+ * ops), so it reads ZERO instead. */
+static bool unwritten_color_in(uint8_t in, uint8_t cWritten, uint8_t aWritten) {
+    return (in == GX_CC_CPREV && !(cWritten & (1 << R_PREV))) || (in == GX_CC_APREV && !(aWritten & (1 << R_PREV))) ||
+           (in == GX_CC_C2 && !(cWritten & (1 << GX_TEVREG2))) || (in == GX_CC_A2 && !(aWritten & (1 << GX_TEVREG2)));
+}
+
+static bool unwritten_alpha_in(uint8_t in, uint8_t aWritten) {
+    return (in == GX_CA_APREV && !(aWritten & (1 << R_PREV))) || (in == GX_CA_A2 && !(aWritten & (1 << GX_TEVREG2)));
+}
+
+#ifdef GFX_TEV_TEST_HOOKS
+/* For dol_tev on the console: 1 reads ZERO (the renderer), 0 keeps the unwritten reads (the programs before
+ * the fix), 2 passes konst 1 through instead in channels that only pass the register through */
+int gGfxTevUnwrittenRead = 1;
+#endif
+
+static void zero_unwritten_reads(TevProgram* p) {
+    uint8_t cWritten = (1 << GX_TEVREG0) | (1 << GX_TEVREG1), aWritten = cWritten;
+    int i, j;
+
+#ifdef GFX_TEV_TEST_HOOKS
+    if (gGfxTevUnwrittenRead == 0) {
+        return;
+    }
+#endif
+    for (i = 0; i < p->numStages; i++) {
+        TevStage* st = &p->stages[i];
+
+#ifdef GFX_TEV_TEST_HOOKS
+        if (gGfxTevUnwrittenRead == 2) {
+            if (st->cin[0] == GX_CC_ZERO && st->cin[1] == GX_CC_ZERO && st->cin[2] == GX_CC_ZERO &&
+                unwritten_color_in(st->cin[3], cWritten, aWritten) && st->kcsel == GX_TEV_KCSEL_1) {
+                st->cin[3] = GX_CC_KONST;
+            }
+            if (st->ain[0] == GX_CA_ZERO && st->ain[1] == GX_CA_ZERO && st->ain[2] == GX_CA_ZERO &&
+                unwritten_alpha_in(st->ain[3], aWritten) && st->kasel == GX_TEV_KASEL_1) {
+                st->ain[3] = GX_CA_KONST;
+            }
+        }
+#endif
+        for (j = 0; j < 4; j++) {
+            if (unwritten_color_in(st->cin[j], cWritten, aWritten)) {
+                st->cin[j] = GX_CC_ZERO;
+            }
+            if (unwritten_alpha_in(st->ain[j], aWritten)) {
+                st->ain[j] = GX_CA_ZERO;
+            }
+        }
+        cWritten |= (uint8_t)(1 << (st->cop >> 4));
+        aWritten |= (uint8_t)(1 << (st->aop >> 4));
+    }
+}
+
 static void lower(Compiler* c, TevProgram* p) {
     int i;
 
@@ -954,6 +1012,7 @@ static void lower(Compiler* c, TevProgram* p) {
             p->info.usesShade = true;
         }
     }
+    zero_unwritten_reads(p);
 }
 
 /* ------------------------------------------------------------------------------------------------ */

@@ -195,6 +195,12 @@ static const BlendCase sBlendCases[] = {
       IM_RD | FORCE_BL | GBL_c1(G_BL_CLR_IN, G_BL_A_SHADE, G_BL_CLR_MEM, G_BL_1MA) |
           GBL_c2(G_BL_CLR_IN, G_BL_A_SHADE, G_BL_CLR_MEM, G_BL_1MA),
       GFX_PRIM_TRIANGLE, TRI, false },
+    /* Actor shadows (SETUPDL_44 + z_actor.c): the render mode the console logged, 0xC8104F50 =
+     * G_RM_FOG_SHADE_A | G_RM_ZB_OVL_SURF2 */
+    { "circle shadow (SETUPDL_44)", LERP(0, 0, 0, PRIMITIVE, TEXEL0, 0, PRIMITIVE, 0, 0, 0, 0, COMBINED, 0, 0, 0, COMBINED),
+      G_CYC_2CYCLE, 0xC8104F50u, GFX_PRIM_TRIANGLE, TRI | G_FOG, true },
+    { "foot shadow (SETUPDL_44)", MODE(G_CC_MODULATEIA_PRIM, G_CC_PASS2), G_CYC_2CYCLE, 0xC8104F50u, GFX_PRIM_TRIANGLE,
+      TRI | G_FOG, true },
     { "FOG_SHADE_A + ADD2 (fog alpha out)", MODE(G_CC_MODULATEIA, G_CC_PASS2), G_CYC_2CYCLE,
       G_RM_FOG_SHADE_A | RM_ADD(2), GFX_PRIM_TRIANGLE, TRI | G_FOG, false },
     { "MEM*A_IN + IN*1MA (dst factor alpha)", MODE(G_CC_MODULATEIA, G_CC_MODULATEIA), G_CYC_1CYCLE,

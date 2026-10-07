@@ -57,12 +57,13 @@ DOL_OBJS   := $(DOL_BUILD)/gfx_tev.o $(DOL_BUILD)/rdp_model.o $(DOL_BUILD)/dol_t
 dol: $(DOL_BUILD)/dol_tev.dol
 
 $(DOL_BUILD)/dol_tev.dol: $(DOL_OBJS)
-	$(PPC_CC) $(MACHDEP) -Wl,-Map,$(DOL_BUILD)/dol_tev.map $^ -L$(DEVKITPRO)/libogc/lib/cube -logc -lm 	    -o $(DOL_BUILD)/dol_tev.elf
+	$(PPC_CC) $(MACHDEP) -Wl,-Map,$(DOL_BUILD)/dol_tev.map $^ -L$(DEVKITPRO)/libogc/lib/cube -lfat -logc -lm 	    -o $(DOL_BUILD)/dol_tev.elf
 	$(ELF2DOL) $(DOL_BUILD)/dol_tev.elf $@
 	python3 $(ROOT)/port/gc/tools/dolpad.py $@
 
+# GFX_TEV_TEST_HOOKS: dol_tev also draws with the TEV program variants gGfxTevUnwrittenRead selects
 $(DOL_BUILD)/gfx_tev.o: $(ROOT)/port/gc/gfx/gfx_tev.c $(ROOT)/port/gc/gfx/gfx_internal.h | $(DOL_BUILD)
-	$(PPC_CC) -c $(PPC_CFLAGS) -o $@ $<
+	$(PPC_CC) -c $(PPC_CFLAGS) -DGFX_TEV_TEST_HOOKS -o $@ $<
 
 $(DOL_BUILD)/%.o: %.c rdp_model.h tev_cases.h $(ROOT)/port/gc/gfx/gfx_internal.h | $(DOL_BUILD)
 	$(PPC_CC) -c $(PPC_CFLAGS) -o $@ $<

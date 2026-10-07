@@ -113,6 +113,8 @@ void gfx_rsp_reset(void);
 void gfx_rsp_run(uint32_t dlAddr);
 /** Log statistics every few seconds (called by gfx_task.c after each task). */
 void gfx_rsp_stats_frame(void);
+/** GX behaviour test (-DGFX_HW_TEST=1, gfx_hwtest.c): run once from gfx_gx_init, before the renderer's own setup. */
+void gfx_hw_test(void);
 /** Hash build (-DGFX_FRAME_HASH=1): log the task's per-skeleton hashes (gfx_rsp.c). */
 void gfx_rsp_frame_hash_log(void);
 

@@ -132,6 +132,20 @@ GC_ROM_FLAGS ?=
 GC_ROM_FLAGS_STAMP := $(BUILD_DIR)/generated/gc_rom_flags.txt
 GC_ROM_O := $(BUILD_DIR)/port/gc/ogc/bridge_rom.o $(BUILD_DIR)/port/gc/ogc/platform.o
 
+# make -f Makefile.gc GC_ROM_CHECK=1: after the boot, read the whole ROM back the way the game's DMA does and compare
+# every 64 KB with checksums of baseroms/<version>/baserom.z64 (generated into the build directory; never commit it).
+GC_ROM_CHECK ?= 0
+ifeq ($(GC_ROM_CHECK),1)
+GC_ROM_FLAGS += -DGC_ROM_CHECK=1
+GC_ROM_CRC_C := $(BUILD_DIR)/generated/gc_rom_crc.c
+GC_ROM_CRC_O := $(GC_ROM_CRC_C:.c=.o)
+$(GC_ROM_CRC_C): baseroms/$(VERSION)/baserom.z64 port/gc/tools/gen_rom_crc.py
+	@mkdir -p $(@D)
+	$(PYTHON) port/gc/tools/gen_rom_crc.py --rom $< -o $@
+$(GC_ROM_CRC_O): $(GC_ROM_CRC_C)
+	$(CC) -c $(OGC_CFLAGS) -o $@ $<
+endif
+
 $(GC_ROM_FLAGS_STAMP): FORCE
 	@mkdir -p $(@D)
 	@printf '%s\n' '$(GC_ROM_FLAGS)' > $@.tmp; \
@@ -238,7 +252,7 @@ GC_MAP       := $(BUILD_DIR)/mm-gc.map
 GC_DOL       := $(BUILD_DIR)/mm-gc.dol
 GC_PROBE_ELF := $(BUILD_DIR)/probe/mm-gc-probe.elf
 
-LINK_O_FILES := $(GAME_O_FILES) $(PORT_O_FILES) $(OVL_RANGES_O)
+LINK_O_FILES := $(GAME_O_FILES) $(PORT_O_FILES) $(OVL_RANGES_O) $(GC_ROM_CRC_O)
 GC_LIB_DIR   := $(DEVKITPRO)/libogc/lib/cube
 
 # -mogc adds devkitPPC's crt objects and system libraries. Given -T, it drops its default ogc.ld (mm_gc.ld replaces

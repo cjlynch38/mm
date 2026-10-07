@@ -143,6 +143,18 @@ Use the obvious shortcuts to save stages: B = 0, C = 0, C = 1, A = B, and so on.
 - **Z:** Z_CMP/Z_UPD bits give GX_SetZMode. Z_MODE decal sets `decal`.
 - **Caching:** cache compiled stage setups by (combineHi, combineLo, cycle type, render mode bits,
   prim kind).
+- **Never read TEVPREV (or TEVREG2) before a stage has written it.** On the console, a program
+  with such a read misreads the registers that GX_SetTevColor loads. Dolphin shows none of it.
+  - Seen with dol_tev on hardware, 2026-10-06:
+    - In 4 of the 141 modes, stage 0 passes the alpha in TEVPREV through unchanged (an unused
+      channel). In those, env alpha (A1) read as prim alpha or prim green (which one changed from
+      pass to pass), and prim alpha (A0) as 0.
+    - In the circle shadow, stage 0 passes TEVPREV's color through. Prim red read as the texel
+      alpha, so black actor shadows came out red.
+  - A host replay of the test's inputs with those substitutions gives the console's numbers
+    exactly, and keeps the passing samples passing.
+  - `zero_unwritten_reads` turns these reads into ZERO. gfx_tev never loads TEVPREV or TEVREG2,
+    so nothing depends on their value.
 
 ## Textures (gfx_rdp.c, gfx_tex.c)
 
